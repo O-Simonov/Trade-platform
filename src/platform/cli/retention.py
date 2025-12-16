@@ -3,8 +3,11 @@ import os
 from pathlib import Path
 import yaml
 from dotenv import load_dotenv
-from platform.data.storage.postgres.pool import create_pool
-from platform.data.storage.postgres.storage import PostgreSQLStorage
+from src.platform.data.storage.postgres.pool import create_pool
+from src.platform.data.storage.postgres.storage import PostgreSQLStorage
+
+# from platform.data.storage.postgres.pool import create_pool
+# from platform.data.storage.postgres.storage import PostgreSQLStorage
 
 def main():
     import argparse

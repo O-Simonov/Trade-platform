@@ -1,4 +1,3 @@
-# src/platform/data/storage/postgres/storage.py
 from __future__ import annotations
 
 import logging
@@ -16,6 +15,27 @@ class PostgreSQLStorage:
     def __init__(self, pool):
         self.pool = pool
 
+
+    # =========================================================================
+    # POSITIONS UID (BOOTSTRAP STUB)
+    # =========================================================================
+
+    def get_last_pos_uid(
+        self,
+        exchange_id: int,
+        account_id: int,
+        symbol_id: int,
+        strategy_id: int,
+    ) -> int:
+        """
+        Return last known position UID for given scope.
+
+        Stub implementation:
+        - returns 0 if no positions yet
+        - TradingInstance will start from UID=1
+        """
+        return 0
+
     # =========================================================================
     # DDL
     # =========================================================================
@@ -25,11 +45,7 @@ class PostgreSQLStorage:
         Execute DDL script containing multiple SQL statements.
         Compatible with psycopg3.
         """
-        statements = [
-            s.strip()
-            for s in ddl_sql.split(";")
-            if s.strip()
-        ]
+        statements = [s.strip() for s in ddl_sql.split(";") if s.strip()]
 
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
@@ -38,6 +54,77 @@ class PostgreSQLStorage:
             conn.commit()
 
         logger.info("[DB] DDL applied (%d statements)", len(statements))
+
+    # =========================================================================
+    # REGISTRY (EXCHANGE / ACCOUNT / SYMBOL)
+    # =========================================================================
+
+    def ensure_exchange_account_symbol(
+        self,
+        exchange: str,
+        account: str,
+        symbols: list[str],
+    ) -> Dict[str, int]:
+        """
+        Ensure exchange, account and symbols exist.
+
+        Returns:
+          {
+            "_exchange_id": int,
+            "_account_id": int,
+            "BTCUSDT": int,
+            ...
+          }
+        """
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                # --- exchange ---
+                cur.execute(
+                    """
+                    INSERT INTO exchanges (name)
+                    VALUES (%s)
+                    ON CONFLICT (name)
+                    DO UPDATE SET name = EXCLUDED.name
+                    RETURNING exchange_id
+                    """,
+                    (exchange,),
+                )
+                exchange_id = cur.fetchone()[0]
+
+                # --- account ---
+                cur.execute(
+                    """
+                    INSERT INTO exchange_accounts (exchange_id, name)
+                    VALUES (%s, %s)
+                    ON CONFLICT (exchange_id, name)
+                    DO UPDATE SET name = EXCLUDED.name
+                    RETURNING account_id
+                    """,
+                    (exchange_id, account),
+                )
+                account_id = cur.fetchone()[0]
+
+                ids: Dict[str, int] = {
+                    "_exchange_id": exchange_id,
+                    "_account_id": account_id,
+                }
+
+                # --- symbols ---
+                for sym in symbols:
+                    cur.execute(
+                        """
+                        INSERT INTO symbols (exchange_id, symbol)
+                        VALUES (%s, %s)
+                        ON CONFLICT (exchange_id, symbol)
+                        DO UPDATE SET symbol = EXCLUDED.symbol
+                        RETURNING symbol_id
+                        """,
+                        (exchange_id, sym),
+                    )
+                    ids[sym] = cur.fetchone()[0]
+
+            conn.commit()
+            return ids
 
     # =========================================================================
     # RETENTION / CLEANUP
@@ -87,17 +174,14 @@ class PostgreSQLStorage:
         return result
 
     # =========================================================================
-    # DOWNSAMPLE BALANCE
+    # STUBS (NEXT STAGES)
     # =========================================================================
 
     def downsample_balance(self) -> Dict[str, int]:
         """Build 5m / 1h balance snapshots from raw snapshots."""
         return {"5m": 0, "1h": 0}
 
-    # =========================================================================
-    # POSITIONS (BASELINE)
-    # =========================================================================
-
     def upsert_positions(self, rows: Iterable[Dict[str, Any]]) -> int:
         """Upsert positions (baseline)."""
         return len(list(rows))
+

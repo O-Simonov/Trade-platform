@@ -1,6 +1,6 @@
 from __future__ import annotations
 import threading
-from platform.core.engine.instance import TradingInstance
+from src.platform.core.engine.instance import TradingInstance
 
 def run_instances(instances: list[TradingInstance]) -> None:
     threads = []

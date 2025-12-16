@@ -1,8 +1,8 @@
 from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Callable
-from platform.core.models.order import OrderIntent
-from platform.core.models.position import Position
+from src.platform.core.models.order import OrderIntent
+from src.platform.core.models.position import Position
 
 TickCallback = Callable[[str, float], None]
 UserEventCallback = Callable[[dict], None]

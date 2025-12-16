@@ -1,7 +1,7 @@
 from __future__ import annotations
 from datetime import datetime, timezone
-from platform.core.models.order import OrderIntent
-from platform.core.models.enums import OrderState
+from src.platform.core.models.order import OrderIntent
+from src.platform.core.models.enums import OrderState
 
 class OrderManager:
     def __init__(self, *, storage, exchange_id: int, account_id: int):

@@ -1,7 +1,7 @@
 from __future__ import annotations
-from platform.core.strategy.base import Strategy
-from platform.core.models.order import OrderIntent
-from platform.core.models.enums import Side
+from src.platform.core.strategy.base import Strategy
+from src.platform.core.models.order import OrderIntent
+from src.platform.core.models.enums import Side
 
 class ExampleNoHedge(Strategy):
     strategy_id = "example_nohedge"

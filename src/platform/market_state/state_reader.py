@@ -1,7 +1,7 @@
 from __future__ import annotations
 from typing import Optional
-from platform.data.storage.base import Storage
-from platform.market_state.models import AccountBalanceSnapshot
+from src.platform.data.storage.base import Storage
+from src.platform.market_state.models import AccountBalanceSnapshot
 
 def latest_balance_snapshot(storage: Storage, exchange_id: int, account_id: int) -> Optional[AccountBalanceSnapshot]:
     row = storage.get_latest_account_balance_snapshot(exchange_id, account_id)

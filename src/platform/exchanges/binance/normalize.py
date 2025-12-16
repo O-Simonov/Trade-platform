@@ -1,8 +1,8 @@
 from __future__ import annotations
 import time
 from datetime import datetime, timezone
-from platform.core.models.position import Position
-from platform.core.models.enums import Side
+from src.platform.core.models.position import Position
+from src.platform.core.models.enums import Side
 
 def ts_ms_to_dt(ts_ms: int) -> datetime:
     return datetime.fromtimestamp(ts_ms/1000.0, tz=timezone.utc)

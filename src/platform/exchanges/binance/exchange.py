@@ -1,13 +1,13 @@
 from __future__ import annotations
 import os, threading, time
 from datetime import datetime, timezone
-from platform.exchanges.base.exchange import ExchangeAdapter, TickCallback, UserEventCallback, CandleCallback
-from platform.core.models.order import OrderIntent
-from platform.core.models.enums import Side
-from platform.core.models.position import Position
-from platform.exchanges.binance.rest import BinanceFuturesREST
-from platform.exchanges.binance.ws import BinanceWS, WS_BASE
-from platform.exchanges.binance.normalize import norm_position, norm_markprice_tick, norm_kline_event, norm_premium_index_item
+from src.platform.exchanges.base.exchange import ExchangeAdapter, TickCallback, UserEventCallback, CandleCallback
+from src.platform.core.models.order import OrderIntent
+from src.platform.core.models.enums import Side
+from src.platform.core.models.position import Position
+from src.platform.exchanges.binance.rest import BinanceFuturesREST
+from src.platform.exchanges.binance.ws import BinanceWS, WS_BASE
+from src.platform.exchanges.binance.normalize import norm_position, norm_markprice_tick, norm_kline_event, norm_premium_index_item
 
 class BinanceExchange(ExchangeAdapter):
     name = "binance"

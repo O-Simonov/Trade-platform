@@ -1,5 +1,5 @@
 from __future__ import annotations
-from platform.exchanges.binance.exchange import BinanceExchange
+from src.platform.exchanges.binance.exchange import BinanceExchange
 
 def build_exchange(name: str):
     name = name.lower()

@@ -1,8 +1,8 @@
 from __future__ import annotations
 import threading, time
 from datetime import datetime, timezone
-from platform.exchanges.base.exchange import ExchangeAdapter
-from platform.data.storage.base import Storage
+from src.platform.exchanges.base.exchange import ExchangeAdapter
+from src.platform.data.storage.base import Storage
 
 class BalancePoller(threading.Thread):
     def __init__(self, *, exchange: ExchangeAdapter, storage: Storage,

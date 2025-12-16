@@ -1,8 +1,8 @@
 from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Optional
-from platform.core.models.order import OrderIntent
-from platform.core.models.position import Position
+from src.platform.core.models.order import OrderIntent
+from src.platform.core.models.position import Position
 
 class Strategy(ABC):
     strategy_id: str

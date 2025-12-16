@@ -1,6 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from platform.core.models.order import OrderIntent
+from src.platform.core.models.order import OrderIntent
 
 @dataclass
 class RiskLimits:

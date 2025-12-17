@@ -1,18 +1,27 @@
+# src/platform/market_state/models.py
 from __future__ import annotations
+
 from dataclasses import dataclass
+from typing import Dict
 from datetime import datetime
 
-@dataclass(frozen=True)
-class AccountBalanceSnapshot:
-    ts: datetime
-    wallet_balance: float
-    equity: float
-    available_balance: float
-    margin_used: float
-    unrealized_pnl: float
 
-@dataclass(frozen=True)
-class OpenInterestPoint:
-    ts: datetime
-    open_interest: float
-    open_interest_value: float
+@dataclass(slots=True)
+class PositionState:
+    symbol: str
+    qty: float
+    entry_price: float
+    unrealized_pnl: float
+    leverage: int
+    side: str  # LONG / SHORT / FLAT
+
+
+@dataclass(slots=True)
+class AccountState:
+    wallet_balance: float
+    available_balance: float
+    margin_balance: float
+    positions: Dict[str, PositionState]
+    ts_ms: int
+
+

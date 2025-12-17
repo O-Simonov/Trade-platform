@@ -16,13 +16,15 @@ from src.platform.core.engine.runner import run_instances
 from src.platform.data.storage.postgres.pool import create_pool
 from src.platform.data.storage.postgres.storage import PostgreSQLStorage
 from src.platform.core.risk.risk_engine import RiskLimits
+from src.platform.exchanges.binance.collector_exchange_info import sync_exchange_info
+
 
 
 # ---------------------------------------------------------------------------
 # CONFIG
 # ---------------------------------------------------------------------------
 
-DRY_RUN: bool = os.getenv("DRY_RUN", "1") == "1"
+DRY_RUN: bool = os.getenv("DRY_RUN", "1") == "0"
 
 
 # ---------------------------------------------------------------------------
@@ -93,6 +95,37 @@ def main() -> None:
             "Registry OK: exchange=%s account=%s symbols=%s",
             exchange_name, account, ",".join(symbols)
         )
+
+    # -----------------------------------------------------------------------
+    # SYNC EXCHANGE INFO (FILTERS / LIMITS)
+    # -----------------------------------------------------------------------
+
+    # берём binance adapter ОДИН РАЗ
+    binance_ex = build_exchange("binance")
+
+    # exchange_id берём из любого аккаунта binance
+    for (ex_name, _acc), ids in ids_by_key.items():
+        if ex_name == "binance":
+            exchange_id = ids["_exchange_id"]
+
+            # symbol -> symbol_id
+            symbol_ids = {
+                k: v for k, v in ids.items()
+                if not k.startswith("_")
+            }
+
+            sync_exchange_info(
+                binance_rest=binance_ex.rest,
+                storage=store,
+                exchange_id=exchange_id,
+                symbol_ids=symbol_ids,
+            )
+
+            logger.info(
+                "ExchangeInfo synced: exchange=binance symbols=%s",
+                ",".join(symbol_ids.keys()),
+            )
+            break
 
     # -----------------------------------------------------------------------
     # BUILD INSTANCES

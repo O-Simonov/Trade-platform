@@ -17,7 +17,7 @@ instances:
   role: BASE
   strategy: example_nohedge
   symbols:
-  - BTCUSDT
+  - ETHUSDT
   candle_intervals:
   - 1m
   - 5m
@@ -25,7 +25,7 @@ instances:
   oms_reconcile_sec: 15
   oms_pending_timeout_sec: 20
   params:
-    qty: 0.001
+    qty: 0.0001
     tp_usdt: 5.0
   risk:
     max_open_positions: 5
@@ -44,14 +44,14 @@ instances:
   hedge_ratio: 1.0
   strategy: example_nohedge
   symbols:
-  - BTCUSDT
+  - ETHUSDT
   candle_intervals:
   - 1m
   funding_poll_sec: 180
   oms_reconcile_sec: 15
   oms_pending_timeout_sec: 20
   params:
-    qty: 0.001
+    qty: 0.0001
     tp_usdt: 2.0
   risk:
     max_open_positions: 5

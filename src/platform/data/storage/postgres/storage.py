@@ -1,62 +1,27 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Dict, Iterable
+from datetime import datetime, timezone
+
+from src.platform.market_state import (
+    AccountBalanceSnapshot,
+    OpenInterestPoint,
+)
 
 logger = logging.getLogger(__name__)
 
 
 class PostgreSQLStorage:
     """
-    Base PostgreSQL storage layer.
-    All DB access for the platform goes through this class.
+    PostgreSQL storage — OMS / Orders / Fills / PnL (v9)
     """
 
     def __init__(self, pool):
         self.pool = pool
 
-
     # =========================================================================
-    # POSITIONS UID (BOOTSTRAP STUB)
-    # =========================================================================
-
-    def get_last_pos_uid(
-        self,
-        exchange_id: int,
-        account_id: int,
-        symbol_id: int,
-        strategy_id: int,
-    ) -> int:
-        """
-        Return last known position UID for given scope.
-
-        Stub implementation:
-        - returns 0 if no positions yet
-        - TradingInstance will start from UID=1
-        """
-        return 0
-
-    # =========================================================================
-    # DDL
-    # =========================================================================
-
-    def exec_ddl(self, ddl_sql: str) -> None:
-        """
-        Execute DDL script containing multiple SQL statements.
-        Compatible with psycopg3.
-        """
-        statements = [s.strip() for s in ddl_sql.split(";") if s.strip()]
-
-        with self.pool.connection() as conn:
-            with conn.cursor() as cur:
-                for stmt in statements:
-                    cur.execute(stmt)
-            conn.commit()
-
-        logger.info("[DB] DDL applied (%d statements)", len(statements))
-
-    # =========================================================================
-    # REGISTRY (EXCHANGE / ACCOUNT / SYMBOL)
+    # REGISTRY
     # =========================================================================
 
     def ensure_exchange_account_symbol(
@@ -65,33 +30,19 @@ class PostgreSQLStorage:
         account: str,
         symbols: list[str],
     ) -> Dict[str, int]:
-        """
-        Ensure exchange, account and symbols exist.
-
-        Returns:
-          {
-            "_exchange_id": int,
-            "_account_id": int,
-            "BTCUSDT": int,
-            ...
-          }
-        """
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
-                # --- exchange ---
                 cur.execute(
                     """
                     INSERT INTO exchanges (name)
                     VALUES (%s)
-                    ON CONFLICT (name)
-                    DO UPDATE SET name = EXCLUDED.name
+                    ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
                     RETURNING exchange_id
                     """,
                     (exchange,),
                 )
                 exchange_id = cur.fetchone()[0]
 
-                # --- account ---
                 cur.execute(
                     """
                     INSERT INTO exchange_accounts (exchange_id, name)
@@ -104,12 +55,11 @@ class PostgreSQLStorage:
                 )
                 account_id = cur.fetchone()[0]
 
-                ids: Dict[str, int] = {
+                ids = {
                     "_exchange_id": exchange_id,
                     "_account_id": account_id,
                 }
 
-                # --- symbols ---
                 for sym in symbols:
                     cur.execute(
                         """
@@ -127,61 +77,263 @@ class PostgreSQLStorage:
             return ids
 
     # =========================================================================
-    # RETENTION / CLEANUP
+    # OMS / ORDERS
     # =========================================================================
 
-    def retention_cleanup(
+    def client_order_exists(
         self,
-        *,
-        candles_days: int = 180,
-        snapshots_days: int = 30,
-        funding_days: int = 90,
-        orders_days: int = 90,
-        trades_days: int = 90,
-        fills_days: int = 90,
-        balance_days: int = 30,
-        balance_5m_days: int = 180,
-        balance_1h_days: int = 1825,
-        oi_5m_days: int = 90,
-        oi_15m_days: int = 180,
-        oi_1h_days: int = 365,
-        dry_run: bool = False,
-    ) -> Dict[str, int]:
-        """Delete old rows to keep DB bounded."""
-
-        stmts: List[Tuple[str, str, Tuple[int]]] = [
-            ("candles", "DELETE FROM candles WHERE open_time < now() - (%s || ' days')::interval", (candles_days,)),
-            ("account_balance_snapshots", "DELETE FROM account_balance_snapshots WHERE ts < now() - (%s || ' days')::interval", (balance_days,)),
-            ("account_balance_5m", "DELETE FROM account_balance_5m WHERE ts < now() - (%s || ' days')::interval", (balance_5m_days,)),
-            ("account_balance_1h", "DELETE FROM account_balance_1h WHERE ts < now() - (%s || ' days')::interval", (balance_1h_days,)),
-            ("open_interest_5m", "DELETE FROM open_interest WHERE interval='5m' AND ts < now() - (%s || ' days')::interval", (oi_5m_days,)),
-            ("open_interest_15m", "DELETE FROM open_interest WHERE interval='15m' AND ts < now() - (%s || ' days')::interval", (oi_15m_days,)),
-            ("open_interest_1h", "DELETE FROM open_interest WHERE interval='1h' AND ts < now() - (%s || ' days')::interval", (oi_1h_days,)),
-            ("orders", "DELETE FROM orders WHERE updated_at IS NOT NULL AND updated_at < now() - (%s || ' days')::interval", (orders_days,)),
-            ("trades", "DELETE FROM trades WHERE ts < now() - (%s || ' days')::interval", (trades_days,)),
-            ("fills", "DELETE FROM order_fills WHERE ts < now() - (%s || ' days')::interval", (fills_days,)),
-            ("funding", "DELETE FROM funding WHERE funding_time < now() - (%s || ' days')::interval", (funding_days,)),
-        ]
-
-        result: Dict[str, int] = {}
+        exchange_id: int,
+        account_id: int,
+        client_order_id: str,
+    ) -> bool:
+        sql = """
+        SELECT 1 FROM orders
+        WHERE exchange_id=%s AND account_id=%s AND client_order_id=%s
+        LIMIT 1
+        """
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
-                for name, sql, params in stmts:
-                    cur.execute(sql, params)
-                    result[name] = int(cur.rowcount or 0)
+                cur.execute(sql, (exchange_id, account_id, client_order_id))
+                return cur.fetchone() is not None
+
+    # =========================================================================
+    # ORDER FILLS
+    # =========================================================================
+
+    def upsert_order_fills(self, rows) -> int:
+        """
+        Insert order fills from WS (ORDER_TRADE_UPDATE).
+
+        rows: Iterable[dict]
+        """
+        sql = """
+              INSERT INTO order_fills (exchange_id, \
+                                       account_id, \
+                                       fill_uid, \
+                                       symbol_id, \
+                                       order_id, \
+                                       trade_id, \
+                                       client_order_id, \
+                                       price, \
+                                       qty, \
+                                       realized_pnl, \
+                                       ts, \
+                                       source)
+              VALUES (%(exchange_id)s, \
+                      %(account_id)s, \
+                      %(fill_uid)s, \
+                      %(symbol_id)s, \
+                      %(order_id)s, \
+                      %(trade_id)s, \
+                      %(client_order_id)s, \
+                      %(price)s, \
+                      %(qty)s, \
+                      %(realized_pnl)s, \
+                      %(ts)s, \
+                      'ws_user') ON CONFLICT (exchange_id, account_id, fill_uid)
+        DO NOTHING \
+              """
+
+        rows = list(rows)
+        if not rows:
+            return 0
+
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.executemany(sql, rows)
             conn.commit()
 
-        return result
+        return len(rows)
 
     # =========================================================================
-    # STUBS (NEXT STAGES)
+    # TRADES
     # =========================================================================
 
-    def downsample_balance(self) -> Dict[str, int]:
-        """Build 5m / 1h balance snapshots from raw snapshots."""
-        return {"5m": 0, "1h": 0}
+    def upsert_trades(self, rows) -> int:
+        """
+        Insert trades built from fills.
+        """
+        sql = """
+              INSERT INTO trades (exchange_id, \
+                                  account_id, \
+                                  trade_id, \
+                                  order_id, \
+                                  symbol_id, \
+                                  strategy_id, \
+                                  pos_uid, \
+                                  side, \
+                                  price, \
+                                  qty, \
+                                  fee, \
+                                  fee_asset, \
+                                  realized_pnl, \
+                                  ts, \
+                                  source)
+              VALUES (%(exchange_id)s, \
+                      %(account_id)s, \
+                      %(trade_id)s, \
+                      %(order_id)s, \
+                      %(symbol_id)s, \
+                      %(strategy_id)s, \
+                      %(pos_uid)s, \
+                      %(side)s, \
+                      %(price)s, \
+                      %(qty)s, \
+                      %(fee)s, \
+                      %(fee_asset)s, \
+                      %(realized_pnl)s, \
+                      %(ts)s, \
+                      'ws_user') ON CONFLICT (exchange_id, account_id, trade_id)
+        DO NOTHING \
+              """
 
-    def upsert_positions(self, rows: Iterable[Dict[str, Any]]) -> int:
-        """Upsert positions (baseline)."""
+        rows = list(rows)
+        if not rows:
+            return 0
+
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.executemany(sql, rows)
+            conn.commit()
+
+        return len(rows)
+
+    def get_today_realized_pnl(
+            self,
+            exchange_id: int,
+            account_id: int,
+    ) -> float:
+        """
+        Sum today's realized PnL from trades.
+        """
+        sql = """
+              SELECT COALESCE(SUM(realized_pnl), 0)
+              FROM trades
+              WHERE exchange_id = %s
+                AND account_id = %s
+                AND ts >= date_trunc('day', now()) \
+              """
+
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (exchange_id, account_id))
+                return float(cur.fetchone()[0] or 0.0)
+
+    def upsert_symbol_filters(
+            self,
+            *,
+            exchange_id: int,
+            symbol_id: int,
+            price_tick: float,
+            qty_step: float,
+            min_qty: float | None,
+            max_qty: float | None,
+            min_notional: float | None,
+    ):
+        sql = """
+              INSERT INTO symbol_filters (exchange_id, symbol_id, \
+                                          price_tick, qty_step, \
+                                          min_qty, max_qty, min_notional, \
+                                          updated_at)
+              VALUES (%(exchange_id)s, %(symbol_id)s, \
+                      %(price_tick)s, %(qty_step)s, \
+                      %(min_qty)s, %(max_qty)s, %(min_notional)s, \
+                      now()) ON CONFLICT (exchange_id, symbol_id)
+        DO \
+              UPDATE SET
+                  price_tick = EXCLUDED.price_tick, \
+                  qty_step = EXCLUDED.qty_step, \
+                  min_qty = EXCLUDED.min_qty, \
+                  max_qty = EXCLUDED.max_qty, \
+                  min_notional = EXCLUDED.min_notional, \
+                  updated_at = now() \
+              """
+
+    def get_symbol_filters(
+            self,
+            exchange_id: int,
+            symbol_id: int,
+    ) -> dict:
+        sql = """
+              SELECT price_tick, qty_step, min_qty, max_qty, min_notional
+              FROM symbol_filters
+              WHERE exchange_id = %s \
+                AND symbol_id = %s \
+              """
+
+
+
+    def upsert_order_placeholder(self, order: dict) -> None:
+        """
+        WS-safe stub: принимает ОДИН dict
+        """
+        return None
+
+    def expire_stuck_pending(
+        self,
+        exchange_id: int,
+        account_id: int,
+        timeout_sec: int,
+    ) -> int:
+        return 0
+
+    # =========================================================================
+    # MARKET STATE (STUBS)
+    # =========================================================================
+
+    def get_latest_positions(self, *, exchange: str, account: str) -> dict:
+        return {}
+
+    def get_latest_balances(self, *, exchange: str, account: str) -> dict:
+        return {
+            "wallet_balance": 0.0,
+            "available_balance": 0.0,
+            "margin_balance": 0.0,
+        }
+
+    # =========================================================================
+    # PNL / BALANCE / OI (STUBS)
+    # =========================================================================
+
+    def insert_account_balance_snapshots(
+        self,
+        rows: Iterable[AccountBalanceSnapshot],
+    ) -> int:
         return len(list(rows))
+
+    def upsert_open_interest(
+        self,
+        rows: Iterable[OpenInterestPoint],
+    ) -> int:
+        return len(list(rows))
+
+
+def get_symbol_filters(
+    self,
+    *,
+    exchange_id: int,
+    symbol_id: int,
+) -> dict:
+    sql = """
+    SELECT
+        qty_step,
+        min_qty,
+        max_qty,
+        price_tick,
+        min_notional
+    FROM symbol_filters
+    WHERE exchange_id = %s AND symbol_id = %s
+    """
+    with self.pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, (exchange_id, symbol_id))
+            row = cur.fetchone()
+            if not row:
+                raise RuntimeError("Symbol filters not found")
+
+            return dict(zip(
+                ["qty_step", "min_qty", "max_qty", "price_tick", "min_notional"],
+                row
+            ))
+
 

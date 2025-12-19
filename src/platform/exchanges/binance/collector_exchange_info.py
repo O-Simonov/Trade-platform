@@ -1,17 +1,9 @@
-
-from __future__ import annotations
-
 from src.platform.exchanges.binance.filters import parse_symbol_filters
 
 
-def sync_exchange_info(
-    binance_rest,
-    storage,
-    exchange_id: int,
-    symbol_ids: dict[str, int],
-):
+def sync_exchange_info(binance_rest, storage, exchange_id: int, symbol_ids: dict):
     """
-    Load Binance Futures exchangeInfo and persist symbol filters to DB.
+    Fetch Binance Futures exchangeInfo and store symbol filters
     """
     info = binance_rest.fetch_exchange_info()
 
@@ -20,7 +12,7 @@ def sync_exchange_info(
             continue
 
         symbol = s.get("symbol")
-        if not symbol or symbol not in symbol_ids:
+        if symbol not in symbol_ids:
             continue
 
         filters = parse_symbol_filters(s)

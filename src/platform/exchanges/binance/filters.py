@@ -1,21 +1,34 @@
-def parse_symbol_filters(s: dict) -> dict:
+def parse_symbol_filters(sym: dict) -> dict:
     """
-    Extract filters from Binance exchangeInfo symbol block.
+    Parse Binance Futures exchangeInfo symbol filters
     """
-    out = {}
+    qty_step = None
+    min_qty = None
+    max_qty = None
+    price_tick = None
+    min_notional = None
 
-    for f in s.get("filters", []):
+    for f in sym.get("filters", []):
         t = f.get("filterType")
 
         if t == "LOT_SIZE":
-            out["qty_step"] = float(f["stepSize"])
-            out["min_qty"] = float(f["minQty"])
-            out["max_qty"] = float(f["maxQty"])
+            qty_step = float(f["stepSize"])
+            min_qty = float(f["minQty"])
+            max_qty = float(f["maxQty"])
 
         elif t == "PRICE_FILTER":
-            out["price_tick"] = float(f["tickSize"])
+            price_tick = float(f["tickSize"])
 
         elif t == "MIN_NOTIONAL":
-            out["min_notional"] = float(f.get("notional", f.get("minNotional", 0)))
+            min_notional = float(f.get("notional", f.get("minNotional", 0)))
 
-    return out
+    if qty_step is None or min_qty is None or price_tick is None:
+        raise ValueError(f"Incomplete filters for symbol {sym.get('symbol')}")
+
+    return {
+        "qty_step": qty_step,
+        "min_qty": min_qty,
+        "max_qty": max_qty,
+        "price_tick": price_tick,
+        "min_notional": min_notional,
+    }

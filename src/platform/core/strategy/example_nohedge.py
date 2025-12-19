@@ -1,24 +1,58 @@
 from __future__ import annotations
+import time
 from src.platform.core.strategy.base import Strategy
 from src.platform.core.models.order import OrderIntent
 from src.platform.core.models.enums import Side
 
+
 class ExampleNoHedge(Strategy):
     strategy_id = "example_nohedge"
-    def __init__(self, exchange: str, account: str, qty: float, tp_usdt: float):
+
+    def __init__(self, exchange: str, account: str, qty: float):
         self.exchange = exchange
         self.account = account
         self.qty = float(qty)
-        self.tp_usdt = float(tp_usdt)
+
+        self._opened_at: float | None = None
+        self._done = False
 
     def on_tick(self, symbol, price, position, pos_uid):
-        if position is None or position.qty == 0:
-            return OrderIntent(exchange=self.exchange, account=self.account, symbol=symbol,
-                               side=Side.LONG, qty=self.qty, strategy_id=self.strategy_id,
-                               pos_uid=pos_uid, intent_type="ENTRY")
-        if (position.unrealized_pnl or 0.0) >= self.tp_usdt:
-            close_side = Side.SHORT if position.side == Side.LONG else Side.LONG
-            return OrderIntent(exchange=self.exchange, account=self.account, symbol=symbol,
-                               side=close_side, qty=abs(position.qty), reduce_only=True,
-                               strategy_id=self.strategy_id, pos_uid=pos_uid, intent_type="CLOSE")
+        # 🔒 ТОЛЬКО ОДИН ЦИКЛ
+        if self._done:
+            return None
+
+        # 1️⃣ ОТКРЫВАЕМ ОДИН РАЗ
+        if self._opened_at is None and (position is None or position.qty == 0):
+            self._opened_at = time.time()
+            return OrderIntent(
+                exchange=self.exchange,
+                account=self.account,
+                symbol=symbol,
+                side=Side.LONG,
+                qty=self.qty,
+                strategy_id=self.strategy_id,
+                pos_uid=pos_uid,
+                intent_type="ENTRY",
+            )
+
+        # 2️⃣ ЗАКРЫВАЕМ ЧЕРЕЗ 10 СЕК
+        if (
+            position
+            and position.qty > 0
+            and self._opened_at
+            and time.time() - self._opened_at >= 10
+        ):
+            self._done = True
+            return OrderIntent(
+                exchange=self.exchange,
+                account=self.account,
+                symbol=symbol,
+                side=Side.SHORT,
+                qty=abs(position.qty),
+                reduce_only=True,
+                strategy_id=self.strategy_id,
+                pos_uid=pos_uid,
+                intent_type="CLOSE",
+            )
+
         return None

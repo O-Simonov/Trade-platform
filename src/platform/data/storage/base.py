@@ -62,3 +62,24 @@ class Storage(ABC):
 
     @abstractmethod
     def get_equity_peak(self, exchange_id: int, account_id: int, lookback_days: int = 90) -> float | None: ...
+
+
+
+
+    # ------------------------------------------------------------------
+    # OMS helpers
+    # ------------------------------------------------------------------
+
+    def get_pending_order_by_client_id(
+        self,
+        *,
+        exchange_id: int,
+        account_id: int,
+        client_order_id: str,
+    ) -> dict | None:
+        """
+        Возвращает metadata pending order (strategy_id, pos_uid, symbol_id, ...)
+        Используется для связывания fills/trades с OMS placeholder.
+        """
+        raise NotImplementedError
+

@@ -1,35 +1,28 @@
 # src/platform/run_instances.py
 from __future__ import annotations
 
-import time
 import os
 import logging
-import time
 from pathlib import Path
 import yaml
 from dotenv import load_dotenv
 
 from src.platform.exchanges.registry import build_exchange
-from src.platform.core.strategy.example_nohedge import ExampleNoHedge
-from src.platform.core.engine.instance import TradingInstance
-from src.platform.core.engine.runner import run_instances
-from src.platform.data.storage.postgres.pool import create_pool
-from src.platform.data.storage.postgres.storage import PostgreSQLStorage
-from src.platform.core.risk.risk_engine import RiskLimits
 from src.platform.exchanges.binance.collector_exchange_info import sync_exchange_info
 
+from src.platform.core.engine.instance import TradingInstance
+from src.platform.core.engine.runner import run_instances
+from src.platform.core.risk.risk_engine import RiskLimits
+from src.platform.core.strategy.one_shot_test import OneShotTestStrategy
+
+from src.platform.data.storage.postgres.pool import create_pool
+from src.platform.data.storage.postgres.storage import PostgreSQLStorage
 
 
-# ---------------------------------------------------------------------------
-# CONFIG
-# ---------------------------------------------------------------------------
+# DRY_RUN=1 -> dry run ON (no real orders)
+# DRY_RUN=0 -> real orders enabled
+DRY_RUN: bool = os.getenv("DRY_RUN", "1") == "1"
 
-DRY_RUN: bool = os.getenv("DRY_RUN", "1") == "0"
-
-
-# ---------------------------------------------------------------------------
-# UTILS
-# ---------------------------------------------------------------------------
 
 def _load_yaml(path: Path) -> dict:
     if not path.exists():
@@ -37,12 +30,7 @@ def _load_yaml(path: Path) -> dict:
     return yaml.safe_load(path.read_text(encoding="utf-8"))
 
 
-# ---------------------------------------------------------------------------
-# MAIN
-# ---------------------------------------------------------------------------
-
 def main() -> None:
-    # --- logging ---
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -50,87 +38,76 @@ def main() -> None:
     logger = logging.getLogger("platform.run_instances")
 
     logger.info("=== RUN INSTANCES START ===")
-    logger.warning("DRY_RUN=%s (NO REAL ORDERS WILL BE SENT)", DRY_RUN)
+    logger.warning("DRY_RUN=%s (%s)", DRY_RUN, "NO REAL ORDERS" if DRY_RUN else "REAL ORDERS ENABLED")
 
-    # --- env ---
     load_dotenv()
     dsn = os.getenv("PG_DSN")
     if not dsn:
         raise SystemExit("PG_DSN env var is required")
 
-    # --- config ---
-    root = Path(__file__).resolve().parents[2]  # -> Trade-platform
-    cfg_path = root / "config" / "strategies.yaml"
-    cfg_root = _load_yaml(cfg_path)
+    root = Path(__file__).resolve().parents[2]
+    cfg_root = _load_yaml(root / "config" / "strategies.yaml")
     instances_cfg = cfg_root.get("instances") or []
-
     if not instances_cfg:
         raise SystemExit("No instances defined in strategies.yaml")
 
-    # --- storage ---
     pool = create_pool(dsn)
     store = PostgreSQLStorage(pool)
     logger.info("PostgreSQL storage initialized")
 
-    # -----------------------------------------------------------------------
-    # REGISTRY (TEMP B2)
-    # -----------------------------------------------------------------------
-
+    # -------------------------------------------------------------------
+    # REGISTRY: exchange/account/symbol -> ids
+    # -------------------------------------------------------------------
     ids_by_key: dict[tuple[str, str], dict] = {}
 
     for icfg in instances_cfg:
-        exchange_name = icfg["exchange"]
+        exchange = icfg["exchange"]
         account = icfg["account"]
         symbols = [s.upper() for s in icfg.get("symbols", [])]
 
         ids = store.ensure_exchange_account_symbol(
-            exchange=exchange_name,
+            exchange=exchange,
             account=account,
             symbols=symbols,
         )
+        ids_by_key[(exchange, account)] = ids
 
-        ids_by_key[(exchange_name, account)] = ids
+        logger.info("Registry OK: exchange=%s account=%s symbols=%s", exchange, account, ",".join(symbols))
 
-        logger.info(
-            "Registry OK: exchange=%s account=%s symbols=%s",
-            exchange_name, account, ",".join(symbols)
-        )
+    # -------------------------------------------------------------------
+    # BOOTSTRAP exchangeInfo -> symbol_filters (лучше 1 раз на старте)
+    # -------------------------------------------------------------------
+    binance_keys = [(ex, acc) for (ex, acc) in ids_by_key.keys() if ex == "binance"]
+    if binance_keys:
+        _, rest_account = binance_keys[0]
+        binance_ex = build_exchange("binance")
 
-    # -----------------------------------------------------------------------
-    # SYNC EXCHANGE INFO (FILTERS / LIMITS)
-    # -----------------------------------------------------------------------
+        # ВАЖНО: REST клиент строим по аккаунту (ключи)
+        rest = binance_ex._rest(rest_account)
 
-    # берём binance adapter ОДИН РАЗ
-    binance_ex = build_exchange("binance")
+        exchange_id = ids_by_key[("binance", rest_account)]["_exchange_id"]
 
-    # exchange_id берём из любого аккаунта binance
-    for (ex_name, _acc), ids in ids_by_key.items():
-        if ex_name == "binance":
-            exchange_id = ids["_exchange_id"]
-
-            # symbol -> symbol_id
-            symbol_ids = {
-                k: v for k, v in ids.items()
-                if not k.startswith("_")
-            }
-
+        # объединяем symbols всех binance-инстансов
+        symbol_ids: dict[str, int] = {}
+        for (ex, acc) in binance_keys:
+            ids = ids_by_key[(ex, acc)]
+            for k, v in ids.items():
+                if not k.startswith("_"):
+                    symbol_ids[k] = v
+        try:
             sync_exchange_info(
-                binance_rest=binance_ex.rest,
+                binance_rest=rest,
                 storage=store,
                 exchange_id=exchange_id,
                 symbol_ids=symbol_ids,
             )
+            logger.info("ExchangeInfo synced: exchange=binance symbols=%s", ",".join(sorted(symbol_ids.keys())))
+        except Exception:
+            logger.exception("ExchangeInfo sync failed (will continue without refresh)")
 
-            logger.info(
-                "ExchangeInfo synced: exchange=binance symbols=%s",
-                ",".join(symbol_ids.keys()),
-            )
-            break
-
-    # -----------------------------------------------------------------------
+    # -------------------------------------------------------------------
     # BUILD INSTANCES
-    # -----------------------------------------------------------------------
-
+    # -------------------------------------------------------------------
     instances: list[TradingInstance] = []
 
     for icfg in instances_cfg:
@@ -139,32 +116,29 @@ def main() -> None:
         role = icfg.get("role", "MIXED")
         symbols = [s.upper() for s in icfg.get("symbols", [])]
 
-        candle_intervals = icfg.get("candle_intervals") or []
-        funding_poll_sec = float(icfg.get("funding_poll_sec", 120))
-        oms_reconcile_sec = float(icfg.get("oms_reconcile_sec", 15))
-        oms_pending_timeout_sec = float(icfg.get("oms_pending_timeout_sec", 20))
-
-        base_ref = icfg.get("base_ref")
-        hedge_ratio = icfg.get("hedge_ratio")
-
         params = icfg.get("params") or {}
         risk_cfg = icfg.get("risk") or {}
 
-        # --- exchange adapter ---
         ex = build_exchange(exchange_name)
+        ids = ids_by_key[(exchange_name, account)]
 
-        # --- strategy ---
-        if icfg["strategy"] == "example_nohedge":
-            strat = ExampleNoHedge(
+        # 🔥 ВАЖНО: bind exchange к storage + ids
+        ex.bind(
+            storage=store,
+            exchange_id=ids["_exchange_id"],
+            symbol_ids={k: v for k, v in ids.items() if not k.startswith("_")},
+        )
+
+        if icfg["strategy"] == "one_shot_test":
+            strat = OneShotTestStrategy(
                 exchange=exchange_name,
                 account=account,
-                qty=float(params.get("qty", 0.001)),
-                tp_usdt=float(params.get("tp_usdt", 5.0)),
+                qty=float(params.get("qty", 0.01)),
+                hold_sec=float(params.get("hold_sec", 10.0)),
             )
         else:
             raise SystemExit(f"Unknown strategy: {icfg['strategy']}")
 
-        # --- risk ---
         limits = RiskLimits(
             max_open_positions=int(risk_cfg.get("max_open_positions", 10)),
             max_notional_usdt=float(risk_cfg.get("max_notional_usdt", 1e9)),
@@ -175,15 +149,6 @@ def main() -> None:
             max_margin_used_pct=float(risk_cfg.get("max_margin_used_pct", 1e9)),
         )
 
-        ids = ids_by_key[(exchange_name, account)]
-
-        if base_ref:
-            bex = base_ref.get("exchange")
-            bacc = base_ref.get("account")
-            if (bex, bacc) in ids_by_key:
-                base_ref = dict(base_ref)
-                base_ref["account_id"] = ids_by_key[(bex, bacc)]["_account_id"]
-
         inst = TradingInstance(
             exchange=ex,
             storage=store,
@@ -191,27 +156,19 @@ def main() -> None:
             account=account,
             role=role,
             symbols=symbols,
-            candle_intervals=candle_intervals,
-            funding_poll_sec=funding_poll_sec,
-            oms_reconcile_sec=oms_reconcile_sec,
-            oms_pending_timeout_sec=oms_pending_timeout_sec,
+            candle_intervals=icfg.get("candle_intervals") or [],
+            funding_poll_sec=float(icfg.get("funding_poll_sec", 120)),
+            oms_reconcile_sec=float(icfg.get("oms_reconcile_sec", 15)),
+            oms_pending_timeout_sec=float(icfg.get("oms_pending_timeout_sec", 20)),
             ids=ids,
-            base_ref=base_ref,
-            hedge_ratio=hedge_ratio,
+            base_ref=icfg.get("base_ref"),
+            hedge_ratio=icfg.get("hedge_ratio"),
             risk_limits=limits,
             dry_run=DRY_RUN,
         )
 
         instances.append(inst)
-
-        logger.info(
-            "Instance ready: %s / %s | symbols=%s | role=%s",
-            exchange_name, account, ",".join(symbols), role
-        )
-
-    # -----------------------------------------------------------------------
-    # RUN
-    # -----------------------------------------------------------------------
+        logger.info("Instance ready: %s / %s | symbols=%s | role=%s", exchange_name, account, ",".join(symbols), role)
 
     logger.info("Starting %d trading instance(s)", len(instances))
     run_instances(instances)

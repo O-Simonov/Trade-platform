@@ -1,3 +1,4 @@
+# src/platform/exchanges/binance/normalize.ru
 from __future__ import annotations
 import time
 from datetime import datetime, timezone
@@ -159,3 +160,4 @@ def norm_user_event(evt: dict) -> dict:
                 "source": "ws_user",
             }
     return out
+

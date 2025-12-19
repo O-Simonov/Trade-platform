@@ -1,10 +1,11 @@
+# src/platform/exchanges/binance/exchange.py
 from __future__ import annotations
 
 import os
 import threading
 import time
 from datetime import datetime, timezone
-from typing import List
+from typing import List, Optional, Any
 
 from src.platform.exchanges.base.exchange import (
     ExchangeAdapter,
@@ -23,8 +24,11 @@ from src.platform.exchanges.binance.normalize import (
     norm_markprice_tick,
     norm_kline_event,
     norm_premium_index_item,
+    norm_user_event,
 )
 from src.platform.exchanges.binance.order_normalizer import normalize_order
+
+
 
 
 class BinanceExchange(ExchangeAdapter):
@@ -34,22 +38,38 @@ class BinanceExchange(ExchangeAdapter):
     name = "binance"
 
     def __init__(self):
+
+
         self._rest_by_account: dict[str, BinanceFuturesREST] = {}
+        self._public_rest: Optional[BinanceFuturesREST] = None
+
         self._tick_ws: dict[str, BinanceWS] = {}
         self._kline_ws: dict[str, BinanceWS] = {}
         self._user_ws: dict[str, BinanceWS] = {}
+
         self._listen_key: dict[str, str] = {}
         self._keepalive_threads: dict[str, threading.Thread] = {}
 
-        # Эти поля устанавливаются TradingInstance
+        # Bind from TradingInstance
         self.storage = None
         self.exchange_id: int | None = None
         self.symbol_ids: dict[str, int] = {}
+        self.account_ids: dict[str, int] = {}  # account -> account_id
+        self.oms_by_account: dict[str, Any] = {}  # account -> OrderManager (опционально)
 
-    # ======================================================================
-    # REST
-    # ======================================================================
+    # ------------------------------------------------------------------
+    # BIND CONTEXT (called by TradingInstance)
+    # ------------------------------------------------------------------
+    def bind(self, *, storage, exchange_id: int, symbol_ids: dict[str, int]) -> None:
+        self.storage = storage
+        self.exchange_id = int(exchange_id)
+        self.symbol_ids = dict(symbol_ids or {})
 
+
+
+    # ------------------------------------------------------------------
+    # REST CLIENTS
+    # ------------------------------------------------------------------
     def _rest(self, account: str) -> BinanceFuturesREST:
         if account in self._rest_by_account:
             return self._rest_by_account[account]
@@ -62,26 +82,29 @@ class BinanceExchange(ExchangeAdapter):
 
         if not api_key or not api_sec:
             raise RuntimeError(
-                f"Missing Binance credentials for account={account}: "
-                f"{key_var}/{sec_var}"
+                f"Missing Binance credentials for account={account}: {key_var}/{sec_var}"
             )
 
         cli = BinanceFuturesREST(api_key, api_sec)
         self._rest_by_account[account] = cli
         return cli
 
-    # ======================================================================
-    # WEBSOCKETS
-    # ======================================================================
+    def _rest_public(self) -> BinanceFuturesREST:
+        """
+        Public endpoints (signed=False) don’t require real keys.
+        """
+        if self._public_rest is None:
+            self._public_rest = BinanceFuturesREST(api_key="", api_secret="")
+        return self._public_rest
 
-    def subscribe_ticks(
-        self,
-        account: str,
-        symbols: List[str],
-        cb: TickCallback,
-    ) -> None:
+    # ------------------------------------------------------------------
+    # WEBSOCKETS
+    # ------------------------------------------------------------------
+    def subscribe_ticks(self, account: str, symbols: List[str], cb: TickCallback) -> None:
         streams = [f"{s.lower()}@markPrice@1s" for s in symbols]
-        url = WS_BASE + "/" + "/".join(streams)
+        url = WS_BASE + "/".join(streams)
+        print("WS TICKS URL =", url)  # 🔥 ВАЖНО
+
 
         def on_msg(data: dict):
             res = norm_markprice_tick(data)
@@ -100,11 +123,7 @@ class BinanceExchange(ExchangeAdapter):
         intervals: List[str],
         cb: CandleCallback,
     ) -> None:
-        streams = [
-            f"{s.lower()}@kline_{itv}"
-            for s in symbols
-            for itv in intervals
-        ]
+        streams = [f"{s.lower()}@kline_{itv}" for s in symbols for itv in intervals]
         if not streams:
             return
 
@@ -120,100 +139,97 @@ class BinanceExchange(ExchangeAdapter):
         self._kline_ws[account] = ws
 
     def subscribe_user_stream(
-        self,
-        account: str,
-        cb: UserEventCallback,
+            self,
+            account: str,
+            cb: UserEventCallback,
     ) -> None:
         rest = self._rest(account)
 
-        listen_key = self._listen_key.get(account)
-        if not listen_key:
+        lk = self._listen_key.get(account)
+        if not lk:
             resp = rest.create_listen_key()
-            listen_key = resp.get("listenKey")
-            if not listen_key:
-                raise RuntimeError(f"Failed to create listenKey: {resp}")
-            self._listen_key[account] = listen_key
+            lk = resp.get("listenKey")
+            if not lk:
+                raise RuntimeError("listenKey error")
+            self._listen_key[account] = lk
 
-        url = WS_BASE + "/" + listen_key
-        ws = BinanceWS(url=url, on_message=cb, name=f"BinanceUser-{account}")
+        ws = BinanceWS(
+            url=WS_BASE + "/" + lk,
+            on_message=cb,  # 🔥 ВАЖНО: просто пробрасываем evt
+            name=f"BinanceUser-{account}",
+        )
         ws.start()
-        self._user_ws[account] = ws
 
-        if account not in self._keepalive_threads:
-            def keepalive():
-                while True:
-                    try:
-                        rest.keepalive_listen_key(listen_key)
-                    except Exception as e:
-                        print(f"[BinanceUser-{account}] keepalive error: {e}")
-                    time.sleep(30 * 60)
-
-            t = threading.Thread(
-                target=keepalive,
-                daemon=True,
-                name=f"BinanceListenKeyKeepAlive-{account}",
-            )
-            t.start()
-            self._keepalive_threads[account] = t
-
-    # ======================================================================
+    # ------------------------------------------------------------------
     # FETCH
-    # ======================================================================
-
+    # ------------------------------------------------------------------
     def fetch_positions(self, account: str) -> list[Position]:
         raw = self._rest(account).position_risk()
         out: list[Position] = []
-
         for r in raw:
             p = norm_position(self.name, account, r)
             if p:
                 out.append(p)
+        return out
+
+    def fetch_open_orders(self, account: str, symbol: str | None = None) -> list[dict]:
+        return self._rest(account).open_orders(symbol=symbol)
+
+    def fetch_funding_snapshot(self, symbols: list[str]) -> list[dict]:
+        """
+        Funding snapshot (premiumIndex).
+        Account не нужен — берём любой активный REST.
+        """
+        out: list[dict] = []
+
+        if not self._rest_by_account:
+            return out  # REST ещё не инициализирован
+
+        rest = next(iter(self._rest_by_account.values()))
+
+        for s in symbols:
+            try:
+                item = rest.premium_index(symbol=s)
+                row = norm_premium_index_item(item)
+                if row:
+                    out.append(row)
+            except Exception as e:
+                print(f"[Funding] premiumIndex {s} error: {e}")
 
         return out
 
-    def fetch_open_orders(
-        self,
-        account: str,
-        symbol: str | None = None,
-    ) -> list[dict]:
-        return self._rest(account).open_orders(symbol=symbol)
-
-    # ======================================================================
+    # ------------------------------------------------------------------
     # ORDER PLACEMENT (D2 — NORMALIZED)
-    # ======================================================================
-
+    # ------------------------------------------------------------------
     def place_order(self, intent: OrderIntent) -> dict:
-        """
-        Единственная точка отправки ордера в Binance.
-        Нормализация строго по symbol_filters из БД.
-        """
         if not self.storage or self.exchange_id is None:
-            raise RuntimeError("Exchange is not bound to storage / exchange_id")
+            raise RuntimeError("BinanceExchange is not bound: storage/exchange_id missing. Call ex.bind(...)")
+
+        if intent.symbol not in self.symbol_ids:
+            raise KeyError(f"symbol_id not found for {intent.symbol}. Did you bind symbol_ids correctly?")
 
         rest = self._rest(intent.account)
-
         side = "BUY" if intent.side == Side.LONG else "SELL"
 
-        # --- load filters from DB ---
         filters = self.storage.get_symbol_filters(
             exchange_id=self.exchange_id,
             symbol_id=self.symbol_ids[intent.symbol],
         )
 
         qty, price = normalize_order(
-            qty=intent.qty,
-            price=intent.price,
-            qty_step=filters["qty_step"],
-            min_qty=filters["min_qty"],
-            max_qty=filters.get("max_qty"),
-            price_tick=filters.get("price_tick"),
-            min_notional=filters.get("min_notional"),
+            qty=float(intent.qty),
+            price=(float(intent.price) if intent.price is not None else None),
+            qty_step=float(filters["qty_step"]),
+            min_qty=float(filters["min_qty"]),
+            max_qty=(float(filters["max_qty"]) if filters.get("max_qty") is not None else None),
+            price_tick=(float(filters["price_tick"]) if filters.get("price_tick") is not None else None),
+            min_notional=(float(filters["min_notional"]) if filters.get("min_notional") is not None else None),
         )
 
         if qty <= 0:
             raise ValueError(f"Normalized qty <= 0 for {intent.symbol}")
 
-        params = {
+        params: dict = {
             "symbol": intent.symbol,
             "side": side,
             "type": intent.order_type.value,
@@ -221,7 +237,7 @@ class BinanceExchange(ExchangeAdapter):
         }
 
         if intent.reduce_only:
-            params["reduceOnly"] = True
+            params["reduceOnly"] = "true"
 
         if intent.client_order_id:
             params["newClientOrderId"] = intent.client_order_id
@@ -232,10 +248,9 @@ class BinanceExchange(ExchangeAdapter):
 
         return rest.new_order(**params)
 
-    # ======================================================================
+    # ------------------------------------------------------------------
     # ACCOUNT / OI
-    # ======================================================================
-
+    # ------------------------------------------------------------------
     def fetch_account_state(self, account: str) -> dict:
         raw = self._rest(account).account()
 
@@ -259,26 +274,18 @@ class BinanceExchange(ExchangeAdapter):
         interval: str,
         limit: int = 30,
     ) -> list[dict]:
-        raw = self._rest(account).open_interest_hist(
-            symbol=symbol,
-            period=interval,
-            limit=int(limit),
-        )
+        raw = self._rest(account).open_interest_hist(symbol=symbol, period=interval, limit=int(limit))
 
-        out = []
+        out: list[dict] = []
         for r in raw or []:
             ts_ms = int(r.get("timestamp") or 0)
             if ts_ms <= 0:
                 continue
-
-            out.append({
-                "ts": datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc),
-                "open_interest": float(
-                    r.get("sumOpenInterest") or r.get("openInterest") or 0.0
-                ),
-                "open_interest_value": float(
-                    r.get("sumOpenInterestValue") or r.get("openInterestValue") or 0.0
-                ),
-            })
-
+            out.append(
+                {
+                    "ts": datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc),
+                    "open_interest": float(r.get("sumOpenInterest") or r.get("openInterest") or 0.0),
+                    "open_interest_value": float(r.get("sumOpenInterestValue") or r.get("openInterestValue") or 0.0),
+                }
+            )
         return out

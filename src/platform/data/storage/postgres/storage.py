@@ -20,6 +20,29 @@ class PostgreSQLStorage:
     def __init__(self, pool):
         self.pool = pool
 
+    # ------------------------------------------------------------------
+    # INTERNAL SQL HELPERS
+    # ------------------------------------------------------------------
+
+    def _fetchone(self, sql: str, params: tuple):
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                row = cur.fetchone()
+                if not row:
+                    return None
+                cols = [desc[0] for desc in cur.description]
+                return dict(zip(cols, row))
+
+    def _fetchall(self, sql: str, params: tuple = ()):
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                rows = cur.fetchall()
+                cols = [desc[0] for desc in cur.description]
+                return [dict(zip(cols, r)) for r in rows]
+
+
     # =========================================================================
     # REGISTRY
     # =========================================================================
@@ -219,49 +242,99 @@ class PostgreSQLStorage:
                 cur.execute(sql, (exchange_id, account_id))
                 return float(cur.fetchone()[0] or 0.0)
 
+
+
+    # --- SYMBOL FILTERS --------------------------------------------------------
+
     def upsert_symbol_filters(
             self,
             *,
             exchange_id: int,
             symbol_id: int,
-            price_tick: float,
             qty_step: float,
-            min_qty: float | None,
+            min_qty: float,
             max_qty: float | None,
+            price_tick: float,
             min_notional: float | None,
-    ):
+    ) -> None:
+        """
+        Insert / update symbol trading filters from exchangeInfo
+        """
         sql = """
-              INSERT INTO symbol_filters (exchange_id, symbol_id, \
-                                          price_tick, qty_step, \
-                                          min_qty, max_qty, min_notional, \
+              INSERT INTO symbol_filters (exchange_id, \
+                                          symbol_id, \
+                                          qty_step, \
+                                          min_qty, \
+                                          max_qty, \
+                                          price_tick, \
+                                          min_notional, \
                                           updated_at)
-              VALUES (%(exchange_id)s, %(symbol_id)s, \
-                      %(price_tick)s, %(qty_step)s, \
-                      %(min_qty)s, %(max_qty)s, %(min_notional)s, \
+              VALUES (%(exchange_id)s, \
+                      %(symbol_id)s, \
+                      %(qty_step)s, \
+                      %(min_qty)s, \
+                      %(max_qty)s, \
+                      %(price_tick)s, \
+                      %(min_notional)s, \
                       now()) ON CONFLICT (exchange_id, symbol_id)
         DO \
               UPDATE SET
-                  price_tick = EXCLUDED.price_tick, \
                   qty_step = EXCLUDED.qty_step, \
                   min_qty = EXCLUDED.min_qty, \
                   max_qty = EXCLUDED.max_qty, \
+                  price_tick = EXCLUDED.price_tick, \
                   min_notional = EXCLUDED.min_notional, \
                   updated_at = now() \
               """
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, {
+                    "exchange_id": exchange_id,
+                    "symbol_id": symbol_id,
+                    "qty_step": qty_step,
+                    "min_qty": min_qty,
+                    "max_qty": max_qty,
+                    "price_tick": price_tick,
+                    "min_notional": min_notional,
+                })
+            conn.commit()
 
     def get_symbol_filters(
             self,
+            *,
             exchange_id: int,
             symbol_id: int,
     ) -> dict:
+        """
+        Return normalized symbol filters for order normalization
+        """
         sql = """
-              SELECT price_tick, qty_step, min_qty, max_qty, min_notional
+              SELECT qty_step, \
+                     min_qty, \
+                     max_qty, \
+                     price_tick, \
+                     min_notional
               FROM symbol_filters
-              WHERE exchange_id = %s \
+              WHERE exchange_id = %s
                 AND symbol_id = %s \
               """
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (exchange_id, symbol_id))
+                row = cur.fetchone()
 
+        if not row:
+            raise RuntimeError(
+                f"Symbol filters not found: exchange_id={exchange_id} symbol_id={symbol_id}"
+            )
 
+        return {
+            "qty_step": float(row[0]),
+            "min_qty": float(row[1]),
+            "max_qty": float(row[2]) if row[2] is not None else None,
+            "price_tick": float(row[3]),
+            "min_notional": float(row[4]) if row[4] is not None else None,
+        }
 
     def upsert_order_placeholder(self, order: dict) -> None:
         """
@@ -297,43 +370,107 @@ class PostgreSQLStorage:
 
     def insert_account_balance_snapshots(
         self,
-        rows: Iterable[AccountBalanceSnapshot],
+        rows: Iterable[dict],
     ) -> int:
-        return len(list(rows))
+        rows = list(rows)
+        if not rows:
+            return 0
+
+        sql = """
+        INSERT INTO account_balance_snapshots (
+            exchange_id,
+            account_id,
+            ts,
+            wallet_balance,
+            equity,
+            available_balance,
+            margin_used,
+            unrealized_pnl,
+            source
+        )
+        VALUES (
+            %(exchange_id)s,
+            %(account_id)s,
+            %(ts)s,
+            %(wallet_balance)s,
+            %(equity)s,
+            %(available_balance)s,
+            %(margin_used)s,
+            %(unrealized_pnl)s,
+            %(source)s
+        )
+        """
+
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.executemany(sql, rows)
+            conn.commit()
+
+        return len(rows)
+
 
     def upsert_open_interest(
         self,
-        rows: Iterable[OpenInterestPoint],
+        rows: Iterable[dict],
     ) -> int:
-        return len(list(rows))
+        rows = list(rows)
+        if not rows:
+            return 0
+
+        sql = """
+        INSERT INTO open_interest (
+            exchange_id,
+            symbol_id,
+            interval,
+            ts,
+            open_interest,
+            open_interest_value,
+            source
+        )
+        VALUES (
+            %(exchange_id)s,
+            %(symbol_id)s,
+            %(interval)s,
+            %(ts)s,
+            %(open_interest)s,
+            %(open_interest_value)s,
+            %(source)s
+        )
+        ON CONFLICT (exchange_id, symbol_id, interval, ts)
+        DO UPDATE SET
+            open_interest = EXCLUDED.open_interest,
+            open_interest_value = EXCLUDED.open_interest_value
+        """
+
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.executemany(sql, rows)
+            conn.commit()
+
+        return len(rows)
 
 
-def get_symbol_filters(
-    self,
-    *,
-    exchange_id: int,
-    symbol_id: int,
-) -> dict:
-    sql = """
-    SELECT
-        qty_step,
-        min_qty,
-        max_qty,
-        price_tick,
-        min_notional
-    FROM symbol_filters
-    WHERE exchange_id = %s AND symbol_id = %s
-    """
-    with self.pool.connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, (exchange_id, symbol_id))
-            row = cur.fetchone()
-            if not row:
-                raise RuntimeError("Symbol filters not found")
-
-            return dict(zip(
-                ["qty_step", "min_qty", "max_qty", "price_tick", "min_notional"],
-                row
-            ))
-
-
+    def get_pending_order_by_client_id(
+        self,
+        *,
+        exchange_id: int,
+        account_id: int,
+        client_order_id: str,
+    ) -> dict | None:
+        sql = """
+        SELECT
+            symbol_id,
+            strategy_id,
+            pos_uid
+        FROM orders
+        WHERE exchange_id = %s
+          AND account_id = %s
+          AND client_order_id = %s
+          AND status = 'PENDING_SUBMIT'
+        ORDER BY created_at DESC
+        LIMIT 1
+        """
+        row = self._fetchone(sql, (exchange_id, account_id, client_order_id))
+        if not row:
+            return None
+        return dict(row)

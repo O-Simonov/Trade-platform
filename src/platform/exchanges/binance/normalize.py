@@ -136,6 +136,7 @@ def norm_user_event(evt: dict) -> dict:
             out["trade_row"] = {
                 "trade_id": str(trade_id),
                 "order_id": order_id,
+                "client_order_id": client_id,
                 "symbol": sym,
                 "side": str(o.get("S")) if o.get("S") else None,
                 "price": px,

@@ -17,7 +17,7 @@ class BalancePoller(threading.Thread):
         exchange_id: int,
         account_id: int,
         account: str,
-        poll_sec: float = 30.0,
+        poll_sec: float = 120.0,
     ):
         super().__init__(
             daemon=True,

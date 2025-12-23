@@ -25,13 +25,12 @@ instances:
   oms_reconcile_sec: 15
   oms_pending_timeout_sec: 20
   params:
-    qty: 0.1
-    hold_sec: 10
-
+    qty: 0.4
+    hold_sec: 5
   risk:
     max_open_positions: 2
     max_notional_usdt: 2000
-    max_order_qty: 0.3
+    max_order_qty: 1.5
     max_daily_loss_usdt: 200
     max_drawdown_pct: 0.15
     min_available_margin_pct: 0.2
@@ -48,16 +47,17 @@ instances:
   - LTCUSDT
   candle_intervals:
   - 1m
+  - 5m
   funding_poll_sec: 180
   oms_reconcile_sec: 15
   oms_pending_timeout_sec: 20
   params:
-    qty: 0.1
-    hold_sec: 10
+    qty: 0.4
+    hold_sec: 5
   risk:
     max_open_positions: 5
     max_notional_usdt: 2000
-    max_order_qty: 0.3
+    max_order_qty: 1.5
     max_daily_loss_usdt: 200
     max_drawdown_pct: 0.15
     min_available_margin_pct: 0.2

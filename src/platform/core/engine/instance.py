@@ -17,8 +17,11 @@ from src.platform.core.risk.risk_engine import RiskEngine, RiskLimits
 from src.platform.market_state.reader import MarketStateReader
 from src.platform.market_state.pollers.balance_poller import BalancePoller
 from src.platform.market_state.pollers.oi_poller import OpenInterestPoller
+from src.platform.core.oms.writer import OmsWriter
+from src.platform.core.oms.parser import parse_binance_user_event
 
-from src.platform.exchanges.binance.normalize import norm_user_event  # как в твоём normalize.ru
+
+
 
 logger = logging.getLogger(__name__)
 
@@ -26,39 +29,32 @@ logger = logging.getLogger(__name__)
 def new_pos_uid() -> str:
     return _uuid.uuid4().hex
 
-
 class TradingInstance:
-    """
-    TradingInstance — v9
-    - ticks -> strategy intent -> OMS -> risk -> submit
-    - MarketStateReader -> positions/balances
-    - D3: User WS -> orders/fills/trades in DB
-    """
+    exchange: ExchangeAdapter
+    storage: Storage
+    strategy: Strategy
 
-    def __init__(
-        self,
-        *,
-        exchange: ExchangeAdapter,
-        storage: Storage,
-        strategy: Strategy,
-        account: str,
-        role: str,
-        symbols: list[str],
-        candle_intervals: list[str],
-        funding_poll_sec: float,
-        oms_reconcile_sec: float,
-        oms_pending_timeout_sec: float,
-        ids: dict,
-        risk_limits: RiskLimits,
-        base_ref: dict | None = None,
-        hedge_ratio: float | None = None,
-        dry_run: bool = True,
-    ):
+    # --- runtime ---
+    account: str
+    role: str
+    symbols: list[str]
+    candle_intervals: list[str]
+    def __init__(self, *, exchange, storage, strategy, account, role, symbols,
+                 candle_intervals, funding_poll_sec, oms_reconcile_sec,
+                 oms_pending_timeout_sec, ids, risk_limits,
+                 base_ref=None, hedge_ratio=None, dry_run=True):
         self.logger = logging.getLogger("src.platform.core.engine.instance")
+
+
+
+        self.oms_writer = OmsWriter(storage)
 
         self.ex = exchange
         self.db = storage
         self.strategy = strategy
+
+        self.exchange = exchange
+        self.storage = storage
 
         self.account = account
         self.role = (role or "MIXED").upper()
@@ -67,15 +63,16 @@ class TradingInstance:
         self.ids = dict(ids)
         self.dry_run = bool(dry_run)
 
-        self.funding_poll_sec = float(funding_poll_sec)
-        self.base_ref = base_ref
-        self.hedge_ratio = hedge_ratio
+        # ✅ удобные алиасы (ЧТОБЫ НЕ ПУТАТЬСЯ)
+        self.exchange_id: int = int(self.ids["_exchange_id"])
+        self.account_id: int = int(self.ids["_account_id"])
+        self.symbol_ids: dict[str, int] = {s: int(self.ids[s]) for s in self.symbols if s in self.ids}
 
         # OMS + Risk
         self.oms = OrderManager(
             storage=self.db,
-            exchange_id=self.ids["_exchange_id"],
-            account_id=self.ids["_account_id"],
+            exchange_id=self.exchange_id,
+            account_id=self.account_id,
         )
         self.risk = RiskEngine(risk_limits)
 
@@ -128,48 +125,78 @@ class TradingInstance:
 
     # ---------------- USER WS ----------------
 
-    def on_user_event(self, evt: dict) -> None:
-        parsed = norm_user_event(evt)
-        if not parsed:
-            return
+    def on_user_event(self, event: dict):
+        try:
+            o = event.get("o")
+            if not o:
+                return
 
-        ex_id = self.ids["_exchange_id"]
-        acc_id = self.ids["_account_id"]
+            symbol = o.get("s")
+            if not symbol:
+                return
 
-        # orders
-        if "order_row" in parsed:
-            row = parsed["order_row"]
-            sym = row.get("symbol")
-            sym_id = self.ex.symbol_ids.get(sym) if sym else None
-            if sym_id:
-                self.db.upsert_orders([{**row, "exchange_id": ex_id, "account_id": acc_id, "symbol_id": sym_id}])
+            symbol_id = self.ids.get(symbol)
+            if not symbol_id:
+                self.logger.warning(
+                    "[USER EVENT] Unknown symbol %s (ids=%s)", symbol, list(self.ids.keys())
+                )
+                return
 
-        # fills
-        if "fill_row" in parsed:
-            row = parsed["fill_row"]
-            sym = row.get("symbol")
-            sym_id = self.ex.symbol_ids.get(sym) if sym else None
-            if sym_id:
-                self.db.upsert_order_fills([{**row, "exchange_id": ex_id, "account_id": acc_id, "symbol_id": sym_id}])
+            res = parse_binance_user_event(
+                event,
+                exchange_id=self.ids["_exchange_id"],
+                account_id=self.ids["_account_id"],
+                symbol_id=symbol_id,  # ✅ ВЕРНО
+            )
 
-        # trades (+ привязка strategy_id/pos_uid через OMS pending placeholder)
-        if "trade_row" in parsed:
-            row = parsed["trade_row"]
-            sym = row.get("symbol")
-            sym_id = self.ex.symbol_ids.get(sym) if sym else None
-            if sym_id:
-                meta = self.oms.get_pending_by_client_id(row.get("client_order_id"))
-                self.db.upsert_trades([{
-                    **row,
-                    "exchange_id": ex_id,
-                    "account_id": acc_id,
-                    "symbol_id": sym_id,
-                    "strategy_id": meta["strategy_id"] if meta else None,
-                    "pos_uid": meta["pos_uid"] if meta else None,
-                }])
+            if not res:
+                return
+
+            order_evt, trade_evt = res
+
+            self.oms_writer.write_order(order_evt)
+
+            if trade_evt:
+                self.oms_writer.write_trade(trade_evt)
+
+        except Exception:
+            self.logger.exception("[USER EVENT PARSE ERROR]")
+
+
+    def on_candle(self, candle: dict):
+        """
+        candle = {
+            symbol, interval, open_time,
+            open, high, low, close, volume, source
+        }
+        """
+        try:
+            # 1️⃣ передаём в стратегию
+            if hasattr(self.strategy, "on_candle"):
+                self.strategy.on_candle(
+                    symbol=candle["symbol"],
+                    interval=candle["interval"],
+                    candle=candle,
+                )
+
+            # 2️⃣ (опционально) сохранить в БД
+            self.storage.upsert_candles([{
+                "exchange_id": self.exchange.exchange_id,
+                "symbol_id": self.exchange.symbol_ids[candle["symbol"]],
+                "interval": candle["interval"],
+                "open_time": candle["open_time"],
+                "open": candle["open"],
+                "high": candle["high"],
+                "low": candle["low"],
+                "close": candle["close"],
+                "volume": candle["volume"],
+                "source": candle.get("source", "ws"),
+            }])
+
+        except Exception as e:
+            self.logger.exception("on_candle error: %s", e)
 
     # ---------------- TICKS ----------------
-
     def on_tick(self, symbol: str, price: float) -> None:
 
         symbol = symbol.upper()
@@ -250,50 +277,46 @@ class TradingInstance:
 
     # ---------------- RUN ----------------
 
-    def run(self) -> None:
-        self.refresh_positions()
-
-        threading.Thread(target=self._oms_reconcile_loop, daemon=True, name=f"OMSReconcile-{self.account}").start()
-        threading.Thread(target=self._market_state_refresh_loop, daemon=True, name=f"MarketStateRefresh-{self.account}").start()
-
-        BalancePoller(
-            exchange=self.ex,
-            storage=self.db,
-            exchange_id=self.ids["_exchange_id"],
-            account_id=self.ids["_account_id"],
-            account=self.account,
-            poll_sec=30.0,
-
-        ).start()
-
-        OpenInterestPoller(
-            exchange=self.ex,
-            storage=self.db,
-            exchange_id=self.ids["_exchange_id"],
-            account=self.account,
-            symbol_ids={s: self.ids[s] for s in self.symbols},
-            intervals=["5m", "15m", "1h"],
-            poll_sec=300.0,
-        ).start()
-
-        def _ticks_worker():
-            self.logger.info("[WS] subscribe_ticks account=%s symbols=%s", self.account, self.symbols)
-            self.ex.subscribe_ticks(account=self.account, symbols=self.symbols, cb=self.on_tick)
-
-        def _user_worker():
-            self.logger.info("[WS] subscribe_user_stream account=%s", self.account)
-            self.ex.subscribe_user_stream(account=self.account, cb=self.on_user_event)
-
-        threading.Thread(target=_ticks_worker, daemon=True, name=f"Ticks-{self.account}").start()
-        threading.Thread(target=_user_worker, daemon=True, name=f"UserWS-{self.account}").start()
-
-        self.logger.info(
+    def run(self):
+        logger.info(
             "[Instance] running: account=%s role=%s symbols=%s dry_run=%s",
-            self.account, self.role, ",".join(self.symbols), self.dry_run,
+            self.account,
+            self.role,
+            ",".join(self.symbols),
+            self.dry_run,
         )
 
+        # 🔹 1. TICKS (цены)
+        self.exchange.subscribe_ticks(
+            account=self.account,
+            symbols=self.symbols,
+            cb=self.on_tick,
+        )
+
+        # 🔹 2. USER STREAM (ордера / fills / trades)
+        self.exchange.subscribe_user_stream(
+            account=self.account,
+            cb=self.on_user_event,  # 🔥 ВОТ ЗДЕСЬ
+        )
+
+        # 🔹 3. CANDLES (если есть)
+        if self.candle_intervals:
+            self.exchange.subscribe_candles(
+                account=self.account,
+                symbols=self.symbols,
+                intervals=self.candle_intervals,
+                cb=self.on_candle,  # 🔥 ВАЖНО
+            )
+            self.logger.info(
+                "[WS] subscribe_candles account=%s symbols=%s intervals=%s",
+                self.account,
+                self.symbols,
+                self.candle_intervals,
+            )
+
+        # основной loop
         while not self._stop.is_set():
-            time.sleep(60)
+            time.sleep(1.0)
 
     def stop(self) -> None:
         self._stop.set()

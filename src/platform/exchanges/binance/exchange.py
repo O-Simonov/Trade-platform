@@ -6,6 +6,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from typing import List, Optional, Any
+import logging
 
 from src.platform.exchanges.base.exchange import (
     ExchangeAdapter,
@@ -18,7 +19,6 @@ from src.platform.core.models.enums import Side
 from src.platform.core.models.position import Position
 
 from src.platform.exchanges.binance.rest import BinanceFuturesREST
-from src.platform.exchanges.binance.ws import BinanceWS, WS_BASE
 from src.platform.exchanges.binance.normalize import (
     norm_position,
     norm_markprice_tick,
@@ -27,6 +27,7 @@ from src.platform.exchanges.binance.normalize import (
     norm_user_event,
 )
 from src.platform.exchanges.binance.order_normalizer import normalize_order
+from src.platform.exchanges.binance.ws import BinanceWS, WS_STREAM_BASE, WS_WS_BASE
 
 
 
@@ -40,6 +41,9 @@ class BinanceExchange(ExchangeAdapter):
     def __init__(self):
 
 
+        self._dual_side_by_account: dict[str, bool] = {}
+
+        self._log = logging.getLogger("binance.exchange")
         self._rest_by_account: dict[str, BinanceFuturesREST] = {}
         self._public_rest: Optional[BinanceFuturesREST] = None
 
@@ -64,8 +68,6 @@ class BinanceExchange(ExchangeAdapter):
         self.storage = storage
         self.exchange_id = int(exchange_id)
         self.symbol_ids = dict(symbol_ids or {})
-
-
 
     # ------------------------------------------------------------------
     # REST CLIENTS
@@ -100,11 +102,13 @@ class BinanceExchange(ExchangeAdapter):
     # ------------------------------------------------------------------
     # WEBSOCKETS
     # ------------------------------------------------------------------
-    def subscribe_ticks(self, account: str, symbols: List[str], cb: TickCallback) -> None:
+    def subscribe_ticks(self, account: str, symbols: list[str], cb):
         streams = [f"{s.lower()}@markPrice@1s" for s in symbols]
-        url = WS_BASE + "/".join(streams)
-        print("WS TICKS URL =", url)  # 🔥 ВАЖНО
+        if not streams:
+            return
 
+        url = WS_STREAM_BASE + "/".join(streams)
+        print("WS TICKS URL =", url)
 
         def on_msg(data: dict):
             res = norm_markprice_tick(data)
@@ -115,6 +119,22 @@ class BinanceExchange(ExchangeAdapter):
         ws = BinanceWS(url=url, on_message=on_msg, name=f"BinanceTicks-{account}")
         ws.start()
         self._tick_ws[account] = ws
+
+    def subscribe_user_stream(self, account: str, cb):
+        rest = self._rest(account)
+
+        lk = self._listen_key.get(account)
+        if not lk:
+            resp = rest.create_listen_key()
+            lk = resp.get("listenKey")
+            if not lk:
+                raise RuntimeError("listenKey error")
+            self._listen_key[account] = lk
+
+        url = f"{WS_WS_BASE}/{lk}"
+        ws = BinanceWS(url=url, on_message=cb, name=f"BinanceUser-{account}")
+        ws.start()
+        self._user_ws[account] = ws
 
     def subscribe_candles(
         self,
@@ -127,7 +147,10 @@ class BinanceExchange(ExchangeAdapter):
         if not streams:
             return
 
-        url = WS_BASE + "/" + "/".join(streams)
+        url = WS_STREAM_BASE + "/" + "/".join(streams)
+
+        self._log.info("[WS] subscribe_candles %s intervals=%s", symbols, intervals)
+        self._log.info("WS CANDLES URL = %s", url)
 
         def on_msg(data: dict):
             row = norm_kline_event(data)
@@ -137,28 +160,6 @@ class BinanceExchange(ExchangeAdapter):
         ws = BinanceWS(url=url, on_message=on_msg, name=f"BinanceKlines-{account}")
         ws.start()
         self._kline_ws[account] = ws
-
-    def subscribe_user_stream(
-            self,
-            account: str,
-            cb: UserEventCallback,
-    ) -> None:
-        rest = self._rest(account)
-
-        lk = self._listen_key.get(account)
-        if not lk:
-            resp = rest.create_listen_key()
-            lk = resp.get("listenKey")
-            if not lk:
-                raise RuntimeError("listenKey error")
-            self._listen_key[account] = lk
-
-        ws = BinanceWS(
-            url=WS_BASE + "/" + lk,
-            on_message=cb,  # 🔥 ВАЖНО: просто пробрасываем evt
-            name=f"BinanceUser-{account}",
-        )
-        ws.start()
 
     # ------------------------------------------------------------------
     # FETCH

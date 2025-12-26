@@ -19,12 +19,9 @@ from src.platform.market_state.pollers.balance_poller import BalancePoller
 from src.platform.market_state.pollers.oi_poller import OpenInterestPoller
 from src.platform.core.oms.writer import OmsWriter
 from src.platform.core.oms.parser import parse_binance_user_event
-
-
-
+from src.platform.core.position import PositionAggregator
 
 logger = logging.getLogger(__name__)
-
 
 def new_pos_uid() -> str:
     return _uuid.uuid4().hex
@@ -43,7 +40,9 @@ class TradingInstance:
                  candle_intervals, funding_poll_sec, oms_reconcile_sec,
                  oms_pending_timeout_sec, ids, risk_limits,
                  base_ref=None, hedge_ratio=None, dry_run=True):
+
         self.logger = logging.getLogger("src.platform.core.engine.instance")
+
 
 
 
@@ -95,6 +94,7 @@ class TradingInstance:
             "[Init] account=%s role=%s symbols=%s dry_run=%s",
             self.account, self.role, ",".join(self.symbols), self.dry_run,
         )
+        self.pos_agg = PositionAggregator(storage=self.storage, logger_=self.logger)
 
     # ---------------- POSITIONS ----------------
 
@@ -158,6 +158,14 @@ class TradingInstance:
 
             if trade_evt:
                 self.oms_writer.write_trade(trade_evt)
+                # ✅ обновляем позицию
+                pos = self.pos_agg.on_trade(trade_evt)
+                if pos:
+                    self.logger.info(
+                        f"[POS] symbol_id={pos.symbol_id} side={pos.side} qty={pos.qty} "
+                        f"entry={pos.entry_price} realized={pos.realized_pnl} fees={pos.fees} status={pos.status}"
+                    )
+
 
         except Exception:
             self.logger.exception("[USER EVENT PARSE ERROR]")
@@ -208,6 +216,19 @@ class TradingInstance:
             price,
             "YES" if position else "NO",
         )
+
+        # ==========================================================
+        # ✅ ШАГ 3. Передаём MARK PRICE в PositionAggregator
+        # ==========================================================
+        symbol_id = self.symbol_ids.get(symbol)
+        if symbol_id:
+            self.pos_agg.on_mark_price(
+                exchange_id=self.exchange_id,
+                account_id=self.account_id,
+                symbol_id=symbol_id,
+                mark_price=float(price),
+            )
+        # ==========================================================
 
         intent = self.strategy.on_tick(symbol, float(price), position, pos_uid)
         if intent is None:

@@ -3,28 +3,132 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Dict, Iterable,Optional, Any
+from typing import Dict, Iterable,Optional, Sequence, Any
 from datetime import datetime, timezone
 
 from psycopg_pool import ConnectionPool
 from psycopg.rows import dict_row
+from psycopg import sql
 
-
-from src.platform.market_state import (
-    AccountBalanceSnapshot,
-    OpenInterestPoint,
-)
+from src.platform.market_state import AccountBalanceSnapshot, OpenInterestPoint
+from src.platform.core.position.position_state import PositionState
 
 logger = logging.getLogger(__name__)
+
+def _utcnow() -> datetime:
+    return datetime.now(tz=timezone.utc)
 
 
 class PostgreSQLStorage:
     """
     PostgreSQL storage — OMS / Orders / Fills / PnL (v9)
     """
-
     def __init__(self, pool):
         self.pool = pool
+
+    def upsert_position(self, position: Any) -> int:
+        return self.upsert_positions([position])
+
+    def upsert_positions(self, positions: Sequence[Any]) -> int:
+        """
+        UPSERT для таблицы positions.
+
+        Требования в БД:
+          - UNIQUE (exchange_id, account_id, symbol_id)
+          - колонки:
+            side, qty, entry_price,
+            realized_pnl, exchange_realized_pnl,
+            fees, last_trade_id, status, last_ts, updated_at
+        """
+        if not positions:
+            return 0
+
+        sql = """
+              INSERT INTO positions (exchange_id, \
+                                     account_id, \
+                                     symbol_id, \
+                                     side, \
+                                     qty, \
+                                     entry_price, \
+                                     realized_pnl, \
+                                     exchange_realized_pnl, \
+                                     fees, \
+                                     last_trade_id, \
+                                     status, \
+                                     last_ts, \
+                                     updated_at, \
+                                     mark_price, \
+                                     unrealized_pnl, \
+                                     source)
+              VALUES (%(exchange_id)s, \
+                      %(account_id)s, \
+                      %(symbol_id)s, \
+                      %(side)s, \
+                      %(qty)s, \
+                      %(entry_price)s, \
+                      %(realized_pnl)s, \
+                      %(exchange_realized_pnl)s, \
+                      %(fees)s, \
+                      %(last_trade_id)s, \
+                      %(status)s, \
+                      %(last_ts)s, \
+                      %(updated_at)s, \
+                      %(mark_price)s, \
+                      %(unrealized_pnl)s, \
+                      %(source)s) ON CONFLICT (exchange_id, account_id, symbol_id)
+        DO \
+              UPDATE SET
+                  side = EXCLUDED.side, \
+                  qty = EXCLUDED.qty, \
+                  entry_price = EXCLUDED.entry_price, \
+                  realized_pnl = EXCLUDED.realized_pnl, \
+                  exchange_realized_pnl = EXCLUDED.exchange_realized_pnl, \
+                  fees = EXCLUDED.fees, \
+                  last_trade_id = EXCLUDED.last_trade_id, \
+                  status = EXCLUDED.status, \
+                  last_ts = EXCLUDED.last_ts, \
+                  updated_at = EXCLUDED.updated_at, \
+                  mark_price = EXCLUDED.mark_price, \
+                  unrealized_pnl = EXCLUDED.unrealized_pnl, \
+                  source = EXCLUDED.source; \
+              """
+
+        now = _utcnow()
+
+        def get(obj: Any, key: str, default=None):
+            if isinstance(obj, dict):
+                return obj.get(key, default)
+            return getattr(obj, key, default)
+
+        rows = []
+        for p in positions:
+            rows.append(
+                {
+                    "exchange_id": int(get(p, "exchange_id")),
+                    "account_id": int(get(p, "account_id")),
+                    "symbol_id": int(get(p, "symbol_id")),
+                    "side": get(p, "side"),
+                    "qty": float(get(p, "qty", 0.0) or 0.0),
+                    "entry_price": float(get(p, "entry_price", 0.0) or 0.0),
+                    "realized_pnl": float(get(p, "realized_pnl", 0.0) or 0.0),
+                    "exchange_realized_pnl": float(get(p, "exchange_realized_pnl", 0.0) or 0.0),
+                    "fees": float(get(p, "fees", 0.0) or 0.0),
+                    "last_trade_id": str(get(p, "last_trade_id")) if get(p, "last_trade_id") is not None else None,
+                    "status": get(p, "status"),
+                    "last_ts": get(p, "last_ts"),
+                    "updated_at": now,
+                    "mark_price": float(get(p, "mark_price", 0.0)),
+                    "unrealized_pnl": float(get(p, "unrealized_pnl", 0.0)),
+                    "source": "ws_user",
+                }
+            )
+
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.executemany(sql, rows)
+            conn.commit()
+
+        return len(rows)
 
     # ------------------------------------------------------------------
     # INTERNAL SQL HELPERS

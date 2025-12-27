@@ -61,6 +61,8 @@ class BinanceExchange(ExchangeAdapter):
         self.account_ids: dict[str, int] = {}  # account -> account_id
         self.oms_by_account: dict[str, Any] = {}  # account -> OrderManager (опционально)
 
+        self.logger = logging.getLogger("binance.exchange")
+
     # ------------------------------------------------------------------
     # BIND CONTEXT (called by TradingInstance)
     # ------------------------------------------------------------------
@@ -203,34 +205,73 @@ class BinanceExchange(ExchangeAdapter):
     # ORDER PLACEMENT (D2 — NORMALIZED)
     # ------------------------------------------------------------------
     def place_order(self, intent: OrderIntent) -> dict:
+        # ------------------------------------------------------------------
+        # Preconditions
+        # ------------------------------------------------------------------
         if not self.storage or self.exchange_id is None:
-            raise RuntimeError("BinanceExchange is not bound: storage/exchange_id missing. Call ex.bind(...)")
+            raise RuntimeError(
+                "BinanceExchange is not bound: storage/exchange_id missing. "
+                "Call ex.bind(...)"
+            )
 
         if intent.symbol not in self.symbol_ids:
-            raise KeyError(f"symbol_id not found for {intent.symbol}. Did you bind symbol_ids correctly?")
+            raise KeyError(
+                f"symbol_id not found for {intent.symbol}. "
+                f"Did you bind symbol_ids correctly?"
+            )
 
         rest = self._rest(intent.account)
+        symbol_id = int(self.symbol_ids[intent.symbol])
+
         side = "BUY" if intent.side == Side.LONG else "SELL"
 
+        # ------------------------------------------------------------------
+        # Load symbol filters
+        # ------------------------------------------------------------------
         filters = self.storage.get_symbol_filters(
             exchange_id=self.exchange_id,
-            symbol_id=self.symbol_ids[intent.symbol],
+            symbol_id=symbol_id,
         )
 
+        # 🔍 DEBUG: логируем фильтры
+        self.logger.debug(
+            "[FILTERS] symbol=%s symbol_id=%s tick=%s step=%s "
+            "min_qty=%s max_qty=%s min_notional=%s",
+            intent.symbol,
+            symbol_id,
+            filters.get("price_tick"),
+            filters.get("qty_step"),
+            filters.get("min_qty"),
+            filters.get("max_qty"),
+            filters.get("min_notional"),
+        )
+
+        # ------------------------------------------------------------------
+        # Normalize qty / price
+        # ------------------------------------------------------------------
         qty, price = normalize_order(
             qty=float(intent.qty),
-            price=(float(intent.price) if intent.price is not None else None),
+            price=float(intent.price) if intent.price is not None else None,
             qty_step=float(filters["qty_step"]),
-            min_qty=float(filters["min_qty"]),
-            max_qty=(float(filters["max_qty"]) if filters.get("max_qty") is not None else None),
-            price_tick=(float(filters["price_tick"]) if filters.get("price_tick") is not None else None),
-            min_notional=(float(filters["min_notional"]) if filters.get("min_notional") is not None else None),
+            min_qty=float(filters["min_qty"]) if filters.get("min_qty") is not None else None,
+            max_qty=float(filters["max_qty"]) if filters.get("max_qty") is not None else None,
+            price_tick=float(filters["price_tick"]) if filters.get("price_tick") is not None else None,
+            min_notional=float(filters["min_notional"]) if filters.get("min_notional") is not None else None,
         )
 
-        if qty <= 0:
-            raise ValueError(f"Normalized qty <= 0 for {intent.symbol}")
+        # ------------------------------------------------------------------
+        # Validation after normalization
+        # ------------------------------------------------------------------
+        if qty is None or qty <= 0:
+            raise ValueError(
+                f"Normalized qty <= 0 for {intent.symbol} "
+                f"(raw_qty={intent.qty})"
+            )
 
-        params: dict = {
+        # ------------------------------------------------------------------
+        # Build order params
+        # ------------------------------------------------------------------
+        params: dict[str, str] = {
             "symbol": intent.symbol,
             "side": side,
             "type": intent.order_type.value,
@@ -247,6 +288,22 @@ class BinanceExchange(ExchangeAdapter):
             params["price"] = str(price)
             params["timeInForce"] = "GTC"
 
+        # ------------------------------------------------------------------
+        # Log final order before submit
+        # ------------------------------------------------------------------
+        self.logger.info(
+            "[ORDER SUBMIT] %s %s qty=%s price=%s reduce_only=%s cid=%s",
+            intent.symbol,
+            side,
+            qty,
+            price,
+            intent.reduce_only,
+            intent.client_order_id,
+        )
+
+        # ------------------------------------------------------------------
+        # Submit order
+        # ------------------------------------------------------------------
         return rest.new_order(**params)
 
     # ------------------------------------------------------------------

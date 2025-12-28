@@ -11,6 +11,8 @@ from src.platform.core.strategy.base import Strategy
 from src.platform.core.risk.risk_engine import RiskLimits
 from src.platform.exchanges.base.exchange import ExchangeAdapter
 from src.platform.data.storage.postgres.storage import PostgreSQLStorage
+
+from src.platform.core.oms.oms import OrderManager
 from src.platform.core.oms.parser import parse_binance_user_event
 
 
@@ -38,13 +40,12 @@ class TradingInstance:
 
         # --- identity ---
         self.exchange = exchange
-        self.ex = exchange  # ✅ backward-compatible alias (runner/old code)
+        self.ex = exchange  # backward compatibility
         self.account = account
         self.role = role
         self.symbols = list(symbols or [])
         self.strategy = strategy
 
-        # ✅ FIX: сохраняем candle_intervals
         self.candle_intervals = list(candle_intervals or [])
 
         # --- infra ---
@@ -53,7 +54,6 @@ class TradingInstance:
         self.exchange_id = int(self.ids["_exchange_id"])
         self.account_id = int(self.ids.get("_account_id") or 0)
 
-        # symbol_ids shortcut
         self.symbol_ids: dict[str, int] = {
             s: int(self.ids[s]) for s in self.symbols if s in self.ids
         }
@@ -75,22 +75,24 @@ class TradingInstance:
         self._running = False
         self._stop = threading.Event()
 
-        # OMS hooks (будут подключаться на STEP E)
-        self.oms = None
-        self.oms_reconciler = None
+        # --- OMS ---
+        self.oms = OrderManager(
+            storage=self.storage,
+            exchange_id=self.exchange_id,
+            account_id=self.account_id,
+        )
+        self.oms_reconciler = None  # подключается позже (REST)
 
         # runtime cache
-        self._last_account_state: dict | None = None
+        self._last_account_state: Optional[dict] = None
+
+        self._last_idle_log = 0.0
 
     # ------------------------------------------------------------------
     # lifecycle
     # ------------------------------------------------------------------
 
     def run(self) -> None:
-        """
-        Main blocking loop.
-        WS callbacks feed data → intents processed here.
-        """
         self.logger.info(
             "[Instance] running: account=%s role=%s symbols=%s dry_run=%s",
             self.account,
@@ -101,7 +103,7 @@ class TradingInstance:
 
         self._running = True
 
-        # --- subscriptions ---
+        # --- WS subscriptions ---
         self.exchange.subscribe_ticks(
             account=self.account,
             symbols=self.symbols,
@@ -121,23 +123,28 @@ class TradingInstance:
                 cb=self._on_candle,
             )
 
-        # OMS reconcile loop (daemon)
-        t = threading.Thread(target=self._oms_loop, daemon=True, name=f"OMSLoop-{self.account}")
-        t.start()
+        # OMS loop
+        threading.Thread(
+            target=self._oms_loop,
+            daemon=True,
+            name=f"OMSLoop-{self.account}",
+        ).start()
 
-        # Account polling loop (STEP F)
-        t_acc = threading.Thread(
+        # account polling loop
+        threading.Thread(
             target=self._account_loop,
             daemon=True,
             name=f"AccountLoop-{self.account}",
-        )
-        t_acc.start()
+        ).start()
 
         self.strategy.on_start()
 
-        # --- idle loop ---
         while self._running and not self._stop.is_set():
             self._drain_intents()
+            now = time.time()
+            if now - self._last_idle_log >= 10.0:
+                self.logger.info("[Instance] idle (alive)")
+                self._last_idle_log = now
             time.sleep(0.05)
 
     def stop(self) -> None:
@@ -153,26 +160,29 @@ class TradingInstance:
     # ------------------------------------------------------------------
 
     def _on_tick(self, symbol: str, price: float) -> None:
-        self.logger.info("[TICK] %s price=%s", symbol, price)
         self.strategy.on_tick(symbol=symbol, price=price)
 
     def _on_candle(self, candle: dict) -> None:
-        # оставляю как у тебя: strategy сама решит что делать
         if hasattr(self.strategy, "on_candle"):
             self.strategy.on_candle(candle=candle)
 
-
     def _on_user_event(self, event: dict) -> None:
+        """
+        STEP G — UserStream → OMS
+        """
         if not self.oms:
             return
 
         try:
-            for ev in parse_binance_user_event(
-                    event,
-                    exchange=self.exchange.name,
-                    account=self.account,
-            ):
+            events = parse_binance_user_event(
+                event,
+                exchange=self.exchange.name,
+                account=self.account,
+            )
+
+            for ev in events:
                 self.oms.apply_event(ev)
+
         except Exception:
             self.logger.exception("[OMS][USER_EVENT ERROR]")
 
@@ -189,18 +199,19 @@ class TradingInstance:
             self._process_intent(intent)
 
     def _process_intent(self, intent: OrderIntent) -> None:
-        """
-        Сейчас: минимальная отправка.
-        STEP D/E: сюда добавится preflight + state machine.
-        """
         if self.dry_run:
             self.logger.info(
                 "[DRY_RUN] %s %s qty=%s cid=%s",
                 intent.symbol,
                 intent.side.name,
                 intent.qty,
-                getattr(intent, "client_order_id", None),
+                intent.client_order_id,
             )
+            return
+
+        # OMS idempotency gate
+        if not self.oms.should_submit(intent.client_order_id):
+            self.logger.debug("[OMS] skip duplicate cid=%s", intent.client_order_id)
             return
 
         self.logger.info(
@@ -208,43 +219,43 @@ class TradingInstance:
             intent.symbol,
             intent.side.name,
             intent.qty,
-            getattr(intent, "client_order_id", None),
+            intent.client_order_id,
         )
 
-        # ✅ ExchangeAdapter.place_order(intent) — без extra args
+        self.oms.record_pending_submit(
+            client_order_id=intent.client_order_id,
+            symbol_id=self.symbol_ids[intent.symbol],
+            strategy_id=self.strategy.strategy_id,
+            pos_uid=intent.pos_uid,
+            intent=intent,
+        )
+
         self.exchange.place_order(intent)
 
     # ------------------------------------------------------------------
-    # OMS reconcile loop (STEP E.4)
+    # OMS reconcile loop
     # ------------------------------------------------------------------
 
     def _oms_loop(self) -> None:
-        """
-        STEP E.4:
-          - reconcile pending timeouts
-          - REST reconcile open orders (run_once requires symbol_ids)
-        """
         while not self._stop.is_set():
             try:
-                if self.oms:
-                    self.oms.reconcile_pending_timeouts(self.oms_pending_timeout_sec)
+                self.oms.reconcile_pending_timeouts(self.oms_pending_timeout_sec)
 
                 if self.oms_reconciler:
-                    # ✅ твой reconciler требует symbol_ids
                     sym_ids = list(self.symbol_ids.values())
                     if sym_ids:
                         self.oms_reconciler.run_once(symbol_ids=sym_ids)
+
             except Exception:
                 self.logger.exception("[OMS LOOP ERROR]")
+
             time.sleep(self.oms_reconcile_sec)
 
+    # ------------------------------------------------------------------
+    # account polling
+    # ------------------------------------------------------------------
+
     def _account_loop(self) -> None:
-        """
-        STEP F:
-          - poll account state
-          - store snapshot
-          - update runtime cache for RiskEngine
-        """
         while not self._stop.is_set():
             try:
                 state = self.exchange.fetch_account_state(account=self.account)
@@ -257,14 +268,8 @@ class TradingInstance:
 
                 self._last_account_state = state
 
-                self.logger.debug(
-                    "[ACCOUNT] wallet=%s equity=%s avail=%s",
-                    state.get("wallet_balance"),
-                    state.get("equity"),
-                    state.get("available_balance"),
-                )
-
             except Exception:
                 self.logger.exception("[ACCOUNT LOOP ERROR]")
 
             time.sleep(self.funding_poll_sec)
+

@@ -1,52 +1,45 @@
 # src/platform/core/oms/events.py
 from __future__ import annotations
-
 from dataclasses import dataclass
-from datetime import datetime
+from enum import Enum
 from typing import Optional
 
 
-@dataclass(frozen=True, slots=True)
+class OrderStatus(str, Enum):
+    NEW = "NEW"
+    PARTIALLY_FILLED = "PARTIALLY_FILLED"
+    FILLED = "FILLED"
+    CANCELED = "CANCELED"
+    EXPIRED = "EXPIRED"
+    REJECTED = "REJECTED"
+
+
+@dataclass(frozen=True)
 class OrderEvent:
-    exchange_id: int
-    account_id: int
-    symbol_id: int
-
+    exchange: str
+    account: str
     symbol: str
-    order_id: Optional[int]
+    order_id: int
     client_order_id: Optional[str]
-
-    side: Optional[str]          # "BUY"/"SELL"
-    order_type: Optional[str]    # "MARKET"/"LIMIT"/...
-    status: Optional[str]        # "NEW"/"FILLED"/"CANCELED"/...
-
-    price: Optional[float]
-    avg_price: Optional[float]
-    orig_qty: Optional[float]
-    executed_qty: Optional[float]
-
-    reduce_only: Optional[bool]
-    event_ts: datetime
+    status: OrderStatus
+    side: str
+    price: float
+    qty: float
+    filled_qty: float
+    event_ts: float
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class TradeEvent:
-    exchange_id: int
-    account_id: int
-    symbol_id: int
-
+    exchange: str
+    account: str
     symbol: str
-    order_id: Optional[int]
-    client_order_id: Optional[str]
-    trade_id: Optional[int]
-
-    side: Optional[str]          # "BUY"/"SELL"
-    qty: Optional[float]
-    price: Optional[float]
-
-    realized_pnl: Optional[float]
-    commission: Optional[float]
-    commission_asset: Optional[str]
-
-    is_maker: Optional[bool]
-    trade_ts: datetime
+    trade_id: int
+    order_id: int
+    side: str
+    price: float
+    qty: float
+    realized_pnl: float
+    fee: float
+    fee_asset: str
+    event_ts: float

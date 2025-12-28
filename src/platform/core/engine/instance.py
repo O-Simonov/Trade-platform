@@ -11,6 +11,7 @@ from src.platform.core.strategy.base import Strategy
 from src.platform.core.risk.risk_engine import RiskLimits
 from src.platform.exchanges.base.exchange import ExchangeAdapter
 from src.platform.data.storage.postgres.storage import PostgreSQLStorage
+from src.platform.core.oms.parser import parse_binance_user_event
 
 
 class TradingInstance:
@@ -160,13 +161,20 @@ class TradingInstance:
         if hasattr(self.strategy, "on_candle"):
             self.strategy.on_candle(candle=candle)
 
+
     def _on_user_event(self, event: dict) -> None:
-        """
-        User stream events (orders / trades).
-        STEP E будет сюда подключать parser + oms.apply_event(...)
-        """
-        # пока заглушка, чтобы не падать
-        return
+        if not self.oms:
+            return
+
+        try:
+            for ev in parse_binance_user_event(
+                    event,
+                    exchange=self.exchange.name,
+                    account=self.account,
+            ):
+                self.oms.apply_event(ev)
+        except Exception:
+            self.logger.exception("[OMS][USER_EVENT ERROR]")
 
     # ------------------------------------------------------------------
     # intents → OMS

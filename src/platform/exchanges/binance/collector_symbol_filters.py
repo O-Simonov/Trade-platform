@@ -2,14 +2,15 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from datetime import datetime, timezone
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, Optional
 
-log = logging.getLogger("src.platform.exchanges.binance.collector_symbol_filters")
+logger = logging.getLogger("src.platform.exchanges.binance.collector_symbol_filters")
 
 
-def _to_float(x: Any) -> float | None:
+def _to_float(x) -> Optional[float]:
     try:
         if x is None:
             return None
@@ -18,44 +19,48 @@ def _to_float(x: Any) -> float | None:
         return None
 
 
-def _extract_filters_from_exchange_info_symbol(sym: dict) -> dict[str, Any]:
+def _extract_filters_for_symbol(sym_info: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Parse Binance exchangeInfo symbol entry -> our symbol_filters fields.
-    We derive:
-      price_tick  from PRICE_FILTER.tickSize
-      qty_step    from LOT_SIZE.stepSize
-      min_qty     from LOT_SIZE.minQty
-      max_qty     from LOT_SIZE.maxQty
-      min_notional from MIN_NOTIONAL.notional or MIN_NOTIONAL.minNotional (some variants)
+    Parse Binance exchangeInfo["symbols"][i]["filters"] into normalized fields.
+    We care about:
+      - price_tick (PRICE_FILTER.tickSize)
+      - qty_step, min_qty, max_qty (LOT_SIZE)
+      - min_notional (MIN_NOTIONAL.notional)
     """
-    price_tick = None
-    qty_step = None
-    min_qty = None
-    max_qty = None
-    min_notional = None
-
-    for f in (sym.get("filters") or []):
-        ftype = f.get("filterType")
-        if ftype == "PRICE_FILTER":
-            price_tick = _to_float(f.get("tickSize"))
-        elif ftype == "LOT_SIZE":
-            qty_step = _to_float(f.get("stepSize"))
-            min_qty = _to_float(f.get("minQty"))
-            max_qty = _to_float(f.get("maxQty"))
-        elif ftype == "MIN_NOTIONAL":
-            # Binance futures can use "notional" field
-            min_notional = _to_float(f.get("notional")) or _to_float(f.get("minNotional"))
-
-    return {
-        "price_tick": price_tick,
-        "qty_step": qty_step,
-        "min_qty": min_qty,
-        "max_qty": max_qty,
-        "min_notional": min_notional,
-        # We don't have these reliably from exchangeInfo -> keep None for now
+    out: Dict[str, Any] = {
+        "price_tick": None,
+        "qty_step": None,
+        "min_qty": None,
+        "max_qty": None,
+        "min_notional": None,
+        # optional extras
         "max_leverage": None,
         "margin_type": None,
     }
+
+    filters = sym_info.get("filters") or []
+    for f in filters:
+        ftype = f.get("filterType")
+
+        if ftype == "PRICE_FILTER":
+            out["price_tick"] = _to_float(f.get("tickSize"))
+
+        elif ftype == "LOT_SIZE":
+            out["qty_step"] = _to_float(f.get("stepSize"))
+            out["min_qty"] = _to_float(f.get("minQty"))
+            out["max_qty"] = _to_float(f.get("maxQty"))
+
+        elif ftype == "MIN_NOTIONAL":
+            # on futures it's usually "notional"
+            out["min_notional"] = _to_float(f.get("notional") or f.get("minNotional"))
+
+    # safety defaults (so preflight won't crash on None)
+    if out["price_tick"] is None:
+        out["price_tick"] = 0.0
+    if out["qty_step"] is None:
+        out["qty_step"] = 0.0
+
+    return out
 
 
 def run_symbol_filters_collector(
@@ -67,55 +72,78 @@ def run_symbol_filters_collector(
     interval_sec: int = 3600,
 ) -> None:
     """
-    Periodically load exchangeInfo and upsert trading filters for configured symbols.
+    Daemon loop: fetch exchangeInfo and upsert symbol_filters for given symbol_ids.
     """
-    interval_sec = int(interval_sec)
-    log.info("[SymbolFilters] collector started interval=%ss", interval_sec)
+    interval_sec = int(interval_sec or 3600)
+    logger.info("[SymbolFilters] collector started interval=%ss", interval_sec)
 
     while True:
         try:
             info = binance_rest.fetch_exchange_info()
-            symbols_info = info.get("symbols") or []
-
-            # build dict: "LTCUSDT" -> parsed filters
-            parsed: Dict[str, dict] = {}
-            for s in symbols_info:
-                name = str(s.get("symbol") or "").upper()
-                if not name:
-                    continue
-                parsed[name] = _extract_filters_from_exchange_info_symbol(s)
+            symbols = info.get("symbols") or []
 
             now = datetime.now(timezone.utc)
+            rows = []
 
-            rows: List[Tuple[Any, ...]] = []
-            for sym, sid in symbol_ids.items():
-                f = parsed.get(sym)
-                if not f:
+            # build only for our symbols
+            need = set((symbol_ids or {}).keys())
+
+            for s in symbols:
+                sym = (s.get("symbol") or "").upper()
+                if not sym or sym not in need:
                     continue
 
-                # must be 10 fields (see storage.upsert_symbol_filters)
-                rows.append((
-                    int(exchange_id),
-                    int(sid),
-                    f.get("price_tick"),
-                    f.get("qty_step"),
-                    f.get("min_qty"),
-                    f.get("max_qty"),
-                    f.get("min_notional"),
-                    f.get("max_leverage"),   # None пока
-                    f.get("margin_type"),    # None пока
-                    now,
-                ))
+                parsed = _extract_filters_for_symbol(s)
+                rows.append(
+                    {
+                        "exchange_id": int(exchange_id),
+                        "symbol_id": int(symbol_ids[sym]),
+                        "price_tick": parsed["price_tick"],
+                        "qty_step": parsed["qty_step"],
+                        "min_qty": parsed["min_qty"],
+                        "max_qty": parsed["max_qty"],
+                        "min_notional": parsed["min_notional"],
+                        "max_leverage": parsed.get("max_leverage"),
+                        "margin_type": parsed.get("margin_type"),
+                        "updated_at": now,
+                    }
+                )
 
+            n = 0
             if rows:
                 n = storage.upsert_symbol_filters(rows)
-                log.info("[SymbolFilters] upserted %s symbols", n)
-            else:
-                log.warning("[SymbolFilters] nothing to upsert (no rows)")
 
-        except Exception as e:
-            # если это бан 418 от Binance, твой REST клиент обычно кидает RuntimeError(...)
-            # просто логируем и не валим поток
-            log.exception("[SymbolFilters] error: %s", e)
+            logger.info("[SymbolFilters] upserted %s symbols", n)
+
+        except Exception:
+            logger.exception("[SymbolFilters] error")
 
         time.sleep(interval_sec)
+
+
+def start_symbol_filters_collector(
+    *,
+    rest,
+    storage,
+    exchange_id: int,
+    symbol_ids: Dict[str, int],
+    interval_sec: int = 3600,
+) -> None:
+    """
+    Helper to start collector in a daemon thread (like you call from run_instances.py).
+    """
+    t = threading.Thread(
+        target=run_symbol_filters_collector,
+        kwargs=dict(
+            binance_rest=rest,
+            storage=storage,
+            exchange_id=exchange_id,
+            symbol_ids=symbol_ids,
+            interval_sec=int(interval_sec or 3600),
+        ),
+        daemon=True,
+        name="BinanceSymbolFiltersCollector",
+    )
+    t.start()
+    logger.info("[SymbolFilters] collector thread started")
+

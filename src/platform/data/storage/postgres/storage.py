@@ -5,7 +5,7 @@ import json
 import time
 import logging
 from datetime import datetime, timezone
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Sequence, Mapping, Any
 
 from psycopg_pool import ConnectionPool
 
@@ -383,43 +383,22 @@ class PostgreSQLStorage:
     # EXCHANGE INFO (filters)
     # ======================================================================
 
-    def upsert_symbol_filters(self, rows: Sequence[Sequence[Any]]) -> int:
+
+    def upsert_symbol_filters(self, rows: Sequence[Mapping[str, Any]]) -> int:
         """
-        Upsert rows into symbol_filters.
+        Upsert symbol trading filters.
 
-        Expected tuple format (10 fields):
-          (exchange_id, symbol_id,
-           price_tick, qty_step,
-           min_qty, max_qty,
-           min_notional,
-           max_leverage,
-           margin_type,
-           updated_at)
-
-        rows may contain shorter tuples (e.g. 7) - we will pad with None + updated_at.
+        Expected keys in each row dict:
+          exchange_id, symbol_id,
+          price_tick, qty_step,
+          min_qty, max_qty,
+          min_notional,
+          max_leverage,
+          margin_type,
+          updated_at
         """
         if not rows:
             return 0
-
-        now = datetime.now(timezone.utc)
-
-        fixed_rows = []
-        for r in rows:
-            r = list(r)
-
-            # pad to 9 fields (without updated_at) first
-            # if user passed 7 -> add max_leverage, margin_type
-            while len(r) < 9:
-                r.append(None)
-
-            # add updated_at
-            if len(r) == 9:
-                r.append(now)
-
-            if len(r) != 10:
-                raise ValueError(f"upsert_symbol_filters: expected 10 values, got {len(r)}: {r}")
-
-            fixed_rows.append(tuple(r))
 
         sql = """
               INSERT INTO symbol_filters (exchange_id, \
@@ -432,7 +411,16 @@ class PostgreSQLStorage:
                                           max_leverage, \
                                           margin_type, \
                                           updated_at)
-              VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (exchange_id, symbol_id)
+              VALUES (%(exchange_id)s, \
+                      %(symbol_id)s, \
+                      %(price_tick)s, \
+                      %(qty_step)s, \
+                      %(min_qty)s, \
+                      %(max_qty)s, \
+                      %(min_notional)s, \
+                      %(max_leverage)s, \
+                      %(margin_type)s, \
+                      %(updated_at)s) ON CONFLICT (exchange_id, symbol_id)
             DO \
               UPDATE SET
                   price_tick = EXCLUDED.price_tick, \
@@ -445,12 +433,37 @@ class PostgreSQLStorage:
                   updated_at = EXCLUDED.updated_at \
               """
 
+        # гарантируем наличие updated_at, и приводим типы аккуратно
+        now = datetime.now(timezone.utc)
+        prepared: list[dict[str, Any]] = []
+
+        for r in rows:
+            d = dict(r)
+
+            if "updated_at" not in d or d["updated_at"] is None:
+                d["updated_at"] = now
+
+            d["exchange_id"] = int(d["exchange_id"])
+            d["symbol_id"] = int(d["symbol_id"])
+
+            # float columns
+            for k in ("price_tick", "qty_step", "min_qty", "max_qty", "min_notional"):
+                if k in d and d[k] is not None:
+                    d[k] = float(d[k])
+
+            # int / str columns
+            if d.get("max_leverage") is not None:
+                d["max_leverage"] = int(d["max_leverage"])
+            if d.get("margin_type") is not None:
+                d["margin_type"] = str(d["margin_type"])
+
+            prepared.append(d)
+
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
-                cur.executemany(sql, fixed_rows)
-            conn.commit()
+                cur.executemany(sql, prepared)
 
-        return len(fixed_rows)
+        return len(prepared)
 
     # ======================================================================
     # ORDERS / TRADES (optional: keep if used elsewhere)

@@ -289,6 +289,42 @@ class PostgreSQLStorage:
         )
         return bool(row)
 
+    def get_order(self, *, exchange_id: int, account_id: int, order_id: str) -> dict | None:
+        query = """
+                SELECT exchange_id, \
+                       account_id, \
+                       order_id, \
+                       symbol_id, \
+                       strategy_id, \
+                       pos_uid, \
+                       client_order_id, \
+                       side, \
+                       type, \
+                       reduce_only, \
+                       price, \
+                       qty, \
+                       filled_qty, \
+                       status, \
+                       created_at, \
+                       updated_at, \
+                       source, \
+                       ts_ms, \
+                       raw_json
+                FROM orders
+                WHERE exchange_id = %s \
+                  AND account_id = %s \
+                  AND order_id = %s LIMIT 1 \
+                """
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(query, (int(exchange_id), int(account_id), str(order_id)))
+                row = cur.fetchone()
+                if not row:
+                    return None
+                cols = [d[0] for d in cur.description]
+                return dict(zip(cols, row))
+
+
     def expire_stuck_pending(
         self,
         *,
@@ -346,106 +382,207 @@ class PostgreSQLStorage:
     # ======================================================================
     # EXCHANGE INFO (filters)
     # ======================================================================
-    def upsert_symbol_filters(
-            self,
-            *,
-            exchange_id: int,
-            symbol_id: int,
-            price_tick,
-            qty_step,
-            min_qty=None,
-            max_qty=None,
-            min_notional=None,
-            max_leverage=None,
-            margin_type=None,
-    ) -> None:
-        query = """
-                INSERT INTO symbol_filters (exchange_id, \
-                                            symbol_id, \
-                                            price_tick, \
-                                            qty_step, \
-                                            min_qty, \
-                                            max_qty, \
-                                            min_notional, \
-                                            max_leverage, \
-                                            margin_type, \
-                                            updated_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW()) ON CONFLICT (exchange_id, symbol_id) DO \
-                UPDATE SET
-                    price_tick = EXCLUDED.price_tick, \
-                    qty_step = EXCLUDED.qty_step, \
-                    min_qty = EXCLUDED.min_qty, \
-                    max_qty = EXCLUDED.max_qty, \
-                    min_notional = EXCLUDED.min_notional, \
-                    max_leverage = EXCLUDED.max_leverage, \
-                    margin_type = EXCLUDED.margin_type, \
-                    updated_at = NOW() \
-                """
+
+    def upsert_symbol_filters(self, rows: Sequence[Sequence[Any]]) -> int:
+        """
+        Upsert rows into symbol_filters.
+
+        Expected tuple format (10 fields):
+          (exchange_id, symbol_id,
+           price_tick, qty_step,
+           min_qty, max_qty,
+           min_notional,
+           max_leverage,
+           margin_type,
+           updated_at)
+
+        rows may contain shorter tuples (e.g. 7) - we will pad with None + updated_at.
+        """
+        if not rows:
+            return 0
+
+        now = datetime.now(timezone.utc)
+
+        fixed_rows = []
+        for r in rows:
+            r = list(r)
+
+            # pad to 9 fields (without updated_at) first
+            # if user passed 7 -> add max_leverage, margin_type
+            while len(r) < 9:
+                r.append(None)
+
+            # add updated_at
+            if len(r) == 9:
+                r.append(now)
+
+            if len(r) != 10:
+                raise ValueError(f"upsert_symbol_filters: expected 10 values, got {len(r)}: {r}")
+
+            fixed_rows.append(tuple(r))
+
+        sql = """
+              INSERT INTO symbol_filters (exchange_id, \
+                                          symbol_id, \
+                                          price_tick, \
+                                          qty_step, \
+                                          min_qty, \
+                                          max_qty, \
+                                          min_notional, \
+                                          max_leverage, \
+                                          margin_type, \
+                                          updated_at)
+              VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (exchange_id, symbol_id)
+            DO \
+              UPDATE SET
+                  price_tick = EXCLUDED.price_tick, \
+                  qty_step = EXCLUDED.qty_step, \
+                  min_qty = EXCLUDED.min_qty, \
+                  max_qty = EXCLUDED.max_qty, \
+                  min_notional = EXCLUDED.min_notional, \
+                  max_leverage = EXCLUDED.max_leverage, \
+                  margin_type = EXCLUDED.margin_type, \
+                  updated_at = EXCLUDED.updated_at \
+              """
 
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    query,
-                    (
-                        exchange_id,
-                        symbol_id,
-                        price_tick,
-                        qty_step,
-                        min_qty,
-                        max_qty,
-                        min_notional,
-                        max_leverage,
-                        margin_type,
-                    ),
-                )
+                cur.executemany(sql, fixed_rows)
             conn.commit()
+
+        return len(fixed_rows)
 
     # ======================================================================
     # ORDERS / TRADES (optional: keep if used elsewhere)
     # ======================================================================
 
     def upsert_orders(self, orders: list[dict]) -> None:
+        """
+        Upsert orders with monotonic status updates:
+        - update only if event is newer by ts_ms
+        - and status does not regress (rank-based)
+        """
         if not orders:
             return
 
         query = """
-        INSERT INTO orders (
-            exchange_id, account_id, order_id, client_order_id, symbol_id,
-            side, type, status, qty, price, reduce_only, ts_ms, raw_json, updated_at
-        )
-        VALUES (
-            %(exchange_id)s, %(account_id)s, %(order_id)s, %(client_order_id)s, %(symbol_id)s,
-            %(side)s, %(type)s, %(status)s, %(qty)s, %(price)s, %(reduce_only)s,
-            %(ts_ms)s, %(raw_json)s, NOW()
-        )
-        ON CONFLICT (exchange_id, account_id, order_id)
-        DO UPDATE SET
-            status = EXCLUDED.status,
-            qty = EXCLUDED.qty,
-            price = EXCLUDED.price,
-            raw_json = EXCLUDED.raw_json,
-            updated_at = NOW();
-        """
+                INSERT INTO orders (exchange_id, account_id, order_id, client_order_id, symbol_id, \
+                                    side, type, reduce_only, \
+                                    price, qty, filled_qty, \
+                                    status, \
+                                    strategy_id, pos_uid, \
+                                    ts_ms, raw_json, \
+                                    updated_at) \
+                VALUES (%(exchange_id)s, %(account_id)s, %(order_id)s, %(client_order_id)s, %(symbol_id)s, \
+                        %(side)s, %(type)s, %(reduce_only)s, \
+                        %(price)s, %(qty)s, %(filled_qty)s, \
+                        %(status)s, \
+                        %(strategy_id)s, %(pos_uid)s, \
+                        %(ts_ms)s, %(raw_json)s, \
+                        NOW()) ON CONFLICT (exchange_id, account_id, order_id) DO \
+                UPDATE \
+                    SET \
+                        client_order_id = COALESCE (EXCLUDED.client_order_id, orders.client_order_id), \
+                    symbol_id = EXCLUDED.symbol_id, \
+                    side = EXCLUDED.side, \
+                    type = EXCLUDED.type, \
+                    reduce_only = EXCLUDED.reduce_only, \
+                    price = EXCLUDED.price, \
+                    qty = EXCLUDED.qty, \
+                    filled_qty = EXCLUDED.filled_qty, \
+
+                    -- keep placeholders enrichment \
+                    strategy_id = COALESCE (orders.strategy_id, EXCLUDED.strategy_id), \
+                    pos_uid = COALESCE (orders.pos_uid, EXCLUDED.pos_uid), \
+
+                    -- ts_ms monotonic \
+                    ts_ms = GREATEST(COALESCE (orders.ts_ms, 0), COALESCE (EXCLUDED.ts_ms, 0)), \
+
+                    -- status monotonic (rank) \
+                    status = CASE \
+                    WHEN COALESCE (EXCLUDED.ts_ms, 0) < COALESCE (orders.ts_ms, 0) \
+                    THEN orders.status \
+                    ELSE \
+                    CASE \
+                    WHEN (CASE orders.status \
+                    WHEN 'PENDING' THEN 5 \
+                    WHEN 'NEW' THEN 10 \
+                    WHEN 'PARTIALLY_FILLED' THEN 20 \
+                    WHEN 'FILLED' THEN 90 \
+                    WHEN 'CANCELED' THEN 90 \
+                    WHEN 'REJECTED' THEN 90 \
+                    WHEN 'EXPIRED' THEN 90 \
+                    ELSE 0 END) \
+                    <= \
+                    (CASE EXCLUDED.status \
+                    WHEN 'PENDING' THEN 5 \
+                    WHEN 'NEW' THEN 10 \
+                    WHEN 'PARTIALLY_FILLED' THEN 20 \
+                    WHEN 'FILLED' THEN 90 \
+                    WHEN 'CANCELED' THEN 90 \
+                    WHEN 'REJECTED' THEN 90 \
+                    WHEN 'EXPIRED' THEN 90 \
+                    ELSE 0 END) \
+                    THEN EXCLUDED.status \
+                    ELSE orders.status
+                END
+                END \
+                ,
+
+            raw_json = COALESCE(EXCLUDED.raw_json, orders.raw_json),
+            updated_at = NOW() \
+                """
 
         rows = []
         for o in orders:
             rows.append({
                 "exchange_id": int(o["exchange_id"]),
                 "account_id": int(o["account_id"]),
-                "order_id": str(o.get("order_id") or ""),
-                "client_order_id": str(o.get("client_order_id") or ""),
                 "symbol_id": int(o["symbol_id"]),
-                "side": str(o.get("side") or ""),
-                "type": str(o.get("type") or ""),
-                "status": str(o.get("status") or ""),
-                "qty": float(o.get("qty") or 0.0),
-                "price": float(o.get("price") or 0.0),
+
+                "order_id": str(o["order_id"]),
+                "client_order_id": o.get("client_order_id"),
+
+                "side": str(o["side"]),
+                "type": str(o["type"]),
                 "reduce_only": bool(o.get("reduce_only") or False),
+
+                "price": o.get("price"),
+                "qty": float(o.get("qty") or 0.0),
+                "filled_qty": float(o.get("filled_qty") or 0.0),
+
+                "status": str(o.get("status") or "NEW"),
+
+                "strategy_id": o.get("strategy_id"),
+                "pos_uid": o.get("pos_uid"),
+
                 "ts_ms": int(o.get("ts_ms") or 0),
-                "raw_json": json.dumps(o, ensure_ascii=False),
+                "raw_json": json.dumps(o.get("raw") or o.get("raw_json") or {}, ensure_ascii=False),
             })
 
         self._exec_many(query, rows)
+
+    def set_order_status(
+            self,
+            *,
+            exchange_id: int,
+            account_id: int,
+            order_id: str,
+            status: str,
+    ) -> int:
+        query = """
+                UPDATE orders
+                SET status     = %s,
+                    updated_at = NOW()
+                WHERE exchange_id = %s
+                  AND account_id = %s
+                  AND order_id = %s \
+                """
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(query, (status, int(exchange_id), int(account_id), str(order_id)))
+                return int(cur.rowcount or 0)
+
 
     def upsert_trades(self, trades: list[dict]) -> None:
         if not trades:
@@ -682,24 +819,115 @@ class PostgreSQLStorage:
         return int(n or 0)
 
 
-    def get_symbol_filters(self, *, exchange_id: int, symbol_id: int) -> dict:
+    def list_non_terminal_orders(self, *, exchange_id: int, account_id: int, symbol_ids=None) -> list[dict]:
+        base = """
+               SELECT exchange_id, \
+                      account_id, \
+                      order_id, \
+                      symbol_id, \
+                      strategy_id, \
+                      pos_uid, \
+                      client_order_id, \
+                      side, \
+                      type, \
+                      reduce_only, \
+                      price, \
+                      qty, \
+                      filled_qty, \
+                      status, \
+                      created_at, \
+                      updated_at, \
+                      source, \
+                      ts_ms, \
+                      raw_json
+               FROM orders
+               WHERE exchange_id = %s \
+                 AND account_id = %s
+                 AND status NOT IN ('FILLED', 'CANCELED', 'REJECTED', 'EXPIRED') \
+               """
+        params = [int(exchange_id), int(account_id)]
+        if symbol_ids:
+            base += " AND symbol_id = ANY(%s)"
+            params.append(list(map(int, symbol_ids)))
+        base += " ORDER BY updated_at DESC LIMIT 500"
+
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(base, tuple(params))
+                rows = cur.fetchall()
+                cols = [d[0] for d in cur.description]
+                return [dict(zip(cols, r)) for r in rows]
+
+    def get_order_by_client_order_id(
+            self,
+            *,
+            exchange_id: int,
+            account_id: int,
+            client_order_id: str,
+            prefer_placeholder: bool = True,
+    ) -> dict | None:
+        if not client_order_id:
+            return None
+
+        q_ph = """
+               SELECT *
+               FROM orders
+               WHERE exchange_id = %s \
+                 AND account_id = %s \
+                 AND client_order_id = %s
+                 AND order_id LIKE 'PH::%%'
+               ORDER BY updated_at DESC LIMIT 1 \
+               """
+        q_any = """
+                SELECT *
+                FROM orders
+                WHERE exchange_id = %s \
+                  AND account_id = %s \
+                  AND client_order_id = %s
+                ORDER BY updated_at DESC LIMIT 1 \
+                """
+
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                if prefer_placeholder:
+                    cur.execute(q_ph, (int(exchange_id), int(account_id), str(client_order_id)))
+                    row = cur.fetchone()
+                    if row:
+                        cols = [d[0] for d in cur.description]
+                        return dict(zip(cols, row))
+                cur.execute(q_any, (int(exchange_id), int(account_id), str(client_order_id)))
+                row = cur.fetchone()
+                if not row:
+                    return None
+                cols = [d[0] for d in cur.description]
+                return dict(zip(cols, row))
+
+
+    def get_symbol_filters(
+            self,
+            *,
+            exchange_id: int,
+            symbol_id: int,
+    ) -> dict | None:
         """
         Load trading filters for symbol.
-        Used by exchange to normalize qty/price before submit.
+
+        Used by OMS to normalize qty/price before submit.
+        Returns None if filters not found.
         """
 
         query = """
-            SELECT price_tick,
-                   qty_step,
-                   min_qty,
-                   max_qty,
-                   min_notional,
-                   max_leverage,
-                   margin_type
-            FROM symbol_filters
-            WHERE exchange_id = %s
-              AND symbol_id = %s
-        """
+                SELECT price_tick, \
+                       qty_step, \
+                       min_qty, \
+                       max_qty, \
+                       min_notional, \
+                       max_leverage, \
+                       margin_type
+                FROM symbol_filters
+                WHERE exchange_id = %s
+                  AND symbol_id = %s \
+                """
 
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
@@ -707,17 +935,82 @@ class PostgreSQLStorage:
                 row = cur.fetchone()
 
         if row is None:
-            raise KeyError(
-                f"symbol_filters not found "
-                f"(exchange_id={exchange_id}, symbol_id={symbol_id})"
-            )
+            return None
+
+        price_tick = float(row[0]) if row[0] is not None else None
+        qty_step = float(row[1]) if row[1] is not None else None
 
         return {
-            "price_tick": float(row[0]),
-            "qty_step": float(row[1]),
+            "price_tick": price_tick,
+            "qty_step": qty_step,
             "min_qty": float(row[2]) if row[2] is not None else None,
             "max_qty": float(row[3]) if row[3] is not None else None,
             "min_notional": float(row[4]) if row[4] is not None else None,
             "max_leverage": int(row[5]) if row[5] is not None else None,
             "margin_type": row[6],
         }
+
+    def fetch_orders_metrics_window(self, *, exchange_id: int, account_id: int, since_ts_ms: int) -> list[dict]:
+        """
+        STEP 7: get orders rows for lifecycle metrics inside time window.
+        We only need: client_order_id, order_id, status, source, ts_ms.
+        """
+        query = """
+                SELECT client_order_id, order_id, status, source, ts_ms
+                FROM orders
+                WHERE exchange_id = %s
+                  AND account_id = %s
+                  AND ts_ms >= %s
+                  AND client_order_id IS NOT NULL
+                ORDER BY ts_ms ASC \
+                """
+
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(query, (int(exchange_id), int(account_id), int(since_ts_ms)))
+                rows = cur.fetchall()
+
+        out: list[dict] = []
+        for r in rows:
+            out.append(
+                {
+                    "client_order_id": r[0],
+                    "order_id": r[1],
+                    "status": r[2],
+                    "source": r[3],
+                    "ts_ms": r[4],
+                }
+            )
+        return out
+
+
+    def upsert_account_state(
+            self,
+            *,
+            exchange_id: int,
+            account_id: int,
+            state: dict,
+    ) -> None:
+        sql = """
+              INSERT INTO account_state (exchange_id, \
+                                         account_id, \
+                                         ts, \
+                                         wallet_balance, \
+                                         equity, \
+                                         available_balance, \
+                                         unrealized_pnl)
+              VALUES (%s, %s, NOW(), %s, %s, %s, %s) \
+              """
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    sql,
+                    (
+                        exchange_id,
+                        account_id,
+                        state.get("wallet_balance"),
+                        state.get("equity"),
+                        state.get("available_balance"),
+                        state.get("unrealized_pnl"),
+                    ),
+                )

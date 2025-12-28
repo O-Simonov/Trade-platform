@@ -22,7 +22,7 @@ instances:
   - 1m
   - 5m
   funding_poll_sec: 120
-  oms_reconcile_sec: 15
+  oms_reconcile_sec: 60
   oms_pending_timeout_sec: 20
   params:
     qty: 0.4
@@ -49,7 +49,7 @@ instances:
   - 1m
   - 5m
   funding_poll_sec: 180
-  oms_reconcile_sec: 15
+  oms_reconcile_sec: 60
   oms_pending_timeout_sec: 20
   params:
     qty: 0.4

@@ -1,65 +1,99 @@
+# src/platform/core/strategy/one_shot_test.py
 from __future__ import annotations
+
 import time
+from typing import List, Optional
+
 from src.platform.core.strategy.base import Strategy
-from src.platform.core.models.order import OrderIntent
+from src.platform.core.models.order import (
+    OrderIntent,
+    OrderIntentType,
+    OrderType,
+)
 from src.platform.core.models.enums import Side
 
 
 class OneShotTestStrategy(Strategy):
+    """
+    Simple test strategy:
+      • opens position on first tick
+      • closes after hold_sec
+    """
+
     strategy_id = "one_shot_test"
 
-    def __init__(self, *, exchange: str, account: str, qty: float, hold_sec: float):
-        self.exchange = exchange
-        self.account = account
+    def __init__(
+        self,
+        *,
+        exchange: str,
+        account: str,
+        qty: float,
+        hold_sec: float,
+    ):
+        super().__init__(exchange=exchange, account=account)
+
         self.qty = float(qty)
         self.hold_sec = float(hold_sec)
 
-        self._open_sent = False
-        self._close_sent = False
-        self._open_ts: float | None = None
+        self._opened_ts: Optional[float] = None
+        self._symbol: Optional[str] = None
+        self._pos_uid: Optional[str] = None
 
-    def on_tick(self, symbol, price, position, pos_uid):
+        self._pending: List[OrderIntent] = []
+
+    # ------------------------------------------------------------------
+
+    def on_tick(self, *, symbol: str, price: float) -> None:
         now = time.time()
 
-        # 1️⃣ OPEN (один раз)
-        if not self._open_sent:
-            self._open_sent = True
-            self._open_ts = now
+        # --- OPEN ---
+        if self._opened_ts is None:
+            self._opened_ts = now
+            self._symbol = symbol
+            self._pos_uid = f"oneshot:{symbol}:{int(now)}"
 
-            print("🔥 ONE-SHOT TEST: OPEN")
+            self._pending.append(
+                OrderIntent(
+                    symbol=symbol,
+                    side=Side.LONG,
+                    qty=self.qty,
+                    order_type=OrderType.MARKET,
+                    reduce_only=False,
+                    exchange=self.exchange,
+                    account=self.account,
+                    intent_type=OrderIntentType.OPEN,
+                    pos_uid=self._pos_uid,
+                    comment="ONE-SHOT OPEN",
+                )
+            )
+            return
 
-            return OrderIntent(
-                exchange=self.exchange,
-                account=self.account,
-                symbol=symbol,
-                side=Side.LONG,
-                qty=self.qty,
-                reduce_only=False,
-                intent_type="TEST_OPEN",
-                strategy_id=self.strategy_id,
-                pos_uid=pos_uid,
+        # --- CLOSE ---
+        if now - self._opened_ts >= self.hold_sec:
+            self._pending.append(
+                OrderIntent(
+                    symbol=self._symbol,
+                    side=Side.SHORT,
+                    qty=self.qty,
+                    order_type=OrderType.MARKET,
+                    reduce_only=True,
+                    exchange=self.exchange,
+                    account=self.account,
+                    intent_type=OrderIntentType.CLOSE,
+                    pos_uid=self._pos_uid,
+                    comment="ONE-SHOT CLOSE",
+                )
             )
 
-        # 2️⃣ CLOSE через hold_sec — НЕ ЗАВИСИМ ОТ position
-        if (
-            self._open_sent
-            and not self._close_sent
-            and self._open_ts is not None
-            and (now - self._open_ts) >= self.hold_sec
-        ):
-            self._close_sent = True
-            print("🔥 ONE-SHOT TEST: CLOSE")
+            # prevent повторов
+            self._opened_ts = float("inf")
 
-            return OrderIntent(
-                exchange=self.exchange,
-                account=self.account,
-                symbol=symbol,
-                side=Side.SHORT,
-                qty=self.qty,
-                reduce_only=True,
-                intent_type="TEST_CLOSE",
-                strategy_id=self.strategy_id,
-                pos_uid=pos_uid,
-            )
+    # ------------------------------------------------------------------
 
-        return None
+    def get_intents(self) -> List[OrderIntent]:
+        if not self._pending:
+            return []
+
+        out = self._pending
+        self._pending = []
+        return out

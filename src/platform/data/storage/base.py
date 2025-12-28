@@ -106,6 +106,9 @@ class Storage(ABC):
     @abstractmethod
     def get_equity_peak(self, exchange_id: int, account_id: int, lookback_days: int = 90) -> float | None: ...
 
+    @abstractmethod
+    def get_order(self, *, exchange_id: int, account_id: int, order_id: str) -> dict | None: ...
+
     # --- symbol filters ---
     @abstractmethod
     def get_symbol_filters(
@@ -126,3 +129,16 @@ class Storage(ABC):
             margin_type,
         }
         """
+
+    @abstractmethod
+    def list_non_terminal_orders(self, *, exchange_id: int, account_id: int, symbol_ids=None) -> list[dict]: ...
+
+    @abstractmethod
+    def get_order_by_client_order_id(
+            self,
+            *,
+            exchange_id: int,
+            account_id: int,
+            client_order_id: str,
+            prefer_placeholder: bool = True,
+    ) -> dict | None: ...

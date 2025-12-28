@@ -15,6 +15,36 @@ class OmsWriter:
         self.logger = logger or logging.getLogger(__name__)
         self.sm = OrderStateMachine()
 
+
+    def _append_order_event(self, order_evt: OrderEvent) -> None:
+        """STEP G.1: append raw order events into DB (idempotent insert)."""
+        try:
+            if not hasattr(self.storage, "append_order_events"):
+                return
+            now = datetime.now(tz=timezone.utc)
+            row = {
+                "exchange_id": int(order_evt.exchange_id),
+                "account_id": int(order_evt.account_id),
+                "order_id": str(order_evt.order_id),
+                "symbol_id": int(order_evt.symbol_id),
+                "client_order_id": str(order_evt.client_order_id or ""),
+                "status": str(order_evt.status or ""),
+                "side": str(order_evt.side or ""),
+                "type": str(order_evt.type or ""),
+                "reduce_only": bool(order_evt.reduce_only),
+                "price": float(order_evt.price) if order_evt.price is not None else None,
+                "qty": float(order_evt.qty or 0.0) if order_evt.qty is not None else None,
+                "filled_qty": float(order_evt.filled_qty or 0.0) if order_evt.filled_qty is not None else None,
+                "source": str(order_evt.source or "ws_user"),
+                "ts_ms": int(order_evt.ts_ms or 0),
+                "recv_ts": now,
+                "raw_json": json.dumps(order_evt.raw or {}, ensure_ascii=False, default=str),
+            }
+            self.storage.append_order_events([row])
+        except Exception:
+            self.logger.exception("[OMS][ORDER_EVENT] append failed")
+
+
     def write_order(self, order_evt: OrderEvent | None) -> None:
         if order_evt is None:
             return

@@ -178,6 +178,9 @@ class TradingInstance:
                 event,
                 exchange=self.exchange.name,
                 account=self.account,
+                exchange_id=self.exchange_id,
+                account_id=self.account_id,
+                symbol_ids=self.symbol_ids,
             )
 
             for ev in events:

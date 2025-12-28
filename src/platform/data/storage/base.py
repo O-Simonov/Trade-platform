@@ -85,6 +85,9 @@ class Storage(ABC):
     def upsert_order_fills(self, rows: Iterable[dict]) -> None: ...
 
     @abstractmethod
+    def append_order_events(self, rows: Iterable[dict]) -> None: ...
+
+    @abstractmethod
     def upsert_candles(self, rows: Iterable[dict]) -> None: ...
 
     @abstractmethod

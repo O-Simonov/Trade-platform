@@ -70,6 +70,30 @@ CREATE TABLE IF NOT EXISTS orders (
 CREATE INDEX IF NOT EXISTS idx_orders_client_oid ON orders(exchange_id, account_id, client_order_id);
 CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(exchange_id, account_id, status);
 
+
+CREATE TABLE IF NOT EXISTS order_events (
+  exchange_id SMALLINT NOT NULL,
+  account_id SMALLINT NOT NULL,
+  order_id TEXT NOT NULL,
+  symbol_id BIGINT NOT NULL,
+  client_order_id TEXT,
+  status TEXT NOT NULL,
+  side TEXT,
+  type TEXT,
+  reduce_only BOOLEAN,
+  price NUMERIC(18,8),
+  qty NUMERIC(18,8),
+  filled_qty NUMERIC(18,8),
+  source TEXT DEFAULT 'ws_user',
+  ts_ms BIGINT NOT NULL,
+  recv_ts TIMESTAMPTZ NOT NULL,
+  raw_json TEXT,
+  -- idempotency key: same order_id + ts_ms + status + filled_qty won't be inserted twice
+  UNIQUE(exchange_id, account_id, order_id, ts_ms, status, filled_qty)
+);
+CREATE INDEX IF NOT EXISTS idx_order_events_oid ON order_events(exchange_id, account_id, order_id);
+CREATE INDEX IF NOT EXISTS idx_order_events_ts  ON order_events(exchange_id, account_id, ts_ms);
+
 CREATE TABLE IF NOT EXISTS trades (
   exchange_id SMALLINT NOT NULL,
   account_id SMALLINT NOT NULL,

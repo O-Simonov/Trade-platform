@@ -786,6 +786,34 @@ class PostgreSQLStorage:
                 )
             conn.commit()
 
+
+    def append_order_events(self, rows: Iterable[dict]) -> None:
+        """Append immutable order events (idempotent)."""
+        rows = list(rows or [])
+        if not rows:
+            return
+
+        query = """
+            INSERT INTO order_events (
+                exchange_id, account_id, order_id, symbol_id,
+                client_order_id, status, side, type, reduce_only,
+                price, qty, filled_qty,
+                source, ts_ms, recv_ts, raw_json
+            )
+            VALUES (
+                %(exchange_id)s, %(account_id)s, %(order_id)s, %(symbol_id)s,
+                %(client_order_id)s, %(status)s, %(side)s, %(type)s, %(reduce_only)s,
+                %(price)s, %(qty)s, %(filled_qty)s,
+                %(source)s, %(ts_ms)s, %(recv_ts)s, %(raw_json)s
+            )
+            ON CONFLICT DO NOTHING
+        """
+
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.executemany(query, rows)
+            conn.commit()
+
     def upsert_candles(self, rows: list[dict]) -> int:
         """
         Bulk upsert candles into public.candles.

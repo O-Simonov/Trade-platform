@@ -471,82 +471,72 @@ class PostgreSQLStorage:
 
     def upsert_orders(self, orders: list[dict]) -> None:
         """
-        Upsert orders with monotonic status updates:
-        - update only if event is newer by ts_ms
-        - and status does not regress (rank-based)
+        Upsert order snapshots.
+        Status, qty, filled_qty are already resolved by OrderAggregate (FSM).
+        DB does NOT compute lifecycle logic.
         """
         if not orders:
             return
 
         query = """
-                INSERT INTO orders (exchange_id, account_id, order_id, client_order_id, symbol_id, \
-                                    side, type, reduce_only, \
-                                    price, qty, filled_qty, \
+                INSERT INTO orders (exchange_id, \
+                                    account_id, \
+                                    order_id, \
+                                    client_order_id, \
+                                    symbol_id, \
+                                    side, \
+                                    type, \
+                                    reduce_only, \
+                                    price, \
+                                    qty, \
+                                    filled_qty, \
                                     status, \
-                                    strategy_id, pos_uid, \
-                                    ts_ms, raw_json, \
-                                    updated_at) \
-                VALUES (%(exchange_id)s, %(account_id)s, %(order_id)s, %(client_order_id)s, %(symbol_id)s, \
-                        %(side)s, %(type)s, %(reduce_only)s, \
-                        %(price)s, %(qty)s, %(filled_qty)s, \
+                                    strategy_id, \
+                                    pos_uid, \
+                                    ts_ms, \
+                                    raw_json, \
+                                    updated_at)
+                VALUES (%(exchange_id)s, \
+                        %(account_id)s, \
+                        %(order_id)s, \
+                        %(client_order_id)s, \
+                        %(symbol_id)s, \
+                        %(side)s, \
+                        %(type)s, \
+                        %(reduce_only)s, \
+                        %(price)s, \
+                        %(qty)s, \
+                        %(filled_qty)s, \
                         %(status)s, \
-                        %(strategy_id)s, %(pos_uid)s, \
-                        %(ts_ms)s, %(raw_json)s, \
-                        NOW()) ON CONFLICT (exchange_id, account_id, order_id) DO \
-                UPDATE \
-                    SET \
-                        client_order_id = COALESCE (EXCLUDED.client_order_id, orders.client_order_id), \
+                        %(strategy_id)s, \
+                        %(pos_uid)s, \
+                        %(ts_ms)s, \
+                        %(raw_json)s, \
+                        NOW()) ON CONFLICT (exchange_id, account_id, order_id)
+        DO \
+                UPDATE SET
+                    client_order_id = COALESCE (EXCLUDED.client_order_id, orders.client_order_id), \
                     symbol_id = EXCLUDED.symbol_id, \
+
                     side = EXCLUDED.side, \
                     type = EXCLUDED.type, \
                     reduce_only = EXCLUDED.reduce_only, \
+
                     price = EXCLUDED.price, \
                     qty = EXCLUDED.qty, \
                     filled_qty = EXCLUDED.filled_qty, \
 
-                    -- keep placeholders enrichment \
+                    status = EXCLUDED.status, \
+
                     strategy_id = COALESCE (orders.strategy_id, EXCLUDED.strategy_id), \
                     pos_uid = COALESCE (orders.pos_uid, EXCLUDED.pos_uid), \
 
-                    -- ts_ms monotonic \
                     ts_ms = GREATEST(COALESCE (orders.ts_ms, 0), COALESCE (EXCLUDED.ts_ms, 0)), \
-
-                    -- status monotonic (rank) \
-                    status = CASE \
-                    WHEN COALESCE (EXCLUDED.ts_ms, 0) < COALESCE (orders.ts_ms, 0) \
-                    THEN orders.status \
-                    ELSE \
-                    CASE \
-                    WHEN (CASE orders.status \
-                    WHEN 'PENDING' THEN 5 \
-                    WHEN 'NEW' THEN 10 \
-                    WHEN 'PARTIALLY_FILLED' THEN 20 \
-                    WHEN 'FILLED' THEN 90 \
-                    WHEN 'CANCELED' THEN 90 \
-                    WHEN 'REJECTED' THEN 90 \
-                    WHEN 'EXPIRED' THEN 90 \
-                    ELSE 0 END) \
-                    <= \
-                    (CASE EXCLUDED.status \
-                    WHEN 'PENDING' THEN 5 \
-                    WHEN 'NEW' THEN 10 \
-                    WHEN 'PARTIALLY_FILLED' THEN 20 \
-                    WHEN 'FILLED' THEN 90 \
-                    WHEN 'CANCELED' THEN 90 \
-                    WHEN 'REJECTED' THEN 90 \
-                    WHEN 'EXPIRED' THEN 90 \
-                    ELSE 0 END) \
-                    THEN EXCLUDED.status \
-                    ELSE orders.status
-                END
-                END \
-                ,
-
-            raw_json = COALESCE(EXCLUDED.raw_json, orders.raw_json),
-            updated_at = NOW() \
+                    raw_json = COALESCE (EXCLUDED.raw_json, orders.raw_json), \
+                    updated_at = NOW() \
                 """
 
-        rows = []
+        rows: list[dict] = []
         for o in orders:
             rows.append({
                 "exchange_id": int(o["exchange_id"]),
@@ -556,8 +546,8 @@ class PostgreSQLStorage:
                 "order_id": str(o["order_id"]),
                 "client_order_id": o.get("client_order_id"),
 
-                "side": str(o["side"]),
-                "type": str(o["type"]),
+                "side": str(o.get("side") or ""),
+                "type": str(o.get("type") or ""),
                 "reduce_only": bool(o.get("reduce_only") or False),
 
                 "price": o.get("price"),
@@ -570,7 +560,10 @@ class PostgreSQLStorage:
                 "pos_uid": o.get("pos_uid"),
 
                 "ts_ms": int(o.get("ts_ms") or 0),
-                "raw_json": json.dumps(o.get("raw") or o.get("raw_json") or {}, ensure_ascii=False),
+                "raw_json": json.dumps(
+                    o.get("raw") or o.get("raw_json") or {},
+                    ensure_ascii=False,
+                ),
             })
 
         self._exec_many(query, rows)
@@ -814,6 +807,63 @@ class PostgreSQLStorage:
                 cur.executemany(query, rows)
             conn.commit()
 
+    def fetch_order_events(
+            self,
+            *,
+            exchange_id: int,
+            account_id: int,
+            since_ts_ms: int | None = None,
+            limit: int | None = None,
+    ) -> list[dict]:
+        """
+        Fetch order_events ordered by ts_ms ASC.
+        Used for OMS rebuild.
+        """
+        sql = """
+              SELECT exchange_id, \
+                     account_id, \
+                     order_id, \
+                     symbol_id, \
+                     client_order_id, \
+                     status, \
+                     side, \
+                     type, \
+                     reduce_only, \
+                     price, \
+                     qty, \
+                     filled_qty, \
+                     source, \
+                     ts_ms, \
+                     recv_ts, \
+                     raw_json
+              FROM order_events
+              WHERE exchange_id = %(exchange_id)s
+                AND account_id = %(account_id)s \
+              """
+
+        params = {
+            "exchange_id": int(exchange_id),
+            "account_id": int(account_id),
+        }
+
+        if since_ts_ms is not None:
+            sql += " AND ts_ms >= %(since_ts_ms)s"
+            params["since_ts_ms"] = int(since_ts_ms)
+
+        sql += " ORDER BY ts_ms ASC"
+
+        if limit is not None:
+            sql += " LIMIT %(limit)s"
+            params["limit"] = int(limit)
+
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                rows = cur.fetchall()
+                cols = [c.name for c in cur.description]
+
+        return [dict(zip(cols, r)) for r in rows]
+
     def upsert_candles(self, rows: list[dict]) -> int:
         """
         Bulk upsert candles into public.candles.
@@ -1055,3 +1105,65 @@ class PostgreSQLStorage:
                         state.get("unrealized_pnl"),
                     ),
                 )
+
+    def exec_ddl(self, sql: str) -> None:
+        """Execute DDL SQL that may contain multiple statements."""
+        if not sql:
+            return
+
+        # very simple splitter by ';'
+        statements = [s.strip() for s in sql.split(";") if s.strip()]
+
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                for stmt in statements:
+                    cur.execute(stmt)
+            conn.commit()
+
+    def fetch_trades(
+            self,
+            *,
+            exchange_id: int,
+            account_id: int,
+            since_ts_ms: int = 0,
+            limit: int = 200_000,
+    ) -> list[dict]:
+
+        query = """
+                SELECT exchange_id, \
+                       account_id, \
+                       symbol_id, \
+                       trade_id, \
+                       order_id, \
+                       side, \
+                       qty, \
+                       price, \
+                       realized_pnl, \
+                       fee, \
+                       (EXTRACT(EPOCH FROM ts) * 1000)::BIGINT AS ts_ms, raw_json
+                FROM trades
+                WHERE exchange_id = %(exchange_id)s
+                  AND account_id = %(account_id)s
+                  AND (
+                    %(since_ts_ms)s = 0
+                        OR ts >= to_timestamp(%(since_ts_ms)s / 1000.0)
+                    )
+                ORDER BY ts ASC
+                    LIMIT %(limit)s \
+                """
+
+        params = {
+            "exchange_id": int(exchange_id),
+            "account_id": int(account_id),
+            "since_ts_ms": int(since_ts_ms or 0),
+            "limit": int(limit or 200_000),
+        }
+
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(query, params)
+                rows = cur.fetchall()
+                cols = [c.name for c in cur.description]
+            conn.commit()
+
+        return [dict(zip(cols, r)) for r in rows]

@@ -4,16 +4,17 @@ from __future__ import annotations
 import time
 import logging
 from dataclasses import dataclass
-from typing import Optional, Iterable
+from typing import Optional
 
 from src.platform.core.models.order import OrderIntent
 from src.platform.core.oms.events import OrderEvent, TradeEvent
 from src.platform.core.oms.preflight import preflight_intent
 from src.platform.core.oms.writer import OmsWriter
+from src.platform.core.oms.aggregate import OrderAggregate
+from src.platform.core.position.position_manager import PositionManager
 
 
 _FINAL_STATUSES = {"FILLED", "CANCELED", "REJECTED", "EXPIRED"}
-
 
 # ----------------------------------------------------------------------
 # Pending submit placeholder (idempotency / WS gaps)
@@ -29,16 +30,21 @@ class PendingSubmit:
 
 
 class OrderManager:
-    """Minimal OMS layer.
+    """
+    STEP G.2 / H.1 OrderManager
 
-    STEP G.1 goal:
-      - accept WS user events (OrderEvent / TradeEvent)
-      - persist events into DB (order_events + trades)
-      - keep a tiny idempotency gate for client_order_id
-
-    Full aggregate/FSM (STEP G.2) will be added later.
+    Responsibilities:
+      ✔ route OrderEvent / TradeEvent
+      ✔ append immutable events (order_events / trades)
+      ✔ maintain in-memory OrderAggregate (FSM)
+      ✔ persist order snapshot
+      ✔ maintain PositionAggregate via trades
+      ✔ minimal submit-side idempotency
     """
 
+    # ------------------------------------------------------------------
+    # init
+    # ------------------------------------------------------------------
     def __init__(
         self,
         *,
@@ -52,22 +58,31 @@ class OrderManager:
         self.account_id = int(account_id)
         self.logger = logger or logging.getLogger(__name__)
 
-        self.writer = OmsWriter(storage=self.storage, oms=self, logger=self.logger)
+        # persistence only
+        self.writer = OmsWriter(
+            storage=self.storage,
+            logger=self.logger,
+        )
 
-        # cid -> PendingSubmit
+        # submit-side idempotency
         self._pending: dict[str, PendingSubmit] = {}
-
-        # cid -> last seen status (debug)
-        self._last_status: dict[str, str] = {}
-
-        # cid -> ts when we saw final status (idempotency)
         self._final_seen: dict[str, float] = {}
+
+        # order aggregates (FSM)
+        self._orders: dict[str, OrderAggregate] = {}
+
+        # position aggregates (from trades)
+        self.position_manager = PositionManager(
+            storage=self.storage,
+            exchange_id=self.exchange_id,
+            account_id=self.account_id,
+            logger=self.logger,
+        )
 
     # ------------------------------------------------------------------
     # submit-side helpers
     # ------------------------------------------------------------------
     def should_submit(self, client_order_id: str) -> bool:
-        """Simple idempotency: don't submit same CID twice."""
         if not client_order_id:
             return True
         if client_order_id in self._pending:
@@ -87,6 +102,7 @@ class OrderManager:
     ) -> None:
         if not client_order_id:
             return
+
         self._pending[client_order_id] = PendingSubmit(
             client_order_id=client_order_id,
             symbol_id=int(symbol_id),
@@ -97,7 +113,6 @@ class OrderManager:
         )
 
     def reconcile_pending_timeouts(self, timeout_sec: float) -> int:
-        """Drop pending orders that never received WS/REST confirmation."""
         now = time.time()
         timeout = float(timeout_sec or 20)
 
@@ -109,7 +124,6 @@ class OrderManager:
         for cid in expired:
             self._pending.pop(cid, None)
             self._final_seen[cid] = now
-            self._last_status[cid] = "TIMEOUT"
 
         return len(expired)
 
@@ -119,33 +133,87 @@ class OrderManager:
     def apply_event(self, ev: object) -> None:
         if isinstance(ev, OrderEvent):
             self.on_order_event(ev)
-            return
-        if isinstance(ev, TradeEvent):
+        elif isinstance(ev, TradeEvent):
             self.on_trade_event(ev)
-            return
-        self.logger.debug("[OMS] ignored unknown event=%s", type(ev))
+        else:
+            self.logger.debug("[OMS] ignored unknown event=%s", type(ev))
 
+    # ------------------------------------------------------------------
+    # order events
+    # ------------------------------------------------------------------
     def on_order_event(self, evt: OrderEvent) -> None:
-        """Consume order status update."""
-        # ensure ids match current instance (safety)
+        """
+        OrderEvent flow (STEP G.2):
+
+          1) normalize routing ids
+          2) persist immutable event
+          3) apply to OrderAggregate (FSM)
+          4) persist order snapshot
+        """
+
+        # normalize routing ids
         evt.exchange_id = int(evt.exchange_id or self.exchange_id)
         evt.account_id = int(evt.account_id or self.account_id)
 
-        self.writer.write_order(evt)
+        # 1️⃣ immutable log
+        self.writer.append_order_event(evt)
 
-        cid = str(evt.client_order_id or "")
-        status = str(evt.status or "").upper()
-        if cid:
-            self._last_status[cid] = status
-            if status in _FINAL_STATUSES:
-                self._pending.pop(cid, None)
-                self._final_seen[cid] = time.time()
+        oid = str(evt.order_id)
 
+        # 2️⃣ aggregate / FSM
+        agg = self._orders.get(oid)
+        if agg is None:
+            agg = OrderAggregate.from_event(evt)
+            self._orders[oid] = agg
+        else:
+            changed = agg.apply(evt)
+            if not changed:
+                return
+
+        # mark final for idempotency
+        if agg.status in _FINAL_STATUSES and agg.client_order_id:
+            self._final_seen[agg.client_order_id] = time.time()
+            self._pending.pop(agg.client_order_id, None)
+
+        # 3️⃣ snapshot
+        self.writer.upsert_order_snapshot(agg)
+
+    # ------------------------------------------------------------------
+    # trade events (fills)
+    # ------------------------------------------------------------------
     def on_trade_event(self, evt: TradeEvent) -> None:
-        """Consume trade(fill) event."""
+        """
+        TradeEvent flow (STEP H).
+
+        1) normalize routing ids
+        2) persist immutable trade
+        3) apply to PositionAggregate
+        4) persist position snapshot if changed.
+        """
+
+        # normalize routing ids
         evt.exchange_id = int(evt.exchange_id or self.exchange_id)
         evt.account_id = int(evt.account_id or self.account_id)
+
+        # immutable trade log
         self.writer.write_trade(evt)
+
+        # update in-memory position
+        pos = self.position_manager.on_trade_event(evt)
+
+        if pos is not None:
+            # explicitly tell type checker what pos is
+            assert pos.symbol_id is not None
+
+            try:
+                self.storage.upsert_positions([pos.to_row()])
+            except Exception:
+                self.logger.exception(
+                    "[POS][SNAPSHOT] upsert failed symbol_id=%s",
+                    pos.symbol_id,
+                )
+
+        return None
 
     # ------------------------------------------------------------------
     # submit preflight
@@ -159,18 +227,22 @@ class OrderManager:
         last_price: float,
         logger=None,
     ) -> Optional[OrderIntent]:
-        """Normalize intent (qty/price rounding, minNotional, etc)."""
+        """
+        Normalize intent (qty/price rounding, minNotional, etc.).
+        """
         try:
             filters = self.storage.get_symbol_filters(
                 exchange_id=self.exchange_id,
                 symbol_id=int(symbol_id),
             )
         except Exception:
-            self.logger.exception("[OMS][Preflight] get_symbol_filters failed symbol=%s", symbol)
+            self.logger.exception(
+                "[OMS][PREFLIGHT] get_symbol_filters failed symbol=%s",
+                symbol,
+            )
             return None
 
         return preflight_intent(
-            symbol=symbol,
             intent=intent,
             last_price=float(last_price or 0.0),
             filters=filters,

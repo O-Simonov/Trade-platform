@@ -280,3 +280,29 @@ CREATE TABLE IF NOT EXISTS position_ledger (
 CREATE INDEX IF NOT EXISTS idx_position_ledger_symbol ON position_ledger(exchange_id, account_id, symbol_id);
 CREATE INDEX IF NOT EXISTS idx_position_ledger_status ON position_ledger(exchange_id, account_id, status);
 CREATE INDEX IF NOT EXISTS idx_position_ledger_closed_at ON position_ledger(exchange_id, account_id, closed_at);
+
+-- ---------------------------------------------------------------------
+-- positions (snapshot) — derived from trade_events
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS positions (
+  exchange_id SMALLINT NOT NULL,
+  account_id  SMALLINT NOT NULL,
+  symbol_id   BIGINT   NOT NULL,
+
+  qty         NUMERIC(18,8) NOT NULL DEFAULT 0,
+  avg_price   NUMERIC(18,8) NOT NULL DEFAULT 0,
+
+  realized_pnl NUMERIC(18,8) NOT NULL DEFAULT 0,
+  fees         NUMERIC(18,8) NOT NULL DEFAULT 0,
+
+  last_ts_ms  BIGINT NOT NULL DEFAULT 0,
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+  PRIMARY KEY (exchange_id, account_id, symbol_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_positions_acc
+  ON positions(exchange_id, account_id);
+
+CREATE INDEX IF NOT EXISTS idx_positions_sym
+  ON positions(exchange_id, symbol_id);

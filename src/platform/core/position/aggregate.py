@@ -101,36 +101,25 @@ class PositionAggregate:
         self.last_ts_ms = ts
         return True
 
+
     def to_row(self, *, last_trade_id: str | None = None) -> dict:
-        side = "FLAT"
-        status = "CLOSED"
-        if self.qty > 0:
-            side = "LONG"
-            status = "OPEN"
-        elif self.qty < 0:
-            side = "SHORT"
-            status = "OPEN"
-
         return {
-            "exchange_id": int(self.exchange_id),
-            "account_id": int(self.account_id),
-            "symbol_id": int(self.symbol_id),
+            "exchange_id": self.exchange_id,
+            "account_id": self.account_id,
+            "symbol_id": self.symbol_id,
 
-            "side": side,
-            "qty": float(self.qty),
-            "entry_price": float(self.avg_price),
+            "side": "LONG" if self.qty > 0 else "SHORT" if self.qty < 0 else "FLAT",
+            "qty": abs(self.qty),
+            "entry_price": self.avg_price,
 
-            "realized_pnl": float(self.realized_pnl),
-            "unrealized_pnl": 0.0,  # будет обновляться mark_price poller’ом/тикером
-            "exchange_realized_pnl": 0.0,  # если нужно — позже добавим накопление из Binance
+            "realized_pnl": self.realized_pnl,
+            "fees": self.fees,
 
-            "fees": float(self.fees),
-            "mark_price": 0.0,
+            # ✅ ВАЖНО
+            "last_ts": datetime.fromtimestamp(self.last_ts_ms / 1000, tz=timezone.utc),
 
             "last_trade_id": last_trade_id,
-            "status": status,
-            "last_ts": int(self.last_ts_ms),
-
-            "updated_at": _utcnow(),
-            "source": "trade_aggregate",  # ✅ вот это и нужно
+            "status": "OPEN" if self.qty != 0 else "CLOSED",
+            "updated_at": datetime.now(tz=timezone.utc),
+            "source": "trade_aggregate",
         }

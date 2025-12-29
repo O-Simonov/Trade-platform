@@ -14,18 +14,9 @@ from src.platform.data.storage.postgres.storage import PostgreSQLStorage
 
 from src.platform.core.oms.oms import OrderManager
 from src.platform.core.oms.parser import parse_binance_user_event
-from src.platform.core.oms.rebuild import rebuild_orders
 
 
 class TradingInstance:
-    """
-    Trading instance runner.
-
-    Fix included:
-      - H.3 rebuilds (positions + OMS orders FSM) happen BEFORE WS subscriptions
-        to avoid race (WS events arriving between subscribe and rebuild).
-    """
-
     def __init__(
         self,
         *,
@@ -54,6 +45,7 @@ class TradingInstance:
         self.role = role
         self.symbols = list(symbols or [])
         self.strategy = strategy
+
         self.candle_intervals = list(candle_intervals or [])
 
         # --- infra ---
@@ -88,12 +80,12 @@ class TradingInstance:
             storage=self.storage,
             exchange_id=self.exchange_id,
             account_id=self.account_id,
-            logger=self.logger.getChild("oms"),
         )
-        self.oms_reconciler = None  # optional; set later (REST)
+        self.oms_reconciler = None  # подключается позже (REST)
 
         # runtime cache
         self._last_account_state: Optional[dict] = None
+
         self._last_idle_log = 0.0
 
     # ------------------------------------------------------------------
@@ -111,31 +103,7 @@ class TradingInstance:
 
         self._running = True
 
-        # ------------------------------------------------------------------
-        # H.3: rebuilds MUST happen before WS subscriptions to avoid race
-        # ------------------------------------------------------------------
-        # 1) rebuild positions from trades
-        try:
-            pm = getattr(self.oms, "position_manager", None)
-            if pm is not None and hasattr(pm, "rebuild_from_trades"):
-                pm.rebuild_from_trades(since_ts_ms=0)
-        except Exception:
-            self.logger.exception("[POSITIONS][REBUILD] failed")
-
-        # 2) rebuild OMS order FSM from immutable order_events
-        try:
-            self.oms._orders = rebuild_orders(
-                self.storage,
-                exchange_id=self.exchange_id,
-                account_id=self.account_id,
-            )
-        except Exception:
-            self.logger.exception("[OMS][REBUILD] failed")
-            self.oms._orders = {}
-
-        # ------------------------------------------------------------------
-        # WS subscriptions (AFTER rebuilds)
-        # ------------------------------------------------------------------
+        # --- WS subscriptions ---
         self.exchange.subscribe_ticks(
             account=self.account,
             symbols=self.symbols,
@@ -169,13 +137,8 @@ class TradingInstance:
             name=f"AccountLoop-{self.account}",
         ).start()
 
-        # Strategy lifecycle
-        try:
-            self.strategy.on_start()
-        except Exception:
-            self.logger.exception("[StrategyStartError]")
+        self.strategy.on_start()
 
-        # Main loop
         while self._running and not self._stop.is_set():
             self._drain_intents()
             now = time.time()
@@ -205,19 +168,21 @@ class TradingInstance:
 
     def _on_user_event(self, event: dict) -> None:
         """
-        STEP G/H — UserStream → OMS
+        STEP G — UserStream → OMS
         """
+        if not self.oms:
+            return
+
         try:
             events = parse_binance_user_event(
                 event,
                 exchange=self.exchange.name,
                 account=self.account,
-                exchange_id=self.exchange_id,
-                account_id=self.account_id,
-                symbol_ids=self.symbol_ids,
             )
+
             for ev in events:
                 self.oms.apply_event(ev)
+
         except Exception:
             self.logger.exception("[OMS][USER_EVENT ERROR]")
 
@@ -229,6 +194,7 @@ class TradingInstance:
         intents: List[OrderIntent] = self.strategy.get_intents()
         if not intents:
             return
+
         for intent in intents:
             self._process_intent(intent)
 
@@ -256,19 +222,14 @@ class TradingInstance:
             intent.client_order_id,
         )
 
-        # remember placeholder for enrichment
-        try:
-            self.oms.record_pending_submit(
-                client_order_id=intent.client_order_id,
-                symbol_id=self.symbol_ids[intent.symbol],
-                strategy_id=getattr(self.strategy, "strategy_id", "unknown"),
-                pos_uid=getattr(intent, "pos_uid", None),
-                intent=intent,
-            )
-        except Exception:
-            self.logger.exception("[OMS][PENDING_SUBMIT] record failed")
+        self.oms.record_pending_submit(
+            client_order_id=intent.client_order_id,
+            symbol_id=self.symbol_ids[intent.symbol],
+            strategy_id=self.strategy.strategy_id,
+            pos_uid=intent.pos_uid,
+            intent=intent,
+        )
 
-        # submit to exchange
         self.exchange.place_order(intent)
 
     # ------------------------------------------------------------------
@@ -311,3 +272,4 @@ class TradingInstance:
                 self.logger.exception("[ACCOUNT LOOP ERROR]")
 
             time.sleep(self.funding_poll_sec)
+

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Iterable, List, Optional
+from typing import Iterable, List, Optional, Any, Dict
 
 from src.platform.core.models.order import OrderIntent
 from src.platform.core.models.position import Position
@@ -17,7 +17,6 @@ class Strategy(ABC):
       • produces OrderIntent(s)
       • is stateless or minimally stateful
     """
-
     # --- identity ---
     strategy_id: str = "base"
 
@@ -71,3 +70,11 @@ class Strategy(ABC):
           • already returned intents must not be repeated
         """
         raise NotImplementedError
+
+    def on_positions_update(self, *, positions: List[Dict[str, Any]]) -> None:
+        """
+        STEP I: Called by TradingInstance when positions are updated
+        (from trades stream rebuild / REST reconcile).
+        positions: list of normalized dict snapshots
+        """
+        return

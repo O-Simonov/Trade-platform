@@ -6,6 +6,7 @@ import time
 import logging
 from datetime import datetime, timezone
 from typing import Any, Iterable, Sequence, Mapping, Any
+from psycopg import sql as _sql
 
 from psycopg_pool import ConnectionPool
 
@@ -1167,3 +1168,52 @@ class PostgreSQLStorage:
             conn.commit()
 
         return [dict(zip(cols, r)) for r in rows]
+
+
+    def upsert_position_snapshots(self, rows):
+        if not rows:
+            return 0
+
+        sql = """
+              INSERT INTO position_snapshots (exchange_id, account_id, symbol_id, \
+                                              side, qty, entry_price, mark_price, \
+                                              position_value, unrealized_pnl, realized_pnl, fees, \
+                                              last_ts, updated_at, source)
+              VALUES (%(exchange_id)s, %(account_id)s, %(symbol_id)s, \
+                      %(side)s, %(qty)s, %(entry_price)s, %(mark_price)s, \
+                      %(position_value)s, %(unrealized_pnl)s, %(realized_pnl)s, %(fees)s, \
+                      %(last_ts)s, %(updated_at)s, %(source)s) ON CONFLICT (exchange_id, account_id, symbol_id)
+        DO \
+              UPDATE SET
+                  side=EXCLUDED.side, \
+                  qty=EXCLUDED.qty, \
+                  entry_price=EXCLUDED.entry_price, \
+                  mark_price=EXCLUDED.mark_price, \
+                  position_value=EXCLUDED.position_value, \
+                  unrealized_pnl=EXCLUDED.unrealized_pnl, \
+                  realized_pnl=EXCLUDED.realized_pnl, \
+                  fees=EXCLUDED.fees, \
+                  last_ts=EXCLUDED.last_ts, \
+                  updated_at=EXCLUDED.updated_at, \
+                  source =EXCLUDED.source
+              ; \
+              """
+        return self._exec_many(sql, rows)
+
+
+    # ------------------------------------------------------------
+    def execute_raw(self, query: str, *, log: bool = False) -> None:
+        """
+        Execute raw SQL (DDL / maintenance / cleanup).
+        SAFE: uses connection pool.
+        """
+        if not query:
+            return
+
+        if log:
+            logger.info("[DB][RAW] %s", query)
+
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(_sql.SQL(query))
+            conn.commit()

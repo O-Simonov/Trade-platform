@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, Optional, List, Any
 
 from src.platform.core.oms.events import TradeEvent
 from src.platform.core.position.aggregate import PositionAggregate
@@ -14,15 +14,15 @@ class PositionManager:
 
     Responsibilities:
       ✔ deduplicate trades
-      ✔ maintain PositionAggregate per (exchange, account, symbol)
-      ✔ rebuild positions from trades table (H3)
-      ✖ NO persistence (DB writes are done outside)
+      ✔ maintain PositionAggregate per (exchange_id, account_id, symbol_id)
+      ✔ return updated aggregate when position changes
+      ✖ NO persistence
     """
 
     def __init__(
         self,
         *,
-        storage,
+        storage: Any,
         exchange_id: int,
         account_id: int,
         logger: logging.Logger | None = None,
@@ -33,38 +33,26 @@ class PositionManager:
         self.logger = logger or logging.getLogger(__name__)
 
         # key = (exchange_id, account_id, symbol_id)
-        self._aggregates: Dict[Tuple[int, int, int], PositionAggregate] = {}
+        self._aggs: Dict[Tuple[int, int, int], PositionAggregate] = {}
 
         # trade_id deduplication
         self._seen_trade_ids: set[str] = set()
 
     # ------------------------------------------------------------
     @staticmethod
-    def _key(
-        exchange_id: int,
-        account_id: int,
-        symbol_id: int,
-    ) -> tuple[int, int, int]:
+    def _key(exchange_id: int, account_id: int, symbol_id: int) -> tuple[int, int, int]:
         return int(exchange_id), int(account_id), int(symbol_id)
 
-    # ------------------------------------------------------------
-    def get_or_create(
-        self,
-        exchange_id: int,
-        account_id: int,
-        symbol_id: int,
-    ) -> PositionAggregate:
+    def get_or_create(self, exchange_id: int, account_id: int, symbol_id: int) -> PositionAggregate:
         key = self._key(exchange_id, account_id, symbol_id)
-
-        agg = self._aggregates.get(key)
+        agg = self._aggs.get(key)
         if agg is None:
             agg = PositionAggregate.empty(
                 exchange_id=exchange_id,
                 account_id=account_id,
                 symbol_id=symbol_id,
             )
-            self._aggregates[key] = agg
-
+            self._aggs[key] = agg
         return agg
 
     # ------------------------------------------------------------
@@ -76,8 +64,7 @@ class PositionManager:
           PositionAggregate if position changed,
           None otherwise.
         """
-
-        trade_id = str(evt.trade_id or "")
+        trade_id = str(getattr(evt, "trade_id", "") or "")
         if trade_id:
             if trade_id in self._seen_trade_ids:
                 return None
@@ -86,7 +73,7 @@ class PositionManager:
         agg = self.get_or_create(
             int(evt.exchange_id or self.exchange_id),
             int(evt.account_id or self.account_id),
-            int(evt.symbol_id),
+            int(evt.symbol_id or 0),
         )
 
         changed = agg.apply_trade(evt)
@@ -96,26 +83,30 @@ class PositionManager:
         return agg
 
     # ------------------------------------------------------------
-    def rebuild_from_trades(
-        self,
-        *,
-        since_ts_ms: int = 0,
-        limit: int = 200_000,
-    ) -> int:
+    def snapshot(self, *, include_flat: bool = True) -> List[PositionAggregate]:
+        """
+        Used by Engine/Instance for a quick in-memory view.
+        Added to satisfy instance.py references.
+        """
+        aggs = list(self._aggs.values())
+        if include_flat:
+            return aggs
+        return [a for a in aggs if getattr(a, "qty", 0.0) != 0.0]
+
+    def snapshot_rows(self, *, include_flat: bool = True) -> List[dict]:
+        """Convenience: snapshot as DB-ready rows."""
+        return [a.to_row() for a in self.snapshot(include_flat=include_flat)]
+
+    # ------------------------------------------------------------
+    def rebuild_from_trades(self, *, since_ts_ms: int = 0, limit: int = 200_000) -> int:
         """
         STEP H.3
 
         Rebuild in-memory positions from trades table.
-        Persistence is handled by caller.
-
-        Returns:
-          number of rebuilt aggregates
+        Persistence is done by caller (OMS / Engine).
         """
-
         if not hasattr(self.storage, "fetch_trades"):
-            self.logger.warning(
-                "[POSITIONS][REBUILD] storage.fetch_trades missing -> skip"
-            )
+            self.logger.warning("[POSITIONS][REBUILD] storage.fetch_trades missing -> skip")
             return 0
 
         rows = self.storage.fetch_trades(
@@ -129,45 +120,31 @@ class PositionManager:
             self.logger.info("[POSITIONS][REBUILD] no trades found")
             return 0
 
-        rebuilt = 0
-
         for r in rows:
-            try:
-                evt = TradeEvent(
-                    exchange="",
-                    account="",
-                    symbol="",
-
-                    exchange_id=int(r.get("exchange_id") or self.exchange_id),
-                    account_id=int(r.get("account_id") or self.account_id),
-                    symbol_id=int(r["symbol_id"]),
-
-                    trade_id=str(r.get("trade_id") or ""),
-                    order_id=str(r.get("order_id") or ""),
-                    side=str(r.get("side") or ""),
-                    qty=float(r.get("qty") or 0.0),
-                    price=float(r.get("price") or 0.0),
-                    realized_pnl=float(r.get("realized_pnl") or 0.0),
-                    fee=float(r.get("fee") or 0.0),
-
-                    ts_ms=int(r.get("ts_ms") or 0),
-                    raw_json=r.get("raw_json"),
-                )
-
-                self.on_trade_event(evt)
-
-            except Exception:
-                self.logger.exception(
-                    "[POSITIONS][REBUILD] failed trade_id=%s",
-                    r.get("trade_id"),
-                )
-
-        rebuilt = len(self._aggregates)
+            evt = TradeEvent(
+                exchange="",
+                account="",
+                symbol="",
+                exchange_id=int(r.get("exchange_id") or self.exchange_id),
+                account_id=int(r.get("account_id") or self.account_id),
+                symbol_id=int(r.get("symbol_id") or 0),
+                trade_id=str(r.get("trade_id") or ""),
+                order_id=str(r.get("order_id") or ""),
+                side=str(r.get("side") or ""),
+                price=float(r.get("price") or 0.0),
+                qty=float(r.get("qty") or 0.0),
+                realized_pnl=float(r.get("realized_pnl") or 0.0),
+                fee=float(r.get("fee") or 0.0),
+                fee_asset=str(r.get("fee_asset") or ""),
+                ts_ms=int(r.get("ts_ms") or 0),
+                source=str(r.get("source") or "db_rebuild"),
+                raw_json=r.get("raw_json") or {},
+            )
+            self.on_trade_event(evt)
 
         self.logger.info(
             "[POSITIONS][REBUILD] rebuilt %d positions from %d trades",
-            rebuilt,
+            len(self._aggs),
             len(rows),
         )
-
-        return rebuilt
+        return len(self._aggs)

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import time
+import logging
 from typing import List, Optional
 
 from src.platform.core.strategy.base import Strategy
@@ -40,6 +41,8 @@ class OneShotTestStrategy(Strategy):
         self._pos_uid: Optional[str] = None
 
         self._pending: List[OrderIntent] = []
+        # внутри __init__(...)
+        self.logger = logging.getLogger("src.platform.core.strategy.one_shot_test")
 
     # ------------------------------------------------------------------
 
@@ -97,3 +100,7 @@ class OneShotTestStrategy(Strategy):
         out = self._pending
         self._pending = []
         return out
+
+    def on_positions_update(self, *, positions):
+        self.logger.info("[STRAT] positions=%s", positions)
+

@@ -1,250 +1,142 @@
 # src/platform/core/oms/oms.py
 from __future__ import annotations
 
-import time
 import logging
-from dataclasses import dataclass
-from typing import Optional
+import time
+from typing import Dict, Optional, Any
 
 from src.platform.core.models.order import OrderIntent
-from src.platform.core.oms.events import OrderEvent, TradeEvent
-from src.platform.core.oms.preflight import preflight_intent
-from src.platform.core.oms.writer import OmsWriter
-from src.platform.core.oms.aggregate import OrderAggregate
+from src.platform.core.oms.decisions import resolve_order
+from src.platform.core.oms.events import OrderEvent
 from src.platform.core.position.position_manager import PositionManager
-
-
-_FINAL_STATUSES = {"FILLED", "CANCELED", "REJECTED", "EXPIRED"}
-
-# ----------------------------------------------------------------------
-# Pending submit placeholder (idempotency / WS gaps)
-# ----------------------------------------------------------------------
-@dataclass(slots=True)
-class PendingSubmit:
-    client_order_id: str
-    symbol_id: int
-    strategy_id: str
-    pos_uid: str | None
-    intent: OrderIntent
-    created_ts: float
+from src.platform.core.models.enums import Side
 
 
 class OrderManager:
     """
-    STEP G.2 / H.1 OrderManager
+    K6.8 OMS
 
     Responsibilities:
-      ✔ route OrderEvent / TradeEvent
-      ✔ append immutable events (order_events / trades)
-      ✔ maintain in-memory OrderAggregate (FSM)
-      ✔ persist order snapshot
-      ✔ maintain PositionAggregate via trades
-      ✔ minimal submit-side idempotency
+      ✔ order lifecycle FSM (pending submit tracking)
+      ✔ Order ↔ Position decision (OPEN / REDUCE)
+      ✔ reduceOnly enforcement
+      ✖ NO exchange I/O
     """
 
-    # ------------------------------------------------------------------
-    # init
-    # ------------------------------------------------------------------
     def __init__(
         self,
         *,
-        storage,
+        storage: Any,
         exchange_id: int,
         account_id: int,
+        position_manager: PositionManager,
         logger: logging.Logger | None = None,
     ) -> None:
         self.storage = storage
         self.exchange_id = int(exchange_id)
         self.account_id = int(account_id)
-        self.logger = logger or logging.getLogger(__name__)
+        self.pm = position_manager
+        self.logger = logger or logging.getLogger("oms")
 
-        # persistence only
-        self.writer = OmsWriter(
-            storage=self.storage,
-            logger=self.logger,
-        )
+        self.logger.info("[OMS] position_manager_id=%s", id(self.pm))
 
-        # submit-side idempotency
-        self._pending: dict[str, PendingSubmit] = {}
-        self._final_seen: dict[str, float] = {}
+        # client_order_id -> ts
+        self._pending: Dict[str, float] = {}
 
-        # order aggregates (FSM)
-        self._orders: dict[str, OrderAggregate] = {}
-
-        # position aggregates (from trades)
-        self.position_manager = PositionManager(
-            storage=self.storage,
-            exchange_id=self.exchange_id,
-            account_id=self.account_id,
-            logger=self.logger,
-        )
-
-    # ------------------------------------------------------------------
-    # submit-side helpers
-    # ------------------------------------------------------------------
+    # ------------------------------------------------------------
     def should_submit(self, client_order_id: str) -> bool:
-        if not client_order_id:
-            return True
-        if client_order_id in self._pending:
-            return False
-        if client_order_id in self._final_seen:
-            return False
-        return True
+        return client_order_id not in self._pending
 
-    def record_pending_submit(
-        self,
-        *,
-        client_order_id: str,
-        symbol_id: int,
-        strategy_id: str,
-        pos_uid: str | None,
-        intent: OrderIntent,
-    ) -> None:
-        if not client_order_id:
-            return
+    def record_pending_submit(self, *, client_order_id: str) -> None:
+        self._pending[str(client_order_id)] = time.time()
 
-        self._pending[client_order_id] = PendingSubmit(
-            client_order_id=client_order_id,
-            symbol_id=int(symbol_id),
-            strategy_id=str(strategy_id or "unknown"),
-            pos_uid=str(pos_uid) if pos_uid else None,
-            intent=intent,
-            created_ts=time.time(),
+    def reconcile_pending_timeouts(self, timeout_sec: float) -> None:
+        now = time.time()
+        expired = [cid for cid, ts in self._pending.items() if now - ts >= timeout_sec]
+        for cid in expired:
+            self.logger.warning("[OMS] pending timeout cid=%s", cid)
+            self._pending.pop(cid, None)
+
+    # ------------------------------------------------------------
+    def apply_event(self, event: OrderEvent) -> None:
+        """
+        Apply exchange events (ACK / FILL / CANCEL).
+        """
+        cid = getattr(event, "client_order_id", None)
+        if cid and str(cid) in self._pending:
+            self._pending.pop(str(cid), None)
+
+    # ------------------------------------------------------------
+    def _is_close_intent(self, intent: OrderIntent) -> bool:
+        it = getattr(intent, "intent_type", None)
+        if it is None:
+            return False
+        s = str(it).upper()
+        return "CLOSE" in s or "REDUCE" in s
+
+    def resolve_intent(self, intent: OrderIntent) -> Optional[OrderIntent]:
+        """
+        K6.8 core logic:
+        OrderIntent → OrderDecision → final OrderIntent
+        """
+
+        symbol_id = int(getattr(intent, "symbol_id", 0) or 0)
+        if symbol_id <= 0:
+            self.logger.warning("[OMS] missing/invalid symbol_id intent=%s", intent)
+            return None
+
+        agg = self.pm.get_or_create(
+            self.exchange_id,
+            self.account_id,
+            symbol_id,
         )
 
-    def reconcile_pending_timeouts(self, timeout_sec: float) -> int:
-        now = time.time()
-        timeout = float(timeout_sec or 20)
-
-        expired: list[str] = []
-        for cid, p in list(self._pending.items()):
-            if now - p.created_ts >= timeout:
-                expired.append(cid)
-
-        for cid in expired:
-            self._pending.pop(cid, None)
-            self._final_seen[cid] = now
-
-        return len(expired)
-
-    # ------------------------------------------------------------------
-    # event ingestion
-    # ------------------------------------------------------------------
-    def apply_event(self, ev: object) -> None:
-        if isinstance(ev, OrderEvent):
-            self.on_order_event(ev)
-        elif isinstance(ev, TradeEvent):
-            self.on_trade_event(ev)
-        else:
-            self.logger.debug("[OMS] ignored unknown event=%s", type(ev))
-
-    # ------------------------------------------------------------------
-    # order events
-    # ------------------------------------------------------------------
-    def on_order_event(self, evt: OrderEvent) -> None:
-        """
-        OrderEvent flow (STEP G.2):
-
-          1) normalize routing ids
-          2) persist immutable event
-          3) apply to OrderAggregate (FSM)
-          4) persist order snapshot
-        """
-
-        # normalize routing ids
-        evt.exchange_id = int(evt.exchange_id or self.exchange_id)
-        evt.account_id = int(evt.account_id or self.account_id)
-
-        # 1️⃣ immutable log
-        self.writer.append_order_event(evt)
-
-        oid = str(evt.order_id)
-
-        # 2️⃣ aggregate / FSM
-        agg = self._orders.get(oid)
-        if agg is None:
-            agg = OrderAggregate.from_event(evt)
-            self._orders[oid] = agg
-        else:
-            changed = agg.apply(evt)
-            if not changed:
-                return
-
-        # mark final for idempotency
-        if agg.status in _FINAL_STATUSES and agg.client_order_id:
-            self._final_seen[agg.client_order_id] = time.time()
-            self._pending.pop(agg.client_order_id, None)
-
-        # 3️⃣ snapshot
-        self.writer.upsert_order_snapshot(agg)
-
-    # ------------------------------------------------------------------
-    # trade events (fills)
-    # ------------------------------------------------------------------
-    def on_trade_event(self, evt: TradeEvent) -> None:
-        """
-        TradeEvent flow (STEP H).
-
-        1) normalize routing ids
-        2) persist immutable trade
-        3) apply to PositionAggregate
-        4) persist position snapshot if changed.
-        """
-
-        # normalize routing ids
-        evt.exchange_id = int(evt.exchange_id or self.exchange_id)
-        evt.account_id = int(evt.account_id or self.account_id)
-
-        # immutable trade log
-        self.writer.write_trade(evt)
-
-        # update in-memory position
-        pos = self.position_manager.on_trade_event(evt)
-
-        if pos is not None:
-            # explicitly tell type checker what pos is
-            assert pos.symbol_id is not None
-
-            try:
-                self.storage.upsert_positions([pos.to_row()])
-            except Exception:
-                self.logger.exception(
-                    "[POS][SNAPSHOT] upsert failed symbol_id=%s",
-                    pos.symbol_id,
+        # CRITICAL SAFETY:
+        # CLOSE intent must NOT become OPEN when position is not yet in memory.
+        if self._is_close_intent(intent):
+            ps = getattr(agg, "side", None)
+            pq = float(getattr(agg, "qty", 0.0) or 0.0)
+            if pq <= 0.0 or ps is None:
+                self.logger.warning(
+                    "[OMS][BLOCK][CLOSE] %s %s qty=%.6f reason=position_is_flat_in_memory",
+                    intent.symbol,
+                    getattr(intent.side, "name", str(intent.side)),
+                    float(intent.qty or 0.0),
                 )
+                return None
 
-        return None
+        decision = resolve_order(
+            pos_side=getattr(agg, "side", None),
+            pos_qty=float(getattr(agg, "qty", 0.0) or 0.0),
+            order_side=intent.side,           # Side.LONG / Side.SHORT
+            order_qty=float(intent.qty),
+        )
 
-    # ------------------------------------------------------------------
-    # submit preflight
-    # ------------------------------------------------------------------
-    def preflight(
-        self,
-        *,
-        symbol: str,
-        symbol_id: int,
-        intent: OrderIntent,
-        last_price: float,
-        logger=None,
-    ) -> Optional[OrderIntent]:
-        """
-        Normalize intent (qty/price rounding, minNotional, etc.).
-        """
-        try:
-            filters = self.storage.get_symbol_filters(
-                exchange_id=self.exchange_id,
-                symbol_id=int(symbol_id),
-            )
-        except Exception:
-            self.logger.exception(
-                "[OMS][PREFLIGHT] get_symbol_filters failed symbol=%s",
-                symbol,
+        if not decision.allowed:
+            self.logger.warning(
+                "[OMS][BLOCK] %s %s qty=%.6f reason=%s",
+                intent.symbol,
+                getattr(intent.side, "name", str(intent.side)),
+                float(intent.qty),
+                decision.reason,
             )
             return None
 
-        return preflight_intent(
-            intent=intent,
-            last_price=float(last_price or 0.0),
-            filters=filters,
-            logger=logger or self.logger,
+        # Apply decision
+        intent.qty = float(decision.qty)
+        intent.reduce_only = bool(decision.reduce_only)
+
+        # Extra safety: reduceOnly must be True for REDUCE mode.
+        if decision.mode == "REDUCE":
+            intent.reduce_only = True
+
+        self.logger.info(
+            "[OMS][%s] %s %s qty=%.6f reduce_only=%s",
+            decision.mode,
+            intent.symbol,
+            getattr(intent.side, "name", str(intent.side)),
+            float(intent.qty),
+            bool(intent.reduce_only),
         )
+
+        return intent

@@ -18,9 +18,19 @@ from src.platform.core.oms.events import TradeEvent
 
 from src.platform.core.position.position_manager import PositionManager
 from src.platform.core.position.position_reconciler import PositionReconciler
+from src.platform.core.position.position_flusher import PositionFlusher
 
 
 class TradingInstance:
+    """
+    Trading runtime (K6.8):
+
+      WS user events  → OMS (pending) → PositionManager (authoritative trades)
+      WS ticks        → PositionManager (mark price uPnL)
+      REST reconcile  → PositionManager (secondary safety)
+      PositionFlusher → DB persistence (ONLY here)
+    """
+
     def __init__(
         self,
         *,
@@ -37,61 +47,55 @@ class TradingInstance:
         funding_poll_sec: float = 120.0,
         oms_reconcile_sec: float = 15.0,
         oms_pending_timeout_sec: float = 20.0,
+        positions_reconcile_sec: float = 2.0,
+        positions_flush_sec: float = 2.0,
         base_ref: Optional[str] = None,
         hedge_ratio: Optional[float] = None,
-        # STEP I/J: позиционный reconcile интервал
-        positions_reconcile_sec: float = 2.0,
-    ):
+    ) -> None:
         self.logger = logging.getLogger("src.platform.core.engine.instance")
 
-        # --- identity ---
+        # identity
         self.exchange = exchange
-        self.ex = exchange  # backward compatibility
         self.account = account
         self.role = role
-        self.symbols = list(symbols or [])
+        self.symbols = list(symbols)
         self.strategy = strategy
+        self.candle_intervals = list(candle_intervals)
 
-        self.candle_intervals = list(candle_intervals or [])
-
-        # --- infra ---
+        # infra / ids
         self.storage = storage
-        self.ids = dict(ids or {})
-        self.exchange_id = int(self.ids["_exchange_id"])
-        self.account_id = int(self.ids.get("_account_id") or 0)
+        self.ids = dict(ids)
 
-        # map only for configured symbols
+        self.exchange_id = int(self.ids["_exchange_id"])
+        self.account_id = int(self.ids.get("_account_id", 0))
+
+        # registry: "LTCUSDT" -> symbol_id
         self.symbol_ids: dict[str, int] = {
-            s: int(self.ids[s]) for s in self.symbols if s in self.ids
+            s.upper(): int(self.ids[s]) for s in self.symbols if s in self.ids
         }
 
-        # --- risk ---
+        # risk / flags
         self.risk_limits = risk_limits
         self.dry_run = bool(dry_run)
-
-        # --- optional ---
         self.base_ref = base_ref
         self.hedge_ratio = hedge_ratio
 
-        # --- timing ---
+        # timing
         self.funding_poll_sec = float(funding_poll_sec)
         self.oms_reconcile_sec = float(oms_reconcile_sec)
         self.oms_pending_timeout_sec = float(oms_pending_timeout_sec)
-
         self.positions_reconcile_sec = float(positions_reconcile_sec)
+        self.positions_flush_sec = float(positions_flush_sec)
 
-        # --- state ---
+        # runtime state
         self._running = False
         self._stop = threading.Event()
+        self._last_idle_log = 0.0
+        self._last_account_state: Optional[dict] = None
 
-        # --- OMS ---
-        self.oms = OrderManager(
-            storage=self.storage,
-            exchange_id=self.exchange_id,
-            account_id=self.account_id,
-        )
-
-        # --- Positions (STEP J) ---
+        # ------------------------------------------------------------
+        # Positions (create FIRST, OMS depends on it)
+        # ------------------------------------------------------------
         self.position_manager = PositionManager(
             storage=self.storage,
             exchange_id=self.exchange_id,
@@ -99,24 +103,36 @@ class TradingInstance:
             logger=logging.getLogger("positions.manager"),
         )
 
-        self.position_reconciler: Optional[PositionReconciler] = PositionReconciler(
+        # ------------------------------------------------------------
+        # OMS (K6.8) — needs position_manager
+        # ------------------------------------------------------------
+        self.oms = OrderManager(
+            storage=self.storage,
+            exchange_id=self.exchange_id,
+            account_id=self.account_id,
+            position_manager=self.position_manager,  # ✅ FIX (иначе TypeError)
+        )
+
+        self.position_reconciler = PositionReconciler(
             exchange=self.exchange,
             position_manager=self.position_manager,
             storage=self.storage,
             exchange_id=self.exchange_id,
             account_id=self.account_id,
             account=self.account,
-            symbol_ids=self.symbol_ids,  # ✅ важно: помогает восстановить symbol_id по symbol
+            symbol_ids=self.symbol_ids,
             logger=logging.getLogger("positions.reconciler"),
         )
 
-        # runtime cache
-        self._last_account_state: Optional[dict] = None
-        self._last_idle_log = 0.0
+        self.position_flusher = PositionFlusher(
+            position_manager=self.position_manager,
+            storage=self.storage,
+            logger=logging.getLogger("positions.flusher"),
+        )
 
-    # ------------------------------------------------------------------
+    # ============================================================
     # lifecycle
-    # ------------------------------------------------------------------
+    # ============================================================
 
     def run(self) -> None:
         self.logger.info(
@@ -129,18 +145,23 @@ class TradingInstance:
 
         self._running = True
 
-        # --- WS subscriptions ---
+        # WS ticks (safe)
         self.exchange.subscribe_ticks(
             account=self.account,
             symbols=self.symbols,
             cb=self._on_tick,
         )
 
-        self.exchange.subscribe_user_stream(
-            account=self.account,
-            cb=self._on_user_event,
-        )
+        # ✅ В DRY_RUN НЕ лезем за listenKey (REST), иначе при бане IP всё падает
+        if not self.dry_run:
+            self.exchange.subscribe_user_stream(
+                account=self.account,
+                cb=self._on_user_event,
+            )
+        else:
+            self.logger.warning("[DRY_RUN] skip user_stream subscribe (listenKey requires REST)")
 
+        # candles тоже WS (safe)
         if self.candle_intervals:
             self.exchange.subscribe_candles(
                 account=self.account,
@@ -149,50 +170,57 @@ class TradingInstance:
                 cb=self._on_candle,
             )
 
-        # OMS loop
-        threading.Thread(
-            target=self._oms_loop,
-            daemon=True,
-            name=f"OMSLoop-{self.account}",
-        ).start()
+        # background loops
+        threading.Thread(target=self._oms_loop, daemon=True).start()
 
-        # account polling loop
-        threading.Thread(
-            target=self._account_loop,
-            daemon=True,
-            name=f"AccountLoop-{self.account}",
-        ).start()
+        # ✅ Эти циклы — REST. В dry_run лучше не запускать, чтобы не ловить 429/418.
+        if not self.dry_run:
+            threading.Thread(target=self._account_loop, daemon=True).start()
+            threading.Thread(target=self._position_reconcile_loop, daemon=True).start()
+        else:
+            self.logger.warning("[DRY_RUN] skip REST loops (account/reconcile)")
 
-        # STEP I loop (REST reconcile)
-        threading.Thread(
-            target=self._position_reconcile_loop,
-            daemon=True,
-            name=f"PositionsRecon-{self.account}",
-        ).start()
+        # flush loop не REST
+        threading.Thread(target=self._position_flush_loop, daemon=True).start()
 
         self.strategy.on_start()
 
         while self._running and not self._stop.is_set():
             self._drain_intents()
+
             now = time.time()
             if now - self._last_idle_log >= 10.0:
                 self.logger.info("[Instance] idle (alive)")
                 self._last_idle_log = now
+
             time.sleep(0.05)
 
     def stop(self) -> None:
         self._running = False
         self._stop.set()
+
         try:
             self.strategy.on_stop()
         except Exception:
             self.logger.exception("[StrategyStopError]")
 
-    # ------------------------------------------------------------------
+        # final flush
+        try:
+            self.position_flusher.flush()
+        except Exception:
+            self.logger.exception("[POSITIONS][FINAL FLUSH ERROR]")
+
+    # ============================================================
     # WS callbacks
-    # ------------------------------------------------------------------
+    # ============================================================
 
     def _on_tick(self, symbol: str, price: float) -> None:
+        symbol_id = self.symbol_ids.get(symbol.upper())
+        if not symbol_id:
+            return
+        self.position_manager.on_mark_price(symbol_id=symbol_id, price=price)
+
+        # стратегию тоже кормим тиком (если нужно)
         self.strategy.on_tick(symbol=symbol, price=price)
 
     def _on_candle(self, candle: dict) -> None:
@@ -200,12 +228,6 @@ class TradingInstance:
             self.strategy.on_candle(candle=candle)
 
     def _on_user_event(self, event: dict) -> None:
-        """
-        STEP G/J — UserStream → OMS + Positions aggregation (TradeEvent → PositionAggregate)
-        """
-        if not self.oms:
-            return
-
         try:
             events = parse_binance_user_event(
                 event,
@@ -214,65 +236,37 @@ class TradingInstance:
             )
 
             for ev in events:
-                # 1) OMS state machine
+                # OMS снимает pending по ACK/FILL/CANCEL
                 self.oms.apply_event(ev)
 
-                # 2) STEP J: realtime positions from trades
-                if isinstance(ev, TradeEvent):
+                # Positions строим только из TradeEvent
+                if not isinstance(ev, TradeEvent):
+                    continue
 
-                    # ---------- FIX 1: symbol_id ----------
-                    if not ev.symbol_id or ev.symbol_id <= 0:
-                        sym = (ev.symbol or "").upper()
-                        ev.symbol_id = self.symbol_ids.get(sym, 0)
+                if not ev.symbol_id:
+                    ev.symbol_id = self.symbol_ids.get((ev.symbol or "").upper(), 0)
 
-                    if not ev.symbol_id:
-                        self.logger.warning(
-                            "[POSITIONS][WS] skip trade without symbol_id (symbol=%s)",
-                            ev.symbol,
-                        )
-                        continue
+                if not ev.symbol_id:
+                    self.logger.debug(
+                        "[USER_STREAM] skip trade without symbol_id symbol=%s",
+                        getattr(ev, "symbol", None),
+                    )
+                    continue
 
-                    # ---------- FIX 2: ts_ms ----------
-                    if not ev.ts_ms or ev.ts_ms <= 0:
-                        raw = ev.raw_json
-                        if not isinstance(raw, dict):
-                            raw = {}
+                if not ev.ts_ms:
+                    ev.ts_ms = int(time.time() * 1000)
 
-                        ev.ts_ms = (
-                                raw.get("T")
-                                or raw.get("eventTime")
-                                or raw.get("E")
-                                or int(time.time() * 1000)
-                        )
-
-                    if not ev.ts_ms:
-                        self.logger.warning(
-                            "[POSITIONS][WS] trade without ts_ms (symbol=%s trade_id=%s)",
-                            ev.symbol,
-                            ev.trade_id,
-                        )
-                        continue
-
-                    # ---------- APPLY ----------
-                    agg = self.position_manager.on_trade_event(ev)
-                    if agg and hasattr(self.storage, "upsert_positions"):
-                        self.storage.upsert_positions(
-                            [agg.to_row(last_trade_id=str(ev.trade_id or ""))]
-                        )
+                self.position_manager.on_trade_event(ev)
 
         except Exception:
-            self.logger.exception("[OMS][USER_EVENT ERROR]")
+            self.logger.exception("[USER_STREAM ERROR]")
 
-    # ------------------------------------------------------------------
-    # intents → OMS
-    # ------------------------------------------------------------------
+    # ============================================================
+    # intents → OMS → Exchange
+    # ============================================================
 
     def _drain_intents(self) -> None:
-        intents: List[OrderIntent] = self.strategy.get_intents()
-        if not intents:
-            return
-
-        for intent in intents:
+        for intent in self.strategy.get_intents() or []:
             self._process_intent(intent)
 
     def _process_intent(self, intent: OrderIntent) -> None:
@@ -286,73 +280,60 @@ class TradingInstance:
             )
             return
 
-        # OMS idempotency gate
-        if not self.oms.should_submit(intent.client_order_id):
-            self.logger.debug("[OMS] skip duplicate cid=%s", intent.client_order_id)
+        # set symbol_id
+        sym = (intent.symbol or "").upper()
+        sid = int(self.symbol_ids.get(sym, 0) or 0)
+        if sid <= 0:
+            self.logger.warning("[INTENT] symbol_id not found for symbol=%s", intent.symbol)
+            return
+        intent.symbol_id = sid
+        intent.account = self.account
+        intent.exchange = self.exchange.name
+
+        # normalize with OMS
+        intent2 = self.oms.resolve_intent(intent)
+        if not intent2:
             return
 
-        self.logger.info(
-            "[SUBMIT] %s %s qty=%s cid=%s",
-            intent.symbol,
-            intent.side.name,
-            intent.qty,
-            intent.client_order_id,
-        )
+        if not self.oms.should_submit(intent2.client_order_id):
+            return
 
-        self.oms.record_pending_submit(
-            client_order_id=intent.client_order_id,
-            symbol_id=self.symbol_ids[intent.symbol],
-            strategy_id=self.strategy.strategy_id,
-            pos_uid=intent.pos_uid,
-            intent=intent,
-        )
+        self.oms.record_pending_submit(client_order_id=intent2.client_order_id)
 
-        self.exchange.place_order(intent)
+        self.exchange.place_order(intent2)
 
-    # ------------------------------------------------------------------
-    # OMS reconcile loop
-    # ------------------------------------------------------------------
+    # ============================================================
+    # background loops
+    # ============================================================
 
     def _oms_loop(self) -> None:
         while not self._stop.is_set():
-            try:
-                self.oms.reconcile_pending_timeouts(self.oms_pending_timeout_sec)
-            except Exception:
-                self.logger.exception("[OMS LOOP ERROR]")
-
+            self.oms.reconcile_pending_timeouts(self.oms_pending_timeout_sec)
             time.sleep(self.oms_reconcile_sec)
-
-    # ------------------------------------------------------------------
-    # STEP I: positions reconcile loop (REST)
-    # ------------------------------------------------------------------
 
     def _position_reconcile_loop(self) -> None:
         while not self._stop.is_set():
-            try:
-                if self.position_reconciler:
-                    self.position_reconciler.run_once()
-            except Exception:
-                self.logger.exception("[POSITIONS][RECON LOOP ERROR]")
-
+            self.position_reconciler.run_once()
             time.sleep(self.positions_reconcile_sec)
 
-    # ------------------------------------------------------------------
-    # account polling
-    # ------------------------------------------------------------------
+    def _position_flush_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self.position_flusher.flush()
+            except Exception:
+                self.logger.exception("[POSITIONS][FLUSH LOOP ERROR]")
+            time.sleep(self.positions_flush_sec)
 
     def _account_loop(self) -> None:
         while not self._stop.is_set():
             try:
                 state = self.exchange.fetch_account_state(account=self.account)
-
                 self.storage.upsert_account_state(
                     exchange_id=self.exchange_id,
                     account_id=self.account_id,
                     state=state,
                 )
-
                 self._last_account_state = state
-
             except Exception:
                 self.logger.exception("[ACCOUNT LOOP ERROR]")
 

@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 from src.platform.exchanges.registry import build_exchange
 from src.platform.exchanges.binance.collector_exchange_info import sync_exchange_info
 from src.platform.exchanges.binance.collector_symbol_filters import run_symbol_filters_collector
+from src.platform.exchanges.binance.collector_symbol_filters import start_symbol_filters_collector
 
 from src.platform.core.engine.instance import TradingInstance
 from src.platform.core.engine.runner import run_instances
@@ -193,25 +194,31 @@ def main() -> None:
                 if not str(k).startswith("_"):
                     symbol_ids[str(k)] = int(v)
 
-        _safe_sync_exchange_info(
-            rest=rest,
-            storage=store,
-            exchange_id=exchange_id,
-            symbol_ids=symbol_ids,
-            dry_run=dry_run,
-            logger=logger,
-        )
+        # _safe_sync_exchange_info(
+        #     rest=rest,
+        #     storage=store,
+        #     exchange_id=exchange_id,
+        #     symbol_ids=symbol_ids,
+        #     dry_run=dry_run,
+        #     logger=logger,
+        # )
 
-        _start_symbol_filters_collector(
-            rest=rest,
-            storage=store,
-            exchange_id=exchange_id,
-            symbol_ids=symbol_ids,
-            interval_sec=3600,
-            logger=logger,
-        )
+        # --- SymbolFilters collector (REST exchangeInfo) ---
+        if dry_run:
+            logger.warning("DRY_RUN enabled → skip SymbolFilters collector (REST exchangeInfo)")
+        else:
 
-    # -------------------------------------------------------------------------
+            start_symbol_filters_collector(
+                rest=rest,  # это BinanceFuturesREST из твоего run_instances.py
+                storage=store,  # это PostgreSQL storage (у тебя переменная store)
+                exchange_id=exchange_id,
+                symbol_ids=symbol_ids,  # dict[str, int] symbol->symbol_id
+                interval_sec=3600,
+                do_seed_on_start=True,
+            )
+            logger.info("SymbolFilters collector started (interval=3600s)")
+
+            # -------------------------------------------------------------------------
     # RETENTION
     # -------------------------------------------------------------------------
     retention_cfg = cfg_root.get("retention", {}) or {}

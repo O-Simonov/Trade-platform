@@ -11,7 +11,7 @@ from src.platform.exchanges.base.exchange import (
     UserEventCallback,
     CandleCallback,
 )
-from src.platform.core.models.order import OrderIntent
+from src.platform.core.models.order import OrderIntent, OrderType
 from src.platform.core.models.enums import Side
 from src.platform.core.models.position import Position
 
@@ -38,7 +38,7 @@ class BinanceExchange(ExchangeAdapter):
 
         # REST
         self._rest_by_account: dict[str, BinanceFuturesREST] = {}
-        self.rest: Optional[BinanceFuturesREST] = None  # exposed for OMS reconcile (optional)
+        self.rest: Optional[BinanceFuturesREST] = None  # exposed (optional)
 
         # WS
         self._tick_ws: dict[str, BinanceWS] = {}
@@ -71,8 +71,16 @@ class BinanceExchange(ExchangeAdapter):
 
         if self.rest is None:
             self.rest = cli
-
         return cli
+
+    # ---------------- url helper ----------------
+
+    @staticmethod
+    def _stream_url(streams: list[str]) -> str:
+        base = str(WS_STREAM_BASE)
+        if base.endswith("="):
+            return base + "/".join(streams)
+        return base.rstrip("/") + "/" + "/".join(streams)
 
     # ---------------- subscriptions ----------------
 
@@ -81,7 +89,7 @@ class BinanceExchange(ExchangeAdapter):
         if not streams:
             return
 
-        url = WS_STREAM_BASE + "/".join(streams)
+        url = self._stream_url(streams)
         self.logger.info("WS TICKS URL = %s", url)
 
         def on_msg(data: dict):
@@ -95,9 +103,15 @@ class BinanceExchange(ExchangeAdapter):
         self._tick_ws[account] = ws
 
     def subscribe_user_stream(self, *, account: str, cb: UserEventCallback) -> None:
+        # NOTE: listenKey is REST and may fail on bans/rate limits.
         rest = self._rest(account)
-        resp = rest.create_listen_key()
-        lk = resp.get("listenKey")
+        try:
+            resp = rest.create_listen_key()
+        except Exception as e:
+            self.logger.error("[BinanceUser] create_listen_key failed: %s", e)
+            raise
+
+        lk = (resp or {}).get("listenKey")
         if not lk:
             raise RuntimeError("listenKey error")
 
@@ -118,7 +132,7 @@ class BinanceExchange(ExchangeAdapter):
         if not streams:
             return
 
-        url = WS_STREAM_BASE + "/" + "/".join(streams)
+        url = self._stream_url(streams)
         self.logger.info("WS CANDLES URL = %s", url)
 
         def on_msg(data: dict):
@@ -132,63 +146,100 @@ class BinanceExchange(ExchangeAdapter):
 
     # ---------------- trading ----------------
 
+    def _resolve_symbol_id_from_intent(self, intent: OrderIntent) -> int:
+        """
+        K6.8: OMS may set intent.symbol_id.
+        If not — take from registry self.symbol_ids.
+        """
+        sid = int(getattr(intent, "symbol_id", 0) or 0)
+        if sid > 0:
+            return sid
+
+        sym = (intent.symbol or "").upper()
+        if sym in self.symbol_ids:
+            return int(self.symbol_ids[sym])
+
+        raise KeyError(f"symbol_id not found for symbol={intent.symbol}")
+
+    def _map_side(self, intent: OrderIntent) -> str:
+        if intent.side == Side.LONG:
+            return "BUY"
+        if intent.side == Side.SHORT:
+            return "SELL"
+        raise ValueError(f"Unsupported intent.side={intent.side}")
+
     def place_order(self, intent: OrderIntent) -> dict:
         """
-        Submit order to Binance.
-        IMPORTANT: signature must match ExchangeAdapter.place_order(self, intent)
+        Submit order to Binance Futures (UM).
+
+        K6.8:
+          - supports reduceOnly
+          - keeps client_order_id for idempotency
+          - normalizes qty/price using symbol filters
         """
         if not self.storage or self.exchange_id is None:
             raise RuntimeError("BinanceExchange not bound")
 
+        if not intent.account:
+            raise ValueError("OrderIntent.account is empty (required for BinanceExchange)")
+
         rest = self._rest(intent.account)
 
-        # symbol_id
-        if intent.symbol not in self.symbol_ids:
-            raise KeyError(f"symbol_id not found for symbol={intent.symbol}")
+        symbol = (intent.symbol or "").upper()
+        symbol_id = self._resolve_symbol_id_from_intent(intent)
+        side = self._map_side(intent)
 
-        symbol_id = int(self.symbol_ids[intent.symbol])
-        side = "BUY" if intent.side == Side.LONG else "SELL"
-
-        # filters
+        # filters from DB
         filters = self.storage.get_symbol_filters(
             exchange_id=self.exchange_id,
             symbol_id=symbol_id,
         )
+        if not filters:
+            raise RuntimeError(f"symbol_filters not found: exchange_id={self.exchange_id} symbol_id={symbol_id} symbol={symbol}")
 
         qty, price = normalize_order(
             qty=float(intent.qty),
             price=float(intent.price) if intent.price is not None else None,
-            qty_step=float(filters["qty_step"]),
-            min_qty=float(filters["min_qty"]) if filters.get("min_qty") else None,
-            max_qty=float(filters["max_qty"]) if filters.get("max_qty") else None,
-            price_tick=float(filters["price_tick"]) if filters.get("price_tick") else None,
-            min_notional=float(filters["min_notional"]) if filters.get("min_notional") else None,
+            qty_step=float(filters["qty_step"] or 0.0),
+            min_qty=float(filters["min_qty"] or 0.0),
+            max_qty=float(filters["max_qty"]) if filters.get("max_qty") is not None else None,
+            price_tick=float(filters["price_tick"]) if filters.get("price_tick") is not None else None,
+            min_notional=float(filters["min_notional"]) if filters.get("min_notional") is not None else None,
         )
 
-        if qty is None or qty <= 0:
+        if qty <= 0:
             raise ValueError("Normalized qty <= 0")
 
         params: dict[str, str] = {
-            "symbol": intent.symbol,
+            "symbol": symbol,
             "side": side,
             "type": intent.order_type.value,
             "quantity": str(qty),
         }
 
-        if intent.reduce_only:
+        # reduceOnly
+        if bool(intent.reduce_only):
             params["reduceOnly"] = "true"
 
-        # OMS idempotency (always via intent.client_order_id)
+        # idempotency
         if getattr(intent, "client_order_id", None):
             params["newClientOrderId"] = str(intent.client_order_id)
 
-        if price is not None:
+        # LIMIT price/TIF
+        if intent.order_type == OrderType.LIMIT:
+            if price is None or price <= 0:
+                raise ValueError("LIMIT order requires price")
             params["price"] = str(price)
             params["timeInForce"] = "GTC"
 
+        # Optional: positionSide (hedge mode)
+        pos_side = os.environ.get("BINANCE_POSITION_SIDE", "").strip().upper()
+        if pos_side in ("LONG", "SHORT", "BOTH"):
+            params["positionSide"] = pos_side
+
         self.logger.info(
             "[ORDER SUBMIT] %s %s qty=%s price=%s reduce_only=%s cid=%s",
-            intent.symbol, side, qty, price, intent.reduce_only, getattr(intent, "client_order_id", None),
+            symbol, side, qty, price, bool(intent.reduce_only), getattr(intent, "client_order_id", None),
         )
 
         return rest.new_order(**params)

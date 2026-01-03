@@ -15,29 +15,14 @@ class OrderType(str, Enum):
 
 
 class OrderIntentType(str, Enum):
-    """
-    High-level semantic type of intent.
-    Used by OMS / Risk / logs.
-    """
     OPEN = "OPEN"
     CLOSE = "CLOSE"
     REDUCE = "REDUCE"
-    INTERNAL = "INTERNAL"   # OMS / reconcile / cleanup
+    INTERNAL = "INTERNAL"
 
 
 @dataclass(slots=True)
 class OrderIntent:
-    """
-    OrderIntent — canonical OMS order description.
-
-    This object is:
-      • produced by Strategy
-      • validated by Risk
-      • normalized by OMS (symbol_filters)
-      • submitted by Exchange
-      • reconciled with WS/REST
-    """
-
     # --- identity ---
     symbol: str
     side: Side
@@ -65,9 +50,8 @@ class OrderIntent:
     comment: Optional[str] = None
     created_ts: float = field(default_factory=lambda: __import__("time").time())
 
-    # ------------------------------------------------------------------
-    # helpers
-    # ------------------------------------------------------------------
+    # --- numeric binding (K6.8) ---
+    symbol_id: Optional[int] = None
 
     def is_open(self) -> bool:
         return self.intent_type == OrderIntentType.OPEN
@@ -82,9 +66,6 @@ class OrderIntent:
         price: Optional[float] = None,
         reduce_only: Optional[bool] = None,
     ) -> "OrderIntent":
-        """
-        Used by OMS after normalization (symbol_filters).
-        """
         return OrderIntent(
             symbol=self.symbol,
             side=self.side,
@@ -98,6 +79,7 @@ class OrderIntent:
             pos_uid=self.pos_uid,
             client_order_id=self.client_order_id,
             comment=self.comment,
+            symbol_id=self.symbol_id,
         )
 
     def __repr__(self) -> str:

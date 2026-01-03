@@ -41,7 +41,6 @@ class OneShotTestStrategy(Strategy):
         self._pos_uid: Optional[str] = None
 
         self._pending: List[OrderIntent] = []
-        # внутри __init__(...)
         self.logger = logging.getLogger("src.platform.core.strategy.one_shot_test")
 
     # ------------------------------------------------------------------
@@ -49,7 +48,7 @@ class OneShotTestStrategy(Strategy):
     def on_tick(self, *, symbol: str, price: float) -> None:
         now = time.time()
 
-        # --- OPEN ---
+        # --- OPEN (once) ---
         if self._opened_ts is None:
             self._opened_ts = now
             self._symbol = symbol
@@ -61,7 +60,7 @@ class OneShotTestStrategy(Strategy):
                     side=Side.LONG,
                     qty=self.qty,
                     order_type=OrderType.MARKET,
-                    reduce_only=False,
+                    reduce_only=False,  # OMS will enforce reduceOnly if needed
                     exchange=self.exchange,
                     account=self.account,
                     intent_type=OrderIntentType.OPEN,
@@ -71,15 +70,15 @@ class OneShotTestStrategy(Strategy):
             )
             return
 
-        # --- CLOSE ---
-        if now - self._opened_ts >= self.hold_sec:
+        # --- CLOSE (once) ---
+        if self._symbol and now - float(self._opened_ts) >= self.hold_sec:
             self._pending.append(
                 OrderIntent(
                     symbol=self._symbol,
-                    side=Side.SHORT,
+                    side=Side.SHORT,      # opposite direction for close
                     qty=self.qty,
                     order_type=OrderType.MARKET,
-                    reduce_only=True,
+                    reduce_only=False,    # let OMS decide + force reduceOnly in REDUCE mode
                     exchange=self.exchange,
                     account=self.account,
                     intent_type=OrderIntentType.CLOSE,
@@ -88,7 +87,7 @@ class OneShotTestStrategy(Strategy):
                 )
             )
 
-            # prevent повторов
+            # prevent repeats
             self._opened_ts = float("inf")
 
     # ------------------------------------------------------------------
@@ -96,11 +95,9 @@ class OneShotTestStrategy(Strategy):
     def get_intents(self) -> List[OrderIntent]:
         if not self._pending:
             return []
-
         out = self._pending
         self._pending = []
         return out
 
     def on_positions_update(self, *, positions):
         self.logger.info("[STRAT] positions=%s", positions)
-

@@ -3,26 +3,27 @@ from __future__ import annotations
 
 import logging
 import threading
-import time
 from datetime import datetime, timezone
-from typing import Dict, Any, Optional, Iterable
+from typing import Any, Dict, Iterable, Optional
 
 logger = logging.getLogger("src.platform.exchanges.binance.collector_symbol_filters")
+
+_NUM_MAX_ABS = 9_999_999_999.0
 
 
 def _to_float(x) -> Optional[float]:
     try:
         if x is None:
             return None
-        return float(x)
+        v = float(x)
+        if abs(v) >= _NUM_MAX_ABS:
+            return None
+        return v
     except Exception:
         return None
 
 
 def _extract_filters_for_symbol(sym_info: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Parse Binance exchangeInfo["symbols"][i]["filters"] into normalized fields.
-    """
     out: Dict[str, Any] = {
         "price_tick": None,
         "qty_step": None,
@@ -36,19 +37,15 @@ def _extract_filters_for_symbol(sym_info: Dict[str, Any]) -> Dict[str, Any]:
     filters = sym_info.get("filters") or []
     for f in filters:
         ftype = f.get("filterType")
-
         if ftype == "PRICE_FILTER":
             out["price_tick"] = _to_float(f.get("tickSize"))
-
         elif ftype == "LOT_SIZE":
             out["qty_step"] = _to_float(f.get("stepSize"))
             out["min_qty"] = _to_float(f.get("minQty"))
             out["max_qty"] = _to_float(f.get("maxQty"))
-
         elif ftype == "MIN_NOTIONAL":
             out["min_notional"] = _to_float(f.get("notional") or f.get("minNotional"))
 
-    # safety defaults
     if out["price_tick"] is None:
         out["price_tick"] = 0.0
     if out["qty_step"] is None:
@@ -57,16 +54,7 @@ def _extract_filters_for_symbol(sym_info: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
-def _fresh_symbol_ids_from_db(
-    *,
-    storage,
-    exchange_id: int,
-    symbol_ids: Iterable[int],
-    fresh_sec: int,
-) -> set[int]:
-    """
-    Return set(symbol_id) which have updated_at >= NOW() - fresh_sec.
-    """
+def _fresh_symbol_ids_from_db(*, storage, exchange_id: int, symbol_ids: Iterable[int], fresh_sec: int) -> set[int]:
     ids = [int(x) for x in symbol_ids]
     if not ids:
         return set()
@@ -86,58 +74,52 @@ def _fresh_symbol_ids_from_db(
                 )
                 rows = cur.fetchall()
         return {int(r[0]) for r in (rows or [])}
-
     except Exception:
-        logger.exception("[SymbolFilters] DB freshness check failed → will refresh all")
+        logger.exception("[SymbolFilters] DB freshness check failed -> will refresh all")
         return set()
 
 
 def run_symbol_filters_collector(
     *,
-    binance_rest,
+    rest,
     storage,
     exchange_id: int,
     symbol_ids: Dict[str, int],
     interval_sec: int = 3600,
     do_seed_on_start: bool = True,
+    stop_event: threading.Event,
 ) -> None:
-    """
-    Daemon loop: refresh symbol_filters only when stale.
-
-    IMPORTANT:
-      - НЕ дергаем exchangeInfo при каждом рестарте, если в БД уже есть свежие фильтры.
-      - do_seed_on_start=True значит "разрешить обновление сразу на старте", но
-        по факту мы всё равно проверяем свежесть в БД.
-    """
     interval_sec = int(interval_sec or 3600)
     logger.info("[SymbolFilters] collector started interval=%ss seed=%s", interval_sec, bool(do_seed_on_start))
 
-    backoff = 1.0  # grows on errors up to 300s
+    backoff = 1.0
+    first = True
 
-    while True:
+    while not stop_event.is_set():
         try:
             need_map = dict(symbol_ids or {})
             if not need_map:
-                logger.info("[SymbolFilters] no symbols configured → sleep")
-                time.sleep(interval_sec)
+                stop_event.wait(interval_sec)
                 continue
 
-            # если do_seed_on_start=False, всё равно проверим свежесть и обновим только если нужно
+            if first and not do_seed_on_start:
+                first = False
+                stop_event.wait(interval_sec)
+                continue
+            first = False
+
             fresh = _fresh_symbol_ids_from_db(
                 storage=storage,
                 exchange_id=exchange_id,
                 symbol_ids=need_map.values(),
                 fresh_sec=interval_sec,
             )
-
-            # если все свежие — НЕ делаем REST exchangeInfo
             if len(fresh) >= len(need_map):
-                logger.info("[SymbolFilters] up-to-date (fresh<%ss) → skip", interval_sec)
-                time.sleep(interval_sec)
+                logger.info("[SymbolFilters] up-to-date (fresh<%ss) -> skip", interval_sec)
+                stop_event.wait(interval_sec)
                 continue
 
-            # --- fetch exchangeInfo once ---
-            info = binance_rest.fetch_exchange_info()
+            info = rest.fetch_exchange_info()
             symbols = info.get("symbols") or []
 
             now = datetime.now(timezone.utc)
@@ -167,15 +149,15 @@ def run_symbol_filters_collector(
 
             n = 0
             if rows:
-                n = storage.upsert_symbol_filters(rows)
+                n = int(storage.upsert_symbol_filters(rows) or 0)
 
-            logger.info("[SymbolFilters] upserted %s symbols", n)
+            logger.info("[SymbolFilters] upserted %s symbols (need=%d)", n, len(need_map))
             backoff = 1.0
-            time.sleep(interval_sec)
+            stop_event.wait(interval_sec)
 
         except Exception as e:
             logger.warning("[SymbolFilters] error: %s", e, exc_info=True)
-            time.sleep(backoff)
+            stop_event.wait(backoff)
             backoff = min(backoff * 2.0, 300.0)
 
 
@@ -187,16 +169,18 @@ def start_symbol_filters_collector(
     symbol_ids: Dict[str, int],
     interval_sec: int = 3600,
     do_seed_on_start: bool = True,
+    stop_event: threading.Event,
 ) -> None:
     t = threading.Thread(
         target=run_symbol_filters_collector,
         kwargs=dict(
-            binance_rest=rest,
+            rest=rest,
             storage=storage,
-            exchange_id=exchange_id,
-            symbol_ids=symbol_ids,
+            exchange_id=int(exchange_id),
+            symbol_ids=dict(symbol_ids),
             interval_sec=int(interval_sec or 3600),
             do_seed_on_start=bool(do_seed_on_start),
+            stop_event=stop_event,
         ),
         daemon=True,
         name="BinanceSymbolFiltersCollector",

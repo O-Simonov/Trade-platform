@@ -11,9 +11,8 @@ import yaml
 from dotenv import load_dotenv
 
 from src.platform.exchanges.registry import build_exchange
-from src.platform.exchanges.binance.collector_exchange_info import sync_exchange_info
-from src.platform.exchanges.binance.collector_symbol_filters import run_symbol_filters_collector
-from src.platform.exchanges.binance.collector_symbol_filters import start_symbol_filters_collector
+from src.platform.exchanges.binance.collector_universe import sync_tradable_usdtm_perpetual_symbols
+from src.platform.exchanges.binance.collector_candles_active import run_candles_active_collector
 
 from src.platform.core.engine.instance import TradingInstance
 from src.platform.core.engine.runner import run_instances
@@ -35,76 +34,11 @@ def _load_yaml(path: Path) -> dict[str, Any]:
     return data or {}
 
 
-def _start_symbol_filters_collector(
-    *,
-    rest,
-    storage: PostgreSQLStorage,
-    exchange_id: int,
-    symbol_ids: dict[str, int],
-    interval_sec: int,
-    logger: logging.Logger,
-) -> None:
-    """
-    Background daemon: periodically refresh symbol_filters.
-    """
-    t = threading.Thread(
-        target=run_symbol_filters_collector,
-        kwargs=dict(
-            binance_rest=rest,
-            storage=storage,
-            exchange_id=int(exchange_id),
-            symbol_ids=dict(symbol_ids),
-            interval_sec=int(interval_sec),
-        ),
-        daemon=True,
-        name=f"BinanceSymbolFiltersCollector-{exchange_id}",
-    )
-    t.start()
-    logger.info("SymbolFilters collector started (interval=%ss)", interval_sec)
-
-
-def _safe_sync_exchange_info(
-    *,
-    rest,
-    storage: PostgreSQLStorage,
-    exchange_id: int,
-    symbol_ids: dict[str, int],
-    dry_run: bool,
-    logger: logging.Logger,
-) -> None:
-    """
-    One-shot exchangeInfo sync.
-    If signature or runtime fails — log and continue (as you wanted).
-    """
-    if dry_run:
-        logger.warning("DRY_RUN enabled → skip exchangeInfo sync")
-        return
-
-    try:
-        sync_exchange_info(
-            binance_rest=rest,
-            storage=storage,
-            exchange_id=int(exchange_id),
-            symbol_ids=dict(symbol_ids),
-        )
-        logger.info(
-            "ExchangeInfo synced: exchange=binance symbols=%s",
-            ",".join(sorted(symbol_ids.keys())),
-        )
-    except TypeError as e:
-        # signature mismatch etc.
-        logger.warning("ExchangeInfo sync failed (TypeError) → continue: %s", e)
-    except Exception as e:
-        logger.warning("ExchangeInfo sync failed (%s) → continue", type(e).__name__)
-
-
-
 def main() -> None:
     # -------------------------------------------------------------------------
     # ENV (.env first) + DRY_RUN
     # -------------------------------------------------------------------------
     load_dotenv()
-
     dry_run: bool = os.getenv("DRY_RUN", "1") == "1"
 
     # -------------------------------------------------------------------------
@@ -140,8 +74,6 @@ def main() -> None:
     # -------------------------------------------------------------------------
     # STORAGE
     # -------------------------------------------------------------------------
-    # Если create_pool поддерживает параметры — лучше расширить там.
-    # Здесь оставляем как есть, чтобы не ломать твой проект.
     pool = create_pool(dsn)
     store = PostgreSQLStorage(pool)
     logger.info("PostgreSQL storage initialized")
@@ -171,54 +103,80 @@ def main() -> None:
         )
 
     # -------------------------------------------------------------------------
-    # BINANCE BOOTSTRAP (exchangeInfo once + symbol_filters daemon)
+    # BINANCE BOOTSTRAP
     # -------------------------------------------------------------------------
     exchange_id: int | None = None
 
     binance_keys = [(ex, acc) for (ex, acc) in ids_by_key.keys() if ex == "binance"]
     if binance_keys:
-        # use first binance account as REST bootstrap account
         _, rest_account = binance_keys[0]
         binance_ex = build_exchange("binance")
 
         # internal REST client for bootstrap
+        # noinspection PyProtectedMember
         rest = binance_ex._rest(rest_account)
 
         exchange_id = int(ids_by_key[("binance", rest_account)]["_exchange_id"])
 
-        # union symbol_ids across all binance accounts in config
-        symbol_ids: dict[str, int] = {}
-        for (ex, acc) in binance_keys:
-            ids = ids_by_key[(ex, acc)]
-            for k, v in ids.items():
-                if not str(k).startswith("_"):
-                    symbol_ids[str(k)] = int(v)
+        # --- Universe: prefer DB first (avoid REST bans on frequent restarts) ---
+        symbol_ids = store.fetch_symbols_map(exchange_id=exchange_id)
 
-        # _safe_sync_exchange_info(
-        #     rest=rest,
-        #     storage=store,
-        #     exchange_id=exchange_id,
-        #     symbol_ids=symbol_ids,
-        #     dry_run=dry_run,
-        #     logger=logger,
-        # )
+        force_universe = os.getenv("UNIVERSE_FORCE_SYNC", "0").lower() in ("1", "true", "yes")
+        if force_universe or not symbol_ids:
+            try:
+                symbol_ids = sync_tradable_usdtm_perpetual_symbols(
+                    binance_rest=rest,
+                    storage=store,
+                    exchange_id=exchange_id,
+                )
+            except Exception as e:
+                logger.warning("[Universe] REST sync failed (%s) -> keep DB universe", repr(e))
 
-        # --- SymbolFilters collector (REST exchangeInfo) ---
-        if dry_run:
-            logger.warning("DRY_RUN enabled → skip SymbolFilters collector (REST exchangeInfo)")
-        else:
+        # fallback: at least configured symbols
+        if not symbol_ids:
+            symbol_ids = {}
+            for (ex, acc) in binance_keys:
+                ids = ids_by_key[(ex, acc)]
+                for k, v in ids.items():
+                    if not str(k).startswith("_"):
+                        symbol_ids[str(k).upper()] = int(v)
 
-            start_symbol_filters_collector(
-                rest=rest,  # это BinanceFuturesREST из твоего run_instances.py
-                storage=store,  # это PostgreSQL storage (у тебя переменная store)
-                exchange_id=exchange_id,
-                symbol_ids=symbol_ids,  # dict[str, int] symbol->symbol_id
-                interval_sec=3600,
-                do_seed_on_start=True,
+        logger.info("[Universe] symbols in use: %d", len(symbol_ids))
+
+        # symbols from instances (только то, чем реально торгуешь)
+        instance_symbols: list[str] = []
+        for icfg in instances_cfg:
+            for s in (icfg.get("symbols") or []):
+                instance_symbols.append(str(s).upper())
+
+        # --- Candles ACTIVE collector (REST klines for active symbols only) ---
+        md_active_cfg = cfg_root.get("market_data_active", {}) or {}
+        active_intervals = md_active_cfg.get("candle_intervals") or []
+
+        instance_symbols: list[str] = []
+        for icfg in instances_cfg:
+            for s in (icfg.get("symbols") or []):
+                instance_symbols.append(str(s).upper())
+
+        if active_intervals:
+            stop_evt = threading.Event()
+            t = threading.Thread(
+                target=run_candles_active_collector,
+                kwargs=dict(
+                    storage=store,
+                    rest=rest,
+                    exchange_id=exchange_id,
+                    cfg=md_active_cfg,
+                    extra_symbols=instance_symbols,
+                    stop_event=stop_evt,
+                ),
+                daemon=True,
+                name="CandlesActiveCollector",
             )
-            logger.info("SymbolFilters collector started (interval=3600s)")
+            t.start()
+            logger.info("CandlesActive collector started: intervals=%s", ",".join([str(x) for x in active_intervals]))
 
-            # -------------------------------------------------------------------------
+    # -------------------------------------------------------------------------
     # RETENTION
     # -------------------------------------------------------------------------
     retention_cfg = cfg_root.get("retention", {}) or {}
@@ -249,14 +207,12 @@ def main() -> None:
         ex = build_exchange(exchange_name)
         ids = ids_by_key[(exchange_name, account)]
 
-        # bind exchange adapter to storage + symbol ids
         ex.bind(
             storage=store,
             exchange_id=int(ids["_exchange_id"]),
             symbol_ids={k: int(v) for k, v in ids.items() if not str(k).startswith("_")},
         )
 
-        # ---- strategy selection ----
         strat = None
         if icfg.get("strategy") == "one_shot_test" and role == "BASE":
             strat = OneShotTestStrategy(
@@ -275,7 +231,6 @@ def main() -> None:
             )
             continue
 
-        # ---- risk limits ----
         limits = RiskLimits(
             max_open_positions=int(risk_cfg.get("max_open_positions", 10)),
             max_notional_usdt=float(risk_cfg.get("max_notional_usdt", 1e9)),

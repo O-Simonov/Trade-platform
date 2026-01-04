@@ -4,8 +4,10 @@ from __future__ import annotations
 import json
 import time
 import logging
-from datetime import datetime, timezone
-from typing import Any, Iterable, Sequence, Mapping, Any
+from datetime import datetime, timezone, timedelta
+from typing import Any, Iterable, Sequence, Mapping, Any, List, Tuple, Dict
+
+
 from psycopg import sql as _sql
 
 from psycopg_pool import ConnectionPool
@@ -115,6 +117,66 @@ class PostgreSQLStorage:
         ids = {"_exchange_id": exchange_id, "_account_id": account_id}
         ids.update(symbol_ids)
         return ids
+
+    def upsert_symbols(
+            self,
+            *,
+            exchange_id: int,
+            symbols: list[str],
+            deactivate_missing: bool = True,
+    ) -> dict[str, int]:
+        symbols_norm = sorted({str(s).upper().strip() for s in (symbols or []) if str(s).strip()})
+        if not symbols_norm:
+            return {}
+
+        sql_upsert = """
+                     WITH incoming AS (SELECT UNNEST(%(symbols)s::text[]) AS symbol)
+                     INSERT
+                     INTO symbols (exchange_id, symbol, is_active, status, last_seen_at)
+                     SELECT %(exchange_id)s, symbol, TRUE, 'TRADING', NOW()
+                     FROM incoming ON CONFLICT (exchange_id, symbol)
+                     DO \
+                     UPDATE SET
+                         is_active = TRUE, \
+                         status = EXCLUDED.status, \
+                         last_seen_at = EXCLUDED.last_seen_at \
+                         RETURNING symbol, symbol_id;
+                     """
+
+        sql_deactivate_missing = """
+                                 UPDATE symbols
+                                 SET is_active = FALSE
+                                 WHERE exchange_id = %(exchange_id)s
+                                   AND NOT (symbol = ANY (%(symbols)s::text[]));
+                                 """
+
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql_upsert, {"exchange_id": int(exchange_id), "symbols": symbols_norm})
+                rows = cur.fetchall() or []
+
+                if deactivate_missing:
+                    # помечаем отсутствующие как неактивные
+                    cur.execute(sql_deactivate_missing, {"exchange_id": int(exchange_id), "symbols": symbols_norm})
+
+            conn.commit()
+
+        return {str(sym).upper(): int(sid) for (sym, sid) in rows}
+
+    def list_symbols(self, *, exchange_id: int) -> dict[str, int]:
+        """Return {SYMBOL: symbol_id} for all symbols known to DB for the exchange."""
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT symbol, symbol_id
+                    FROM symbols
+                    WHERE exchange_id = %s
+                    """,
+                    (int(exchange_id),),
+                )
+                rows = cur.fetchall() or []
+        return {str(sym).upper(): int(sid) for (sym, sid) in rows}
 
     # ======================================================================
     # POSITIONS
@@ -463,6 +525,7 @@ class PostgreSQLStorage:
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.executemany(sql, prepared)
+            conn.commit()
 
         return len(prepared)
 
@@ -911,6 +974,37 @@ class PostgreSQLStorage:
         return int(n or 0)
 
 
+    def get_candles_watermarks(self, *, exchange_id: int, intervals: List[str]) -> Dict[Tuple[int, str], datetime]:
+        """
+        Возвращает watermarks для candles:
+          (symbol_id, interval) -> MAX(open_time)
+
+        Нужно для collector_candles.py чтобы продолжать догрузку после рестарта.
+        """
+        wm: Dict[Tuple[int, str], datetime] = {}
+        intervals = [str(x).strip() for x in (intervals or []) if str(x).strip()]
+        if not intervals:
+            return wm
+
+        sql = """
+              SELECT symbol_id, MAX(open_time) AS last_open_time
+              FROM candles
+              WHERE exchange_id = %s \
+                AND interval = %s
+              GROUP BY symbol_id \
+              """
+
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                for itv in intervals:
+                    cur.execute(sql, (int(exchange_id), str(itv)))
+                    for sid, last_dt in (cur.fetchall() or []):
+                        if sid is None or last_dt is None:
+                            continue
+                        wm[(int(sid), str(itv))] = last_dt
+
+        return wm
+
     def list_non_terminal_orders(self, *, exchange_id: int, account_id: int, symbol_ids=None) -> list[dict]:
         base = """
                SELECT exchange_id, \
@@ -1217,3 +1311,271 @@ class PostgreSQLStorage:
             with conn.cursor() as cur:
                 cur.execute(_sql.SQL(query))
             conn.commit()
+
+
+    def list_active_symbols(self, *, exchange_id: int, active_ttl_sec: int = 1800) -> List[str]:
+        """
+        Active symbols = symbols with OPEN positions OR NEW orders recently updated.
+        Returns list of SYMBOL strings (e.g. 'LTCUSDT').
+        """
+        exchange_id = int(exchange_id)
+        ttl = int(active_ttl_sec)
+
+        sql = """
+              WITH active_symbol_ids AS (SELECT p.symbol_id \
+                                         FROM positions p \
+                                         WHERE p.exchange_id = %s \
+                                           AND abs(p.qty) > 0 \
+                                           AND p.status = 'OPEN' \
+                                           AND p.closed_at IS NULL \
+
+                                         UNION ALL \
+
+                                         SELECT o.symbol_id \
+                                         FROM orders o \
+                                         WHERE o.exchange_id = %s \
+                                           AND o.status = 'NEW' \
+                                           AND o.updated_at >= (now() - (%s || ' seconds')::interval))
+              SELECT DISTINCT s.symbol
+              FROM symbols s
+                       JOIN active_symbol_ids a ON a.symbol_id = s.symbol_id
+              WHERE s.exchange_id = %s
+              ORDER BY s.symbol; \
+              """
+
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (exchange_id, exchange_id, ttl, exchange_id))
+                return [str(r[0]) for r in (cur.fetchall() or []) if r and r[0]]
+
+    def get_symbol_id(self, *, exchange_id: int, symbol: str) -> int | None:
+        """
+        Resolve symbol_id for (exchange_id, symbol).
+        Returns None if symbol not found.
+        """
+        symbol = str(symbol).upper().strip()
+        if not symbol:
+            return None
+
+        sql = "SELECT symbol_id FROM symbols WHERE exchange_id=%s AND symbol=%s"
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (int(exchange_id), symbol))
+                row = cur.fetchone()
+        return int(row[0]) if row else None
+
+    def fetch_symbols_map(self, *, exchange_id: int, only_active: bool = True) -> dict[str, int]:
+        where = "WHERE exchange_id=%s"
+        params = [int(exchange_id)]
+        if only_active:
+            where += " AND is_active = TRUE"
+
+        sql = f"""
+            SELECT symbol, symbol_id
+            FROM symbols
+            {where}
+            ORDER BY symbol
+        """
+
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                rows = cur.fetchall()
+
+        return {str(sym).upper(): int(sid) for (sym, sid) in rows}
+
+    def deactivate_missing_symbols(self, *, exchange_id: int, active_symbols: Iterable[str]) -> int:
+        """
+        Marks symbols NOT in active_symbols as inactive.
+        Returns number of rows updated.
+        """
+        active = [str(s).upper() for s in (active_symbols or [])]
+        if not active:
+            return 0
+
+        sql = """
+        UPDATE symbols
+        SET is_active = FALSE
+        WHERE exchange_id = %s
+          AND is_active = TRUE
+          AND NOT (symbol = ANY(%s))
+        """
+
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (int(exchange_id), active))
+                n = cur.rowcount
+            conn.commit()
+
+        return int(n or 0)
+
+
+    def upsert_funding(self, rows: list[dict]) -> int:
+        if not rows:
+            return 0
+
+        query = """
+            INSERT INTO funding (
+                exchange_id, symbol_id, funding_time,
+                funding_rate, mark_price, source
+            )
+            VALUES (
+                %(exchange_id)s, %(symbol_id)s, %(funding_time)s,
+                %(funding_rate)s, %(mark_price)s, %(source)s
+            )
+            ON CONFLICT (exchange_id, symbol_id, funding_time)
+            DO UPDATE SET
+                funding_rate = EXCLUDED.funding_rate,
+                mark_price   = EXCLUDED.mark_price,
+                source       = EXCLUDED.source
+        """
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.executemany(query, rows)
+                n = cur.rowcount
+            conn.commit()
+        return int(n or 0)
+
+    def upsert_open_interest(self, rows: list[dict]) -> int:
+        if not rows:
+            return 0
+
+        query = """
+            INSERT INTO open_interest (
+                exchange_id, symbol_id, interval, ts,
+                open_interest, open_interest_value, source
+            )
+            VALUES (
+                %(exchange_id)s, %(symbol_id)s, %(interval)s, %(ts)s,
+                %(open_interest)s, %(open_interest_value)s, %(source)s
+            )
+            ON CONFLICT (exchange_id, symbol_id, interval, ts)
+            DO UPDATE SET
+                open_interest       = EXCLUDED.open_interest,
+                open_interest_value = EXCLUDED.open_interest_value,
+                source              = EXCLUDED.source
+        """
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.executemany(query, rows)
+                n = cur.rowcount
+            conn.commit()
+        return int(n or 0)
+
+    def cleanup_funding(self, *, exchange_id: int, keep_days: int) -> int:
+        keep_days = int(keep_days)
+        if keep_days <= 0:
+            return 0
+
+        query = """
+            DELETE FROM funding
+            WHERE exchange_id = %s
+              AND funding_time < (NOW() - (%s || ' days')::interval)
+        """
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(query, (int(exchange_id), keep_days))
+                n = cur.rowcount
+            conn.commit()
+        return int(n or 0)
+
+    def cleanup_open_interest(self, *, exchange_id: int, interval: str, keep_days: int) -> int:
+        keep_days = int(keep_days)
+        if keep_days <= 0:
+            return 0
+
+        query = """
+            DELETE FROM open_interest
+            WHERE exchange_id = %s
+              AND interval = %s
+              AND ts < (NOW() - (%s || ' days')::interval)
+        """
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(query, (int(exchange_id), str(interval), keep_days))
+                n = cur.rowcount
+            conn.commit()
+        return int(n or 0)
+
+
+    def upsert_ticker_24h(self, rows: Iterable[dict]) -> int:
+        rows = list(rows)
+        if not rows:
+            return 0
+
+        query = """
+                INSERT INTO ticker_24h (exchange_id, symbol_id, \
+                                        open_time, close_time, \
+                                        open_price, high_price, low_price, last_price, \
+                                        volume, quote_volume, \
+                                        price_change, price_change_percent, weighted_avg_price, \
+                                        trades, source)
+                VALUES (%(exchange_id)s, %(symbol_id)s, \
+                        %(open_time)s, %(close_time)s, \
+                        %(open_price)s, %(high_price)s, %(low_price)s, %(last_price)s, \
+                        %(volume)s, %(quote_volume)s, \
+                        %(price_change)s, %(price_change_percent)s, %(weighted_avg_price)s, \
+                        %(trades)s, %(source)s) ON CONFLICT (exchange_id, symbol_id, close_time)
+            DO \
+                UPDATE SET
+                    open_time = EXCLUDED.open_time, \
+                    open_price = EXCLUDED.open_price, \
+                    high_price = EXCLUDED.high_price, \
+                    low_price = EXCLUDED.low_price, \
+                    last_price = EXCLUDED.last_price, \
+                    volume = EXCLUDED.volume, \
+                    quote_volume = EXCLUDED.quote_volume, \
+                    price_change = EXCLUDED.price_change, \
+                    price_change_percent = EXCLUDED.price_change_percent, \
+                    weighted_avg_price = EXCLUDED.weighted_avg_price, \
+                    trades = EXCLUDED.trades, \
+                    source = EXCLUDED.source
+                ; \
+                """
+
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.executemany(query, rows)
+                n = cur.rowcount
+            conn.commit()
+
+        # rowcount у executemany иногда бывает -1 в некоторых драйверах,
+        # но psycopg обычно возвращает число. На всякий:
+        return int(n if n is not None and n >= 0 else len(rows))
+
+    def cleanup_ticker_24h(self, exchange_id: int, keep_days: int) -> int:
+        """
+        Удаляет записи ticker_24h старше keep_days (по close_time).
+        Возвращает количество удалённых строк.
+        """
+        exchange_id = int(exchange_id)
+        keep_days = int(keep_days)
+
+        if keep_days <= 0:
+            return 0
+
+        cutoff = datetime.now(timezone.utc) - timedelta(days=keep_days)
+
+        sql = """
+              DELETE \
+              FROM public.ticker_24h
+              WHERE exchange_id = %s
+                AND close_time < %s \
+              """
+
+        try:
+            with self.pool.connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(sql, (exchange_id, cutoff))
+                    deleted = cur.rowcount or 0
+                conn.commit()
+
+            logger.info(
+                "[Retention] ticker_24h cleaned exchange_id=%s keep_days=%s deleted=%s",
+                exchange_id, keep_days, deleted
+            )
+            return int(deleted)
+
+        except Exception:
+            logger.exception("cleanup_ticker_24h failed exchange_id=%s keep_days=%s", exchange_id, keep_days)
+            return 0

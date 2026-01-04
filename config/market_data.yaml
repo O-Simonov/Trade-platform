@@ -1,0 +1,93 @@
+exchange: binance
+exchange_id: 1
+
+universe:
+  enabled: true
+  refresh_sec: 21600
+  seed_on_start: true
+  min_size: 200
+  max_drop_ratio: 0.30
+
+symbol_filters:
+  enabled: true
+  refresh_sec: 3600
+  seed_on_start: true
+
+market_data:
+  enabled: true
+  candle_intervals: ["1h", "4h", "1d"]
+
+  poll_sec: 120
+  symbols_per_cycle: 1
+  req_sleep_sec: 0.35
+
+  seed_on_start: true
+  # Вариант A: seed_days (рекомендую)
+  seed_days: 180
+  seed_chunk_limit: 1500
+
+  # Вариант B: seed_limit (если коллектор так устроен)
+  # seed_limit: 300
+
+  loop_limit: 3
+
+market_data_active:
+  enabled: false
+  candle_intervals: ["1m", "5m"]
+  poll_sec: 5
+  symbols_per_cycle: 10
+  req_sleep_sec: 0.15
+  seed_on_start: true
+  seed_limit: 300
+  active_ttl_sec: 1800
+  extra_symbols: ["BTCUSDT", "ETHUSDT"]
+
+open_interest:
+  enabled: true
+  periods: ["5m", "15m", "1h"]
+  poll_sec: 120
+  symbols_per_cycle: 10
+  req_sleep_sec: 0.35
+
+  seed_on_start: true
+  seed_days: 30
+  seed_symbols_per_cycle: 3
+  seed_req_sleep_sec: 0.50
+
+  limit: 500
+  overlap_points: 2
+  lookback_hours_if_empty: 48
+
+funding:
+  enabled: true
+  poll_sec: 600
+  symbols_per_cycle: 5
+  req_sleep_sec: 0.35
+  seed_on_start: false
+  seed_days: 365
+  limit: 1000
+
+  # важно: если старый funding-коллектор дергает premiumIndex по каждому символу —
+  # ставь false, иначе ты быстро ловишь 429/418.
+  also_premium_index: true
+
+retention:
+  enabled: true
+  run_sec: 3600
+  candles_days: 180
+  candle_intervals: ["1m", "5m", "1h", "4h", "1d"]
+
+  oi_5m_days: 90
+  oi_15m_days: 180
+  oi_1h_days: 365
+
+  funding_days: 365
+
+# 6.5) 24h ticker snapshot (цены/объёмы/изменение за 24ч)
+ticker_24h:
+  enabled: true
+  poll_sec: 300          # раз в 5 минут (можно 60, но смысла мало)
+  upsert_batch: 1000     # чанки UPSERT в БД
+  backoff_min_sec: 2
+  backoff_max_sec: 60
+  ticker_24h_days: 90

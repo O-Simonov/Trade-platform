@@ -19,6 +19,35 @@ CREATE TABLE IF NOT EXISTS symbols (
   UNIQUE(exchange_id, symbol)
 );
 
+-- Trading filters (from exchangeInfo)
+-- FIX: widen numeric precision to avoid overflow (Binance can return large values)
+CREATE TABLE IF NOT EXISTS symbol_filters (
+  exchange_id SMALLINT NOT NULL REFERENCES exchanges(exchange_id),
+  symbol_id BIGINT NOT NULL REFERENCES symbols(symbol_id),
+
+  price_tick   NUMERIC(38,18),
+  qty_step     NUMERIC(38,18),
+  min_qty      NUMERIC(38,18),
+  max_qty      NUMERIC(38,18),
+  min_notional NUMERIC(38,18),
+
+  max_leverage INT,
+  margin_type TEXT,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY(exchange_id, symbol_id)
+);
+
+-- FIX (safe for existing installs): widen existing columns if table already created
+ALTER TABLE symbol_filters
+  ALTER COLUMN price_tick   TYPE NUMERIC(38,18),
+  ALTER COLUMN qty_step     TYPE NUMERIC(38,18),
+  ALTER COLUMN min_qty      TYPE NUMERIC(38,18),
+  ALTER COLUMN max_qty      TYPE NUMERIC(38,18),
+  ALTER COLUMN min_notional TYPE NUMERIC(38,18);
+
+CREATE INDEX IF NOT EXISTS idx_symbol_filters_updated
+  ON symbol_filters(exchange_id, updated_at DESC);
+
 CREATE TABLE IF NOT EXISTS positions (
   exchange_id SMALLINT NOT NULL,
   account_id SMALLINT NOT NULL,
@@ -69,7 +98,6 @@ CREATE TABLE IF NOT EXISTS orders (
 );
 CREATE INDEX IF NOT EXISTS idx_orders_client_oid ON orders(exchange_id, account_id, client_order_id);
 CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(exchange_id, account_id, status);
-
 
 CREATE TABLE IF NOT EXISTS order_events (
   exchange_id SMALLINT NOT NULL,
@@ -168,7 +196,6 @@ CREATE INDEX IF NOT EXISTS idx_candles_lookup ON candles(exchange_id, symbol_id,
 CREATE INDEX IF NOT EXISTS idx_funding_lookup ON funding(exchange_id, symbol_id, funding_time DESC);
 CREATE INDEX IF NOT EXISTS idx_snapshots_lookup ON price_snapshots(exchange_id, symbol_id, ts DESC);
 
-
 -- ============================
 -- v9 Market State Layer
 -- ============================
@@ -188,7 +215,6 @@ CREATE TABLE IF NOT EXISTS account_balance_snapshots (
   FOREIGN KEY(account_id) REFERENCES accounts(account_id)
 );
 
-
 CREATE INDEX IF NOT EXISTS idx_balance_lookup ON account_balance_snapshots(exchange_id, account_id, ts DESC);
 
 CREATE TABLE IF NOT EXISTS open_interest (
@@ -203,7 +229,6 @@ CREATE TABLE IF NOT EXISTS open_interest (
   FOREIGN KEY(exchange_id) REFERENCES exchanges(exchange_id),
   FOREIGN KEY(symbol_id) REFERENCES symbols(symbol_id)
 );
-
 
 CREATE INDEX IF NOT EXISTS idx_oi_lookup ON open_interest(exchange_id, symbol_id, interval, ts DESC);
 
@@ -230,7 +255,7 @@ CREATE TABLE IF NOT EXISTS account_balance_1h (
   PRIMARY KEY(exchange_id, ts)
 );
 
--- v9.1: Extend positions table with standard trading fields (safe for existing installs)
+-- v9.1: Extend positions table with standard trading fields (safe for existing "installs")
 ALTER TABLE positions ADD COLUMN IF NOT EXISTS avg_price NUMERIC(18,8);
 ALTER TABLE positions ADD COLUMN IF NOT EXISTS exit_price NUMERIC(18,8);
 ALTER TABLE positions ADD COLUMN IF NOT EXISTS position_value_usdt NUMERIC(18,8);
@@ -249,7 +274,6 @@ ALTER TABLE positions ADD COLUMN IF NOT EXISTS take_profit_3 NUMERIC(18,8);
 
 ALTER TABLE positions ADD COLUMN IF NOT EXISTS scale_in_count INTEGER DEFAULT 0;
 ALTER TABLE positions ADD COLUMN IF NOT EXISTS strategy_name TEXT;
-
 
 -- v9.2: Position Ledger (fills-driven)
 CREATE TABLE IF NOT EXISTS position_ledger (
@@ -282,9 +306,9 @@ CREATE INDEX IF NOT EXISTS idx_position_ledger_status ON position_ledger(exchang
 CREATE INDEX IF NOT EXISTS idx_position_ledger_closed_at ON position_ledger(exchange_id, account_id, closed_at);
 
 -- ---------------------------------------------------------------------
--- positions (snapshot) — derived from trade_events
+-- positions_snapshot — derived snapshot (do NOT redefine positions!)
 -- ---------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS positions (
+CREATE TABLE IF NOT EXISTS positions_snapshot (
   exchange_id SMALLINT NOT NULL,
   account_id  SMALLINT NOT NULL,
   symbol_id   BIGINT   NOT NULL,
@@ -301,8 +325,44 @@ CREATE TABLE IF NOT EXISTS positions (
   PRIMARY KEY (exchange_id, account_id, symbol_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_positions_acc
-  ON positions(exchange_id, account_id);
+CREATE INDEX IF NOT EXISTS idx_positions_snapshot_acc
+  ON positions_snapshot(exchange_id, account_id);
 
-CREATE INDEX IF NOT EXISTS idx_positions_sym
-  ON positions(exchange_id, symbol_id);
+CREATE INDEX IF NOT EXISTS idx_positions_snapshot_sym
+  ON positions_snapshot(exchange_id, symbol_id);
+
+
+-- symbols: add active flag for delist protection
+ALTER TABLE symbols ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE symbols ADD COLUMN IF NOT EXISTS status TEXT;
+ALTER TABLE symbols ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ;
+
+CREATE INDEX IF NOT EXISTS idx_symbols_active ON symbols(exchange_id, is_active);
+
+CREATE TABLE IF NOT EXISTS ticker_24h (
+  exchange_id INT NOT NULL,
+  symbol_id   INT NOT NULL,
+
+  open_time   TIMESTAMPTZ NOT NULL,
+  close_time  TIMESTAMPTZ NOT NULL,
+
+  open_price  DOUBLE PRECISION NOT NULL,
+  high_price  DOUBLE PRECISION NOT NULL,
+  low_price   DOUBLE PRECISION NOT NULL,
+  last_price  DOUBLE PRECISION NOT NULL,
+
+  volume      DOUBLE PRECISION NOT NULL,
+  quote_volume DOUBLE PRECISION NOT NULL,
+
+  price_change DOUBLE PRECISION NOT NULL,
+  price_change_percent DOUBLE PRECISION NOT NULL,
+  weighted_avg_price DOUBLE PRECISION NOT NULL,
+
+  trades BIGINT NOT NULL,
+  source TEXT NOT NULL,
+
+  PRIMARY KEY (exchange_id, symbol_id, close_time)
+);
+
+CREATE INDEX IF NOT EXISTS ix_ticker_24h_symbol_time
+  ON ticker_24h (exchange_id, symbol_id, close_time DESC);

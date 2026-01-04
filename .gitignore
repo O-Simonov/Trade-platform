@@ -208,3 +208,7 @@ __marimo__/
 .idea/
 .env
 .env.*
+
+*_marketdata.zip
+*_marketdata/
+

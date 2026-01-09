@@ -7,9 +7,6 @@ from typing import Any
 from datetime import datetime, timezone
 
 
-# ------------------------------------------------------------
-# Order status enum (optional, for future FSM strictness)
-# ------------------------------------------------------------
 class OrderStatus(str, Enum):
     NEW = "NEW"
     PARTIALLY_FILLED = "PARTIALLY_FILLED"
@@ -19,51 +16,37 @@ class OrderStatus(str, Enum):
     REJECTED = "REJECTED"
 
 
-# ------------------------------------------------------------
-# OrderEvent
-# ------------------------------------------------------------
 @dataclass(slots=True)
 class OrderEvent:
-    """
-    Domain order event produced by WS / REST parser.
-
-    Routing fields (exchange/account/symbol) are strings.
-    Numeric ids are injected later by Instance / OMS.
-    """
-
-    # routing (from WS)
     exchange: str
     account: str
     symbol: str
 
-    # numeric ids (optional, injected later)
     exchange_id: int | None = None
     account_id: int | None = None
     symbol_id: int | None = None
 
-    # order identifiers
     order_id: str = ""
     client_order_id: str | None = None
 
-    # order state
     status: str | None = None
-    side: str | None = None          # BUY / SELL
-    type: str | None = None          # MARKET / LIMIT / ...
+    side: str | None = None
+    type: str | None = None
     reduce_only: bool = False
 
-    # quantities / prices
     price: float | None = None
     qty: float | None = None
     filled_qty: float | None = None
 
-    # meta
-    ts_ms: int = 0                   # event timestamp (ms)
-    source: str | None = None        # ws_user / rest / reconcile
+    ts_ms: int = 0
+    source: str | None = None
     raw_json: dict[str, Any] | None = None
 
-    # --------------------------------------------------------
+    # ✅ ДОБАВИТЬ
+    strategy_id: str | None = None
+    pos_uid: str | None = None
+
     def to_row(self) -> dict[str, Any]:
-        """Serialize for orders_events table."""
         return {
             "exchange_id": int(self.exchange_id or 0),
             "account_id": int(self.account_id or 0),
@@ -81,27 +64,22 @@ class OrderEvent:
             "qty": float(self.qty) if self.qty is not None else None,
             "filled_qty": float(self.filled_qty) if self.filled_qty is not None else None,
 
+            # ✅ ДОБАВИТЬ
+            "strategy_id": str(self.strategy_id or "unknown"),
+            "pos_uid": (str(self.pos_uid) if self.pos_uid else None),
+
             "source": str(self.source or "ws_user"),
             "ts_ms": int(self.ts_ms or 0),
             "raw_json": self.raw_json or {},
         }
 
 
-# ------------------------------------------------------------
-# TradeEvent (fills)
-# ------------------------------------------------------------
 @dataclass(slots=True)
 class TradeEvent:
-    """
-    Trade (fill) event.
-    """
-
-    # routing
     exchange: str
     account: str
     symbol: str
 
-    # numeric ids (injected later)
     exchange_id: int | None = None
     account_id: int | None = None
     symbol_id: int | None = None
@@ -120,9 +98,11 @@ class TradeEvent:
     source: str | None = None
     raw_json: dict[str, Any] | None = None
 
-    # --------------------------------------------------------
+    # ✅ ДОБАВИТЬ
+    strategy_id: str | None = None
+    pos_uid: str | None = None
+
     def to_row(self) -> dict[str, Any]:
-        """Serialize for trades table."""
         return {
             "exchange_id": int(self.exchange_id or 0),
             "account_id": int(self.account_id or 0),
@@ -132,13 +112,16 @@ class TradeEvent:
             "order_id": self.order_id,
             "side": self.side,
 
+            # ✅ ДОБАВИТЬ (у вас trades.strategy_id NOT NULL)
+            "strategy_id": str(self.strategy_id or "unknown"),
+            "pos_uid": (str(self.pos_uid) if self.pos_uid else None),
+
             "price": float(self.price),
             "qty": float(self.qty),
             "fee": float(self.fee),
             "fee_asset": self.fee_asset,
             "realized_pnl": float(self.realized_pnl),
 
-            # TIMESTAMPTZ
             "ts": datetime.fromtimestamp(self.ts_ms / 1000, tz=timezone.utc),
 
             "source": self.source or "ws_user",

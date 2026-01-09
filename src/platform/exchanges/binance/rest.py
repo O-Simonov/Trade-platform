@@ -3,19 +3,17 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-import inspect
 import logging
 import os
-import re
+import random
 import threading
 import time
-from typing import Any,Optional
+from typing import Any, Optional, Dict, Tuple
 from urllib.parse import urlencode
 
 import requests
 
 BASE_URL = "https://fapi.binance.com"
-
 log = logging.getLogger("src.platform.exchanges.binance.rest")
 
 
@@ -28,474 +26,540 @@ def _truthy_env(name: str, default: str = "0") -> bool:
     return v in ("1", "true", "yes", "y", "on")
 
 
+def _safe_float_env(name: str, default: float) -> float:
+    v = os.environ.get(name, None)
+    if v is None:
+        return float(default)
+    try:
+        return float(str(v).strip())
+    except Exception:
+        return float(default)
+
+
+def _safe_int_env(name: str, default: int) -> int:
+    v = os.environ.get(name, None)
+    if v is None:
+        return int(default)
+    try:
+        return int(str(v).strip())
+    except Exception:
+        return int(default)
+
+
 def _fmt_params(params: dict[str, Any] | None, max_len: int = 220) -> str:
     if not params:
         return ""
-    keys = ("symbol", "symbols", "interval", "period", "limit", "startTime", "endTime")
+    keys = ("symbol", "symbols", "interval", "period", "limit", "startTime", "endTime", "listenKey")
     out: list[str] = []
     for k in keys:
         if k in params and params[k] is not None:
             out.append(f"{k}={params[k]}")
     s = " ".join(out)
     if len(s) > max_len:
-        s = s[: max_len - 3] + "..."
+        s = s[:max_len] + "…"
     return s
 
 
-def _retry_after_sec(headers: dict[str, Any]) -> float | None:
-    try:
-        ra = headers.get("Retry-After") or headers.get("retry-after")
-        if ra is None:
-            return None
-        v = float(str(ra).strip())
-        if v <= 0:
-            return None
-        return min(v, 60.0)
-    except Exception:
-        return None
+def _is_rate_limited(resp_json: Any, status_code: int) -> bool:
+    if status_code == 429:
+        return True
+    if isinstance(resp_json, dict):
+        try:
+            code = int(resp_json.get("code") or 0)
+        except Exception:
+            code = 0
+        # -1003 Too many requests
+        if code == -1003:
+            return True
+    return False
 
 
-class BinanceNonRetryableError(RuntimeError):
-    """Ошибка, которую не надо ретраить (напр. 451 restricted location)."""
+def _is_retryable_http(status_code: int) -> bool:
+    return status_code in (418, 429) or (500 <= status_code <= 599)
+
+
+class _TokenBucket:
+    """
+    Простой token-bucket с ожиданием.
+    tokens пополняются со скоростью refill_per_sec до capacity.
+    """
+
+    def __init__(self, *, capacity: float, refill_per_sec: float) -> None:
+        self.capacity = float(max(1.0, capacity))
+        self.refill_per_sec = float(max(0.001, refill_per_sec))
+        self.tokens = float(self.capacity)
+        self.last = time.monotonic()
+        self.lock = threading.Lock()
+
+    def _refill(self, now: float) -> None:
+        dt = max(0.0, now - self.last)
+        if dt <= 0:
+            return
+        self.tokens = min(self.capacity, self.tokens + dt * self.refill_per_sec)
+        self.last = now
+
+    def acquire(self, amount: float, *, stop_event: threading.Event | None = None) -> None:
+        amt = float(max(0.0, amount))
+        if amt <= 0:
+            return
+
+        while True:
+            if stop_event is not None and stop_event.is_set():
+                return
+
+            now = time.monotonic()
+            with self.lock:
+                self._refill(now)
+                if self.tokens >= amt:
+                    self.tokens -= amt
+                    return
+
+                missing = amt - self.tokens
+                wait_sec = missing / self.refill_per_sec
+
+            # jitter чтобы много потоков не просыпались одновременно
+            wait_sec = max(0.0, float(wait_sec)) + random.uniform(0.0, 0.05)
+
+            # НЕ делаем долгий sleep одной порцией — чтобы stop_event работал
+            time.sleep(min(wait_sec, 1.0))
+
+
+class _GlobalRateLimiter:
+    """
+    Глобальный (на процесс) ограничитель:
+      - bucket по RPS
+      - bucket по RPM
+    Вес запроса = weight (условный).
+    """
+
+    def __init__(self) -> None:
+        max_rps = _safe_float_env("BINANCE_REST_MAX_RPS", 8.0)
+        max_rpm = _safe_float_env("BINANCE_REST_MAX_RPM", 900.0)
+
+        max_rps = max(1.0, max_rps)
+        max_rpm = max(60.0, max_rpm)
+
+        self.max_rps = float(max_rps)
+        self.max_rpm = float(max_rpm)
+
+        self.bucket_rps = _TokenBucket(capacity=max_rps, refill_per_sec=max_rps)
+        self.bucket_rpm = _TokenBucket(capacity=max_rpm, refill_per_sec=max_rpm / 60.0)
+
+        self.stop_event = threading.Event()
+
+        # INFO может быть выключен — поэтому продублируем WARN один раз позже (см. get_limiter())
+        log.info(
+            "[REST RL] init max_rps=%.2f max_rpm=%.0f (env BINANCE_REST_MAX_RPS/BINANCE_REST_MAX_RPM)",
+            max_rps, max_rpm
+        )
+
+    def acquire(self, weight: float) -> None:
+        w = float(max(1.0, weight))
+        # порядок не принципиален, но обычно RPM важнее (меньше лимит) — берём сначала RPM
+        self.bucket_rpm.acquire(w, stop_event=self.stop_event)
+        self.bucket_rps.acquire(w, stop_event=self.stop_event)
+
+
+# ---------- Global singletons (per process) ----------
+_GLOBAL_LIMITER: Optional[_GlobalRateLimiter] = None
+_LIMITER_LOCK = threading.Lock()
+_LIMITER_LOGGED = False
+
+
+def _get_limiter() -> _GlobalRateLimiter:
+    global _GLOBAL_LIMITER, _LIMITER_LOGGED
+    with _LIMITER_LOCK:
+        if _GLOBAL_LIMITER is None:
+            _GLOBAL_LIMITER = _GlobalRateLimiter()
+        if not _LIMITER_LOGGED:
+            # даже если INFO выключен — покажем один раз WARN-ом реальные лимиты
+            _LIMITER_LOGGED = True
+            log.warning(
+                "[REST RL] effective max_rps=%.2f max_rpm=%.0f (env RPS/RPM, per-process limiter!)",
+                _GLOBAL_LIMITER.max_rps, _GLOBAL_LIMITER.max_rpm
+            )
+        return _GLOBAL_LIMITER
+
+
+class _GlobalCooldown:
+    """
+    Глобальный cooldown на процесс после 429/-1003.
+    Если словили rate-limit — "замораживаем" REST на N секунд,
+    чтобы избежать ретрай-шторма.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._until_mono: float = 0.0
+        self._last_reason: str | None = None
+
+    def until(self) -> float:
+        with self._lock:
+            return float(self._until_mono)
+
+    def arm(self, *, seconds: float, reason: str) -> None:
+        s = float(max(0.0, seconds))
+        if s <= 0:
+            return
+        now = time.monotonic()
+        # jitter, чтобы разные потоки не стартовали одновременно после cooldown
+        s = s + random.uniform(0.0, 0.4)
+        with self._lock:
+            new_until = now + s
+            if new_until > self._until_mono:
+                self._until_mono = new_until
+                self._last_reason = reason
+
+    def wait_if_needed(self) -> None:
+        while True:
+            now = time.monotonic()
+            with self._lock:
+                until = self._until_mono
+                reason = self._last_reason
+            if now >= until:
+                return
+            sleep_s = min(1.0, max(0.05, until - now))
+            log.warning("[REST COOLDOWN] sleep=%.2fs reason=%s", sleep_s, reason)
+            time.sleep(sleep_s)
+
+
+_GLOBAL_COOLDOWN = _GlobalCooldown()
+
+
+def _endpoint_weight(method: str, path: str) -> float:
+    """
+    Грубые веса, чтобы не долбить тяжёлые эндпоинты.
+    Реальные веса Binance могут отличаться, но нам важен safety.
+    """
+    m = (method or "").upper()
+    p = str(path or "")
+
+    if p.startswith("/fapi/v1/listenKey"):
+        return 1.0
+
+    if p.startswith("/fapi/v1/order"):
+        return 1.0
+
+    # signed heavy
+    if p.startswith("/fapi/v2/account"):
+        return 10.0
+
+    if p.startswith("/fapi/v3/positionRisk"):
+        return 10.0
+
+    if m in ("GET", "POST", "PUT", "DELETE"):
+        return 1.0
+    return 1.0
 
 
 class BinanceFuturesREST:
-    """
-    Binance USDⓈ-M Futures REST client.
+    def __init__(self, api_key: str, secret_key: str):
+        self.api_key = api_key
+        self.secret_key = secret_key
+        self.session = requests.Session()
+        self.session.headers.update({"X-MBX-APIKEY": api_key})
 
-    Diagnostics env:
-      BINANCE_REST_CALLSITE=1  -> caller=file:line:function
-      BINANCE_REST_HEADERS=1   -> log used-weight headers
-      BINANCE_REST_COUNTERS=1  -> per-minute counters
-    """
+        # retry настройки
+        self.max_retries = _safe_int_env("BINANCE_REST_RETRY_MAX", 6)
+        self.base_backoff = _safe_float_env("BINANCE_REST_RETRY_BASE_SEC", 0.35)
+        self.max_backoff = _safe_float_env("BINANCE_REST_RETRY_MAX_SEC", 30.0)
 
-    def __init__(
-        self,
-        api_key: str,
-        api_secret: str,
-        *,
-        base_url: str = BASE_URL,
-        timeout: float = 10.0,
-        max_retries: int = 5,
-        backoff_base: float = 1.5,
-        recv_window: int = 6000,
-    ):
-        self.base_url = base_url.rstrip("/")
-        self.api_key = api_key or ""
-        self.api_secret = (api_secret or "").encode("utf-8")
+        # таймауты
+        self.timeout_sec = _safe_float_env("BINANCE_REST_TIMEOUT_SEC", 10.0)
 
-        self.timeout = float(timeout)
-        self.max_retries = int(max_retries)
-        self.backoff_base = float(backoff_base)
-        self.recv_window = int(recv_window)
+        # debug
+        self.debug_headers = _truthy_env("BINANCE_REST_DEBUG_HEADERS", "0")
 
-        self.sess = requests.Session()
-        if self.api_key:
-            self.sess.headers.update({"X-MBX-APIKEY": self.api_key})
+        # TTL cache (чтобы не спамить heavy endpoints из tight-loop)
+        self._cache_lock = threading.Lock()
+        self._cache: Dict[str, Tuple[float, Any]] = {}  # key -> (until_monotonic, value)
 
-        # ban circuit breaker: "banned until <ms>"
-        self._ban_until_ms: int = 0
-        self._ban_owner: str = ""      # <-- КТО поставил бан (thread+caller+params)
-        self._ban_reason: str = ""     # <-- почему (418/429/451 + msg)
+        self.position_risk_ttl_sec = _safe_float_env("BINANCE_REST_POSITION_RISK_TTL_SEC", 2.0)
+        self.account_ttl_sec = _safe_float_env("BINANCE_REST_ACCOUNT_TTL_SEC", 3.0)
 
-        # if 451 happens once -> we stop all further requests fast
-        self._restricted_location: bool = False
-
-        # Diagnostics toggles
-        self._dbg_callsite = _truthy_env("BINANCE_REST_CALLSITE", "0")
-        self._dbg_headers = _truthy_env("BINANCE_REST_HEADERS", "0")
-        self._dbg_counters = _truthy_env("BINANCE_REST_COUNTERS", "0")
-
-        # Counters (per-minute)
-        self._ctr_lock = threading.Lock()
-        self._ctr_win_start = int(time.time())
-        self._ctr_total = 0
-        self._ctr_by_path: dict[str, int] = {}
-
-        self._ctr_warn_total = int(os.environ.get("BINANCE_REST_WARN_TOTAL_PER_MIN", "2000"))
-        self._ctr_warn_path = int(os.environ.get("BINANCE_REST_WARN_PATH_PER_MIN", "800"))
-
-        # cooldown for 451 restricted location (seconds)
-        self._cooldown_451_sec = int(os.environ.get("BINANCE_REST_451_COOLDOWN_SEC", "900"))
-
-    # ---------------------------------------------------------------------
-    # SIGN
-    # ---------------------------------------------------------------------
-
-    def _sign_params(self, params: dict[str, Any]) -> dict[str, Any]:
-        if not self.api_secret:
-            raise RuntimeError("Binance signed request requires api_secret")
-
-        p: dict[str, Any] = dict(params or {})
-        p.setdefault("recvWindow", self.recv_window)
-        p["timestamp"] = _ts_ms()
-
-        qs = urlencode(p, doseq=True)
-        sig = hmac.new(self.api_secret, qs.encode("utf-8"), hashlib.sha256).hexdigest()
-        p["signature"] = sig
-        return p
-
-    # ---------------------------------------------------------------------
-    # BAN / RATE LIMIT HELPERS
-    # ---------------------------------------------------------------------
-
-    @staticmethod
-    def _parse_ban_until_ms(text: str) -> int | None:
-        if not text:
-            return None
-        m = re.search(r"banned until (\d+)", text, re.IGNORECASE)
-        if not m:
-            return None
-        try:
-            return int(m.group(1))
-        except Exception:
+    def _cache_get(self, key: str) -> Any | None:
+        now = time.monotonic()
+        with self._cache_lock:
+            item = self._cache.get(key)
+            if not item:
+                return None
+            until, val = item
+            if now <= float(until):
+                return val
+            # expired
+            self._cache.pop(key, None)
             return None
 
-    def _sleep_if_banned(self, *, meta: str = "") -> None:
-        while True:
-            now = _ts_ms()
-            if now >= self._ban_until_ms:
-                return
-            remain_sec = max(0.0, (self._ban_until_ms - now) / 1000.0) + 1.0
-            chunk = min(60.0, remain_sec)
-            log.warning(
-                "Binance BAN active until_ms=%s -> sleep %.1fs | owner=%s | reason=%s | %s",
-                self._ban_until_ms,
-                chunk,
-                (self._ban_owner or "?")[:260],
-                (self._ban_reason or "?")[:200],
-                meta,
-            )
-            time.sleep(chunk)
-
-    # ---------------------------------------------------------------------
-    # DIAGNOSTICS
-    # ---------------------------------------------------------------------
-
-    @staticmethod
-    def _thread_tag() -> str:
-        try:
-            t = threading.current_thread()
-            return f"thread={t.name}"
-        except Exception:
-            return "thread=?"
-
-    def _callsite_tag(self) -> str:
-        if not self._dbg_callsite:
-            return ""
-        try:
-            this_file = os.path.normcase(__file__)
-            for fr in inspect.stack()[2:12]:
-                fname = os.path.normcase(fr.filename)
-                if fname != this_file:
-                    base = os.path.basename(fr.filename)
-                    return f"caller={base}:{fr.lineno}:{fr.function}"
-        except Exception:
-            return "caller=?"
-        return ""
-
-    def _counter_tick(self, path: str) -> str:
-        if not self._dbg_counters:
-            return ""
-
-        now = int(time.time())
-        with self._ctr_lock:
-            if now - self._ctr_win_start >= 60:
-                self._ctr_win_start = now
-                self._ctr_total = 0
-                self._ctr_by_path = {}
-
-            self._ctr_total += 1
-            self._ctr_by_path[path] = self._ctr_by_path.get(path, 0) + 1
-
-            total = self._ctr_total
-            pctr = self._ctr_by_path[path]
-
-        if total >= self._ctr_warn_total or pctr >= self._ctr_warn_path:
-            log.warning("Binance REST counters high: total_1m=%d path_1m=%d path=%s", total, pctr, path)
-
-        return f"ctr_1m={total} path_1m={pctr}"
-
-    # ---------------------------------------------------------------------
-    # CORE REQUEST
-    # ---------------------------------------------------------------------
+    def _cache_put(self, key: str, ttl_sec: float, value: Any) -> None:
+        ttl = float(max(0.0, ttl_sec))
+        if ttl <= 0:
+            return
+        until = time.monotonic() + ttl
+        with self._cache_lock:
+            self._cache[key] = (until, value)
 
     def _request(
         self,
         method: str,
         path: str,
-        *,
         params: dict[str, Any] | None = None,
         signed: bool = False,
-    ) -> Any:
-        if self._restricted_location:
-            raise BinanceNonRetryableError("Binance restricted location already detected (451); stop requests.")
+    ):
+        method = str(method).upper()
+        url = f"{BASE_URL}{path}"
+        params = params or {}
 
-        url = f"{self.base_url}{path}"
-        req_params = dict(params or {})
+        weight = _endpoint_weight(method, path)
 
-        thr = self._thread_tag()
-        caller = self._callsite_tag()
-        ctr = self._counter_tick(path)
-        ptxt = _fmt_params(req_params)
+        attempt = 0
+        backoff = float(self.base_backoff)
 
-        meta_parts = [thr]
-        if caller:
-            meta_parts.append(caller)
-        if ctr:
-            meta_parts.append(ctr)
-        if ptxt:
-            meta_parts.append(f"params[{ptxt}]")
-        meta = " ".join(meta_parts)
+        while True:
+            attempt += 1
 
-        if signed:
-            req_params = self._sign_params(req_params)
+            # если недавно был 429 — подождём (глобально на процесс)
+            _GLOBAL_COOLDOWN.wait_if_needed()
 
-        last_err: Exception | None = None
-        attempt = 1
+            # глобальный limiter (на процесс)
+            _get_limiter().acquire(weight)
 
-        while attempt <= self.max_retries:
-            self._sleep_if_banned(meta=meta)
+            # prepare params
+            if signed:
+                params_to_send = dict(params)
+                params_to_send.setdefault("recvWindow", 5000)
+                params_to_send["timestamp"] = _ts_ms()
+                params_to_send["signature"] = self._sign(params_to_send)
+                send_params: Any = list(params_to_send.items())
+            else:
+                send_params = params
 
+            # request
             try:
-                r = self.sess.request(
-                    method=method,
-                    url=url,
-                    params=req_params,
-                    timeout=self.timeout,
+                if method == "GET":
+                    response = self.session.get(url, params=send_params, timeout=self.timeout_sec)
+                elif method == "POST":
+                    response = self.session.post(url, params=send_params, timeout=self.timeout_sec)
+                elif method == "PUT":
+                    response = self.session.put(url, params=send_params, timeout=self.timeout_sec)
+                elif method == "DELETE":
+                    response = self.session.delete(url, params=send_params, timeout=self.timeout_sec)
+                else:
+                    raise ValueError(f"Неизвестный метод {method}")
+            except Exception as e:
+                if attempt <= self.max_retries:
+                    sleep_s = min(backoff, self.max_backoff) + random.uniform(0.0, 0.3)
+                    log.warning(
+                        "[REST NET] %s %s retry=%d/%d sleep=%.2fs ctx=%s err=%s",
+                        method, path, attempt, self.max_retries, sleep_s, _fmt_params(params), e
+                    )
+                    time.sleep(sleep_s)
+                    backoff = min(backoff * 2.0, self.max_backoff)
+                    continue
+                raise RuntimeError(f"Binance REST request failed: {method} {path} err={e}") from e
+
+            status = int(response.status_code)
+
+            # parse JSON
+            try:
+                data = response.json()
+            except Exception:
+                txt = (response.text or "").strip()
+                if attempt <= self.max_retries and _is_retryable_http(status):
+                    sleep_s = min(backoff, self.max_backoff) + random.uniform(0.0, 0.3)
+                    log.warning(
+                        "[REST NONJSON] %s %s status=%s retry=%d/%d sleep=%.2fs body=%s",
+                        method, path, status, attempt, self.max_retries, sleep_s,
+                        (txt[:300] + ("…" if len(txt) > 300 else ""))
+                    )
+                    time.sleep(sleep_s)
+                    backoff = min(backoff * 2.0, self.max_backoff)
+                    continue
+                raise RuntimeError(
+                    f"Binance REST non-JSON response: {method} {path} status={status} body={txt[:500]}"
                 )
 
-                if self._dbg_headers:
-                    w1m = r.headers.get("X-MBX-USED-WEIGHT-1M")
-                    oc1m = r.headers.get("X-MBX-ORDER-COUNT-1M")
-                    if w1m or oc1m:
-                        log.info(
-                            "Binance headers (%s %s): USED_WEIGHT_1M=%s ORDER_COUNT_1M=%s %s",
-                            method,
-                            path,
-                            w1m,
-                            oc1m,
-                            meta,
-                        )
+            if self.debug_headers:
+                used = response.headers.get("X-MBX-USED-WEIGHT-1M") or response.headers.get("x-mbx-used-weight-1m")
+                if used:
+                    log.info("[REST HDR] used_weight_1m=%s %s %s", used, method, path)
 
-                # ----------------------------
-                # 451: RESTRICTED LOCATION
-                # ----------------------------
-                if r.status_code == 451:
-                    msg_text = ""
+            # rate-limited
+            if _is_rate_limited(data, status):
+                # ставим глобальный cooldown, чтобы не ретраить штормом
+                retry_after = response.headers.get("Retry-After")
+                if retry_after:
                     try:
-                        payload = r.json()
-                        msg_text = str(payload.get("msg", "") or "")
+                        ra = float(retry_after)
                     except Exception:
-                        msg_text = (r.text or "")[:400]
+                        ra = 0.0
+                else:
+                    ra = 0.0
 
-                    now = _ts_ms()
-                    self._restricted_location = True
-                    self._ban_until_ms = max(self._ban_until_ms, now + self._cooldown_451_sec * 1000)
-                    self._ban_owner = meta
-                    self._ban_reason = f"451 restricted location: {msg_text[:180]}"
+                # Минимальный cooldown для 429: 20–60 сек (важно!)
+                # Берём max(retry_after, backoff, 20)
+                cooldown = max(ra, min(backoff, self.max_backoff), 20.0)
+                cooldown = min(cooldown, 120.0)
 
-                    log.error(
-                        "Binance HTTP 451 (%s %s): restricted location. Cooldown %ss until_ms=%s | %s | %s",
-                        method,
-                        path,
-                        self._cooldown_451_sec,
-                        self._ban_until_ms,
-                        msg_text[:200],
-                        meta,
+                _GLOBAL_COOLDOWN.arm(seconds=cooldown, reason=f"{method} {path} 429/-1003")
+
+                if attempt <= self.max_retries:
+                    sleep_s = max(1.0, cooldown * 0.5) + random.uniform(0.0, 0.5)
+                    log.warning(
+                        "[REST 429] %s %s retry=%d/%d sleep=%.2fs cooldown=%.2fs ctx=%s resp=%r",
+                        method, path, attempt, self.max_retries, sleep_s, cooldown, _fmt_params(params), data
                     )
-                    raise BinanceNonRetryableError(f"Binance restricted location (451): {msg_text[:200]}")
+                    time.sleep(sleep_s)
+                    backoff = min(max(backoff * 2.0, 1.0), self.max_backoff)
+                    continue
 
-                # --- BAN / RATE LIMIT (418/429) ---
-                if r.status_code in (418, 429):
-                    ban_until: int | None = None
-                    msg_text = ""
+                raise RuntimeError(f"Binance REST HTTP {status}: {method} {path} resp={data!r}")
 
-                    try:
-                        payload = r.json()
-                        msg_text = str(payload.get("msg", "") or "")
-                        ban_until = self._parse_ban_until_ms(msg_text)
-                    except Exception:
-                        msg_text = r.text or ""
-                        ban_until = self._parse_ban_until_ms(msg_text)
+            # http errors
+            if status >= 400:
+                if attempt <= self.max_retries and _is_retryable_http(status):
+                    sleep_s = min(backoff, self.max_backoff) + random.uniform(0.0, 0.3)
+                    log.warning(
+                        "[REST HTTP] %s %s status=%s retry=%d/%d sleep=%.2fs ctx=%s resp=%r",
+                        method, path, status, attempt, self.max_retries, sleep_s, _fmt_params(params), data
+                    )
+                    time.sleep(sleep_s)
+                    backoff = min(backoff * 2.0, self.max_backoff)
+                    continue
+                raise RuntimeError(f"Binance REST HTTP {status}: {method} {path} resp={data!r}")
 
-                    if ban_until:
-                        self._ban_until_ms = max(self._ban_until_ms, int(ban_until))
-                        self._ban_owner = meta
-                        self._ban_reason = f"{r.status_code} banned-until: {(msg_text or '')[:180]}"
+            # binance api error in json
+            if isinstance(data, dict) and "code" in data:
+                try:
+                    code = int(data.get("code") or 0)
+                except Exception:
+                    code = 0
+
+                if code < 0:
+                    # -1021 timestamp drift: ретраим, но без спама
+                    if attempt <= self.max_retries and code in (-1021,):
+                        sleep_s = min(backoff, self.max_backoff) + random.uniform(0.0, 0.3)
                         log.warning(
-                            "Binance HTTP %d (%s %s) banned until_ms=%s -> wait | %s | %s",
-                            r.status_code,
-                            method,
-                            path,
-                            self._ban_until_ms,
-                            (msg_text or "")[:200],
-                            meta,
+                            "[REST API] %s %s code=%s retry=%d/%d sleep=%.2fs ctx=%s resp=%r",
+                            method, path, code, attempt, self.max_retries, sleep_s, _fmt_params(params), data
                         )
+                        time.sleep(sleep_s)
+                        backoff = min(backoff * 2.0, self.max_backoff)
                         continue
 
-                    ra = _retry_after_sec(r.headers) or 0.0
-                    sleep = max(ra, self.backoff_base * attempt)
+                    raise RuntimeError(f"Binance REST API error: {method} {path} resp={data!r}")
 
-                    if r.status_code == 429:
-                        self._ban_owner = meta
-                        self._ban_reason = f"429 rate-limit: {(msg_text or '')[:180]}"
+            return data
 
-                    log.warning(
-                        "Binance %d (%s %s), retry %d/%d, sleep %.1fs | %s | %s",
-                        r.status_code,
-                        method,
-                        path,
-                        attempt,
-                        self.max_retries,
-                        sleep,
-                        (msg_text or "")[:200],
-                        meta,
-                    )
-                    time.sleep(sleep)
-                    attempt += 1
-                    continue
+    def _sign(self, params: dict[str, Any]) -> str:
+        # ВАЖНО: без сортировки, чтобы совпало с тем, что реально уходит в запрос
+        query_string = urlencode(params, doseq=True)
+        return hmac.new(self.secret_key.encode(), query_string.encode(), hashlib.sha256).hexdigest()
 
-                # --- TEMP SERVER ERRORS ---
-                if r.status_code >= 500:
-                    sleep = self.backoff_base * attempt
-                    log.warning(
-                        "Binance %d server error (%s %s), retry %d/%d, sleep %.1fs | %s",
-                        r.status_code,
-                        method,
-                        path,
-                        attempt,
-                        self.max_retries,
-                        sleep,
-                        meta,
-                    )
-                    time.sleep(sleep)
-                    attempt += 1
-                    continue
-
-                # --- OTHER 4xx ---
-                if r.status_code >= 400:
-                    try:
-                        payload = r.json()
-                        code = payload.get("code")
-                        msg = payload.get("msg")
-                        raise RuntimeError(
-                            f"Binance HTTP {r.status_code} {method} {path}: code={code} msg={msg} | {meta}"
-                        )
-                    except ValueError:
-                        raise RuntimeError(f"Binance HTTP {r.status_code} {method} {path}: {r.text[:500]} | {meta}")
-
-                # --- OK ---
-                if r.text:
-                    return r.json()
-                return {}
-
-            except BinanceNonRetryableError:
-                raise
-            except Exception as e:
-                last_err = e
-                sleep = self.backoff_base * attempt
-                log.warning(
-                    "Binance request error (%s %s), retry %d/%d, sleep %.1fs | %s | %s",
-                    method,
-                    path,
-                    attempt,
-                    self.max_retries,
-                    sleep,
-                    repr(e),
-                    meta,
-                )
-                time.sleep(sleep)
-                attempt += 1
-
-        raise RuntimeError(
-            f"Binance request failed after {self.max_retries} retries: {method} {path} | last_err={last_err!r}"
-        )
-
-    # ---------------------------------------------------------------------
-    # HTTP WRAPPERS
-    # ---------------------------------------------------------------------
-
-    def _get(self, path: str, *, params: dict[str, Any] | None = None, signed: bool = False):
+    def _get(self, path: str, params: dict[str, Any] | None = None, signed: bool = False):
         return self._request("GET", path, params=params, signed=signed)
 
-    # ---------------------------------------------------------------------
-    # API METHODS
-    # ---------------------------------------------------------------------
+    def _post(self, path: str, params: dict[str, Any] | None = None, signed: bool = False):
+        return self._request("POST", path, params=params, signed=signed)
 
-    def fetch_exchange_info(self) -> dict:
-        return self._get("/fapi/v1/exchangeInfo", signed=False)
+    def _put(self, path: str, params: dict[str, Any] | None = None, signed: bool = False):
+        return self._request("PUT", path, params=params, signed=signed)
 
-    def premium_index(self, symbol: str | None = None):
+    def _delete(self, path: str, params: dict[str, Any] | None = None, signed: bool = False):
+        return self._request("DELETE", path, params=params, signed=signed)
+
+    # ----------------------------
+    # USER DATA STREAM (listenKey)
+    # ----------------------------
+    def create_listen_key(self) -> dict[str, Any]:
+        return dict(self._request("POST", "/fapi/v1/listenKey", params=None, signed=False) or {})
+
+    def keepalive_listen_key(self, listen_key: str) -> dict[str, Any]:
+        if not listen_key:
+            raise ValueError("listen_key не может быть пустым")
+        return dict(self._request("PUT", "/fapi/v1/listenKey", params={"listenKey": str(listen_key)}, signed=False) or {})
+
+    def close_listen_key(self, listen_key: str) -> dict[str, Any]:
+        if not listen_key:
+            raise ValueError("listen_key не может быть пустым")
+        return dict(self._request("DELETE", "/fapi/v1/listenKey", params={"listenKey": str(listen_key)}, signed=False) or {})
+
+    # ----------------------------
+    # ТОРГОВЛЯ
+    # ----------------------------
+    def new_order(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        order_type: str,
+        quantity: float,
+        price: float | None = None,
+        time_in_force: str | None = None,
+        reduce_only: bool | None = None,
+        client_order_id: str | None = None,
+        **extra: Any,
+    ) -> dict[str, Any]:
+        if not symbol:
+            raise ValueError("symbol не может быть пустым")
+        if not side:
+            raise ValueError("side не может быть пустым")
+        if not order_type:
+            raise ValueError("order_type не может быть пустым")
+
+        params: dict[str, Any] = {
+            "symbol": str(symbol).upper(),
+            "side": str(side).upper(),
+            "type": str(order_type).upper(),
+            "quantity": quantity,
+        }
+        if price is not None:
+            params["price"] = price
+        if time_in_force is not None:
+            params["timeInForce"] = str(time_in_force)
+        if reduce_only is not None:
+            params["reduceOnly"] = "true" if bool(reduce_only) else "false"
+        if client_order_id:
+            params["newClientOrderId"] = str(client_order_id)
+
+        params.update({k: v for k, v in (extra or {}).items() if v is not None})
+
+        data = self._post("/fapi/v1/order", params=params, signed=True)
+        return dict(data or {})
+
+    # ----------------------------
+    # АККАУНТ / ПОЗИЦИИ
+    # ----------------------------
+    def position_risk(self, *, symbol: str | None = None) -> Any:
+        """
+        GET /fapi/v3/positionRisk (ПОДПИСАНО)
+        TTL cache по умолчанию 2 секунды (env BINANCE_REST_POSITION_RISK_TTL_SEC)
+        """
+        sym = str(symbol).upper() if symbol else ""
+        cache_key = f"positionRisk:{sym}"
+
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached
+
         params: dict[str, Any] = {}
         if symbol:
-            params["symbol"] = symbol
-        return self._get("/fapi/v1/premiumIndex", params=params, signed=False)
+            params["symbol"] = sym
 
-    def klines(
-        self,
-        *,
-        symbol: str,
-        interval: str,
-        start_time_ms: int | None = None,
-        end_time_ms: int | None = None,
-        limit: int = 1500,
-    ):
-        params: dict[str, Any] = {"symbol": str(symbol).upper(), "interval": str(interval), "limit": int(limit)}
-        if start_time_ms is not None:
-            params["startTime"] = int(start_time_ms)
-        if end_time_ms is not None:
-            params["endTime"] = int(end_time_ms)
-        return self._get("/fapi/v1/klines", params=params, signed=False)
+        data = self._get("/fapi/v3/positionRisk", params=params, signed=True)
+        self._cache_put(cache_key, self.position_risk_ttl_sec, data)
+        return data
 
-    def funding_rate(
-        self,
-        *,
-        symbol: str,
-        start_time_ms: int | None = None,
-        end_time_ms: int | None = None,
-        limit: int = 1000,
-    ):
-        params: dict[str, Any] = {"symbol": str(symbol).upper(), "limit": int(limit)}
-        if start_time_ms is not None:
-            params["startTime"] = int(start_time_ms)
-        if end_time_ms is not None:
-            params["endTime"] = int(end_time_ms)
-        return self._get("/fapi/v1/fundingRate", params=params, signed=False)
-
-    def open_interest_hist(
-        self,
-        *,
-        symbol: str,
-        period: str,
-        limit: int = 30,
-        start_time_ms: int | None = None,
-        end_time_ms: int | None = None,
-    ):
-        params: dict[str, Any] = {"symbol": str(symbol).upper(), "period": str(period), "limit": int(limit)}
-        if start_time_ms is not None:
-            params["startTime"] = int(start_time_ms)
-        if end_time_ms is not None:
-            params["endTime"] = int(end_time_ms)
-        return self._get("/futures/data/openInterestHist", params=params, signed=False)
-
-    def ticker_24h(self, *, symbol: Optional[str] = None) -> Any:
+    def account(self) -> Any:
         """
-        GET /fapi/v1/ticker/24hr
-        - symbol=None -> returns list[dict] for all symbols
-        - symbol='BTCUSDT' -> returns dict for one symbol
+        GET /fapi/v2/account (ПОДПИСАНО)
+        TTL cache по умолчанию 3 секунды (env BINANCE_REST_ACCOUNT_TTL_SEC)
         """
-        params = {}
-        if symbol:
-            params["symbol"] = str(symbol).upper()
+        cache_key = "account"
 
-        return self._request(
-            method="GET",
-            path="/fapi/v1/ticker/24hr",
-            params=params,
-            signed=False,
-        )
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached
 
-    # alias for your collector name
-    def get_24hr_ticker(self, *, symbol: str | None = None) -> Any:
-        return self.ticker_24h(symbol=symbol)
+        data = self._get("/fapi/v2/account", signed=True)
+        self._cache_put(cache_key, self.account_ttl_sec, data)
+        return data

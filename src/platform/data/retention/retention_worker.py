@@ -8,7 +8,6 @@ logger = logging.getLogger("src.platform.data.retention.retention_worker")
 
 DEFAULT_CANDLE_INTERVALS = ("1m", "5m", "1h", "4h", "1d")
 
-
 class RetentionWorker(threading.Thread):
     """
     Periodic DB cleanup (safe):
@@ -16,6 +15,7 @@ class RetentionWorker(threading.Thread):
       - open_interest by oi_*_days
       - funding by funding_days
       - ticker_24h by ticker_24h_days
+      - trades by trade_cleanup_days (new feature)
     """
 
     def __init__(self, *, storage, exchange_id: int, cfg: dict, run_sec: int = 3600):
@@ -44,14 +44,19 @@ class RetentionWorker(threading.Thread):
         # ticker_24h
         self.ticker_24h_days = int(self.cfg.get("ticker_24h_days", 90))
 
-        logger.info(
-            "RetentionWorker started run_sec=%s candles=%s oi=%s funding=%s ticker_24h=%s",
-            self.run_sec,
-            True,
-            True,
-            True,
-            True,
-        )
+        # trade cleanup (new)
+        self.trade_cleanup_days = int(self.cfg.get("trade_cleanup_days", 180))
+
+        # Отключаем логи на старте
+        # logger.info(
+        #     "RetentionWorker started run_sec=%s candles=%s oi=%s funding=%s ticker_24h=%s trades=%s",
+        #     self.run_sec,
+        #     True,
+        #     True,
+        #     True,
+        #     True,
+        #     True,
+        # )
 
     def stop(self) -> None:
         self._stop.set()
@@ -76,7 +81,8 @@ class RetentionWorker(threading.Thread):
             return 0
 
     def _run_once(self) -> None:
-        logger.info("Retention cleanup tick")
+        # Отключаем лог о каждом цикле очистки
+        # logger.info("Retention cleanup tick")
 
         # candles
         for itv in self.candle_intervals:
@@ -86,12 +92,13 @@ class RetentionWorker(threading.Thread):
                 interval=str(itv),
                 keep_days=self.candles_days,
             )
-            logger.info(
-                "[Retention] candles cleaned interval=%s keep_days=%d deleted=%d",
-                itv,
-                self.candles_days,
-                deleted,
-            )
+            # Отключаем лог о каждом удалении
+            # logger.info(
+            #     "[Retention] candles cleaned interval=%s keep_days=%d deleted=%d",
+            #     itv,
+            #     self.candles_days,
+            #     deleted,
+            # )
 
         # open_interest
         for itv, keep_days in self.oi_keep_days.items():
@@ -103,12 +110,13 @@ class RetentionWorker(threading.Thread):
                 interval=str(itv),
                 keep_days=int(keep_days),
             )
-            logger.info(
-                "[Retention] open_interest cleaned interval=%s keep_days=%d deleted=%d",
-                itv,
-                keep_days,
-                deleted,
-            )
+            # Отключаем лог о каждом удалении
+            # logger.info(
+            #     "[Retention] open_interest cleaned interval=%s keep_days=%d deleted=%d",
+            #     itv,
+            #     keep_days,
+            #     deleted,
+            # )
 
         # funding
         if self.funding_days > 0:
@@ -117,7 +125,8 @@ class RetentionWorker(threading.Thread):
                 exchange_id=self.exchange_id,
                 keep_days=self.funding_days,
             )
-            logger.info("[Retention] funding cleaned keep_days=%d deleted=%d", self.funding_days, deleted)
+            # Отключаем лог о каждом удалении
+            # logger.info("[Retention] funding cleaned keep_days=%d deleted=%d", self.funding_days, deleted)
 
         # ticker_24h
         if self.ticker_24h_days > 0:
@@ -126,4 +135,15 @@ class RetentionWorker(threading.Thread):
                 exchange_id=self.exchange_id,
                 keep_days=self.ticker_24h_days,
             )
-            logger.info("[Retention] ticker_24h cleaned keep_days=%d deleted=%d", self.ticker_24h_days, deleted)
+            # Отключаем лог о каждом удалении
+            # logger.info("[Retention] ticker_24h cleaned keep_days=%d deleted=%d", self.ticker_24h_days, deleted)
+
+        # Trades (new feature)
+        if self.trade_cleanup_days > 0:
+            deleted = self._safe_call(
+                "cleanup_trades",
+                exchange_id=self.exchange_id,
+                keep_days=self.trade_cleanup_days,
+            )
+            # Отключаем лог о каждом удалении
+            # logger.info("[Retention] trades cleaned keep_days=%d deleted=%d", self.trade_cleanup_days, deleted)

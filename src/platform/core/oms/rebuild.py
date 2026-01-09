@@ -1,48 +1,61 @@
 # src/platform/core/oms/rebuild.py
+from __future__ import annotations
+
 from src.platform.core.oms.events import OrderEvent
 from src.platform.core.oms.aggregate import OrderAggregate
 
 
-def rebuild_orders(storage, *, exchange_id: int, account_id: int):
+def rebuild_orders(
+    storage,
+    *,
+    exchange_id: int,
+    account_id: int,
+) -> dict[str, OrderAggregate]:
+    """
+    Rebuild OMS OrderAggregates from persisted order_events.
+    """
+
     rows = storage.fetch_order_events(
-        exchange_id=exchange_id,
-        account_id=account_id,
+        exchange_id=int(exchange_id),
+        account_id=int(account_id),
     )
 
     aggs: dict[str, OrderAggregate] = {}
 
-    for r in rows:
+    for row in rows:
+        # --------------------------------------------------
+        # ВАЖНО: OrderEvent требует exchange/account/symbol
+        # --------------------------------------------------
         evt = OrderEvent(
-            # 🔹 ОБЯЗАТЕЛЬНЫЕ строковые поля
-            exchange=r.get("exchange") or "",
-            account=r.get("account") or "",
-            symbol=r.get("symbol") or "",
+            exchange=str(row.get("exchange") or ""),
+            account=str(row.get("account") or ""),
+            symbol=str(row.get("symbol") or ""),
 
-            # 🔹 ID-поля
-            exchange_id=r["exchange_id"],
-            account_id=r["account_id"],
-            symbol_id=r["symbol_id"],
+            exchange_id=row.get("exchange_id"),
+            account_id=row.get("account_id"),
+            symbol_id=row.get("symbol_id"),
 
-            # 🔹 Ордер
-            order_id=r["order_id"],
-            client_order_id=r.get("client_order_id"),
+            order_id=str(row.get("order_id") or ""),
+            client_order_id=row.get("client_order_id"),
 
-            side=r.get("side"),
-            type=r.get("type"),
-            reduce_only=bool(r.get("reduce_only")),
+            status=row.get("status"),
+            side=row.get("side"),
+            type=row.get("type"),
+            reduce_only=bool(row.get("reduce_only") or False),
 
-            price=r.get("price"),
-            qty=r.get("qty"),
-            filled_qty=r.get("filled_qty"),
+            price=row.get("price"),
+            qty=row.get("qty"),
+            filled_qty=row.get("filled_qty"),
 
-            status=r.get("status"),
-            ts_ms=r.get("ts_ms"),
+            ts_ms=int(row.get("ts_ms") or 0),
+            source=row.get("source"),
 
-            source=r.get("source"),
-            raw=r.get("raw_json"),
+            raw_json=row.get("raw_json"),
         )
 
         oid = evt.order_id
+        if not oid:
+            continue
 
         if oid not in aggs:
             aggs[oid] = OrderAggregate.from_event(evt)

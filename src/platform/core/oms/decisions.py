@@ -31,33 +31,35 @@ def _norm_side(v: Any) -> Optional[Side]:
 
 def resolve_order(
     *,
-    pos_side: Any,       # Side | "LONG"/"SHORT"/None
-    pos_qty: float,      # ALWAYS >= 0
-    order_side: Side,    # intent.side (LONG/SHORT)
+    pos_side: Any,
+    pos_qty: float,
+    order_side: Any,
     order_qty: float,
 ) -> OrderDecision:
-    """
-    K6.8 Order ↔ Position FSM (qty>=0 + side).
 
-    IMPORTANT:
-      - This function decides OPEN vs REDUCE based on current position side/qty.
-      - It does NOT know whether the intent is a CLOSE intent. That check is done in OMS
-        (so CLOSE on FLAT does NOT become OPEN by mistake).
-    """
-    order_qty = float(order_qty or 0.0)
-    if order_qty <= 0:
+    try:
+        order_qty = float(order_qty)
+    except Exception:
+        order_qty = 0.0
+
+    if not (order_qty > 0.0):
         return OrderDecision(False, "BLOCKED", False, 0.0, "qty<=0")
 
     pos_qty = float(pos_qty or 0.0)
+
     ps = _norm_side(pos_side)
+    os = _norm_side(order_side)
+
+    if os is None:
+        return OrderDecision(False, "BLOCKED", False, 0.0, "invalid order_side")
 
     # FLAT
     if pos_qty <= 0.0 or ps is None:
         return OrderDecision(True, "OPEN", False, order_qty)
 
-    # LONG position
+    # LONG
     if ps == Side.LONG:
-        if order_side == Side.LONG:
+        if os == Side.LONG:
             return OrderDecision(True, "OPEN", False, order_qty)
 
         reduce_qty = min(order_qty, pos_qty)
@@ -65,9 +67,9 @@ def resolve_order(
             return OrderDecision(False, "BLOCKED", True, 0.0, "nothing to reduce")
         return OrderDecision(True, "REDUCE", True, reduce_qty)
 
-    # SHORT position
+    # SHORT
     if ps == Side.SHORT:
-        if order_side == Side.SHORT:
+        if os == Side.SHORT:
             return OrderDecision(True, "OPEN", False, order_qty)
 
         reduce_qty = min(order_qty, pos_qty)

@@ -91,8 +91,10 @@ CREATE TABLE IF NOT EXISTS orders (
   qty NUMERIC(18,8),
   filled_qty NUMERIC(18,8),
   status TEXT,
-  created_at TIMESTAMPTZ,
-  updated_at TIMESTAMPTZ,
+  ts_ms BIGINT,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  raw_json TEXT,
   source TEXT DEFAULT 'ws_user',
   PRIMARY KEY(exchange_id, account_id, order_id)
 );
@@ -137,10 +139,10 @@ CREATE TABLE IF NOT EXISTS trades (
   fee_asset TEXT,
   realized_pnl NUMERIC(18,8),
   ts TIMESTAMPTZ NOT NULL,
+  raw_json TEXT,
   source TEXT DEFAULT 'ws_user',
   PRIMARY KEY(exchange_id, account_id, trade_id)
 );
-
 CREATE TABLE IF NOT EXISTS order_fills (
   exchange_id SMALLINT NOT NULL,
   account_id SMALLINT NOT NULL,

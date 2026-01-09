@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import os
+import time
+import threading
 import logging
-from typing import List, Optional
+import random
+from typing import List, Optional, Any
 
 from src.platform.exchanges.base.exchange import (
     ExchangeAdapter,
@@ -29,11 +32,19 @@ class BinanceExchange(ExchangeAdapter):
     """
     Binance USDⓈ-M Futures exchange adapter.
     OMS-safe, REST/WS separated.
+
+    Fixes / additions:
+      ✅ listenKey keepalive thread (NO early calls, has 429 backoff)
+      ✅ warmup wait via ws.connected.wait()
+      ✅ create_listen_key() may return dict or str
+      ✅ stop WS best-effort + join() to avoid duplicates
+      ✅ close() best-effort: stop keepalive + stop ws + close listenKey
+      ✅ place_order uses REST.new_order kwargs correctly
     """
 
     name = "binance"
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.logger = logging.getLogger("binance.exchange")
 
         # REST
@@ -44,6 +55,11 @@ class BinanceExchange(ExchangeAdapter):
         self._tick_ws: dict[str, BinanceWS] = {}
         self._kline_ws: dict[str, BinanceWS] = {}
         self._user_ws: dict[str, BinanceWS] = {}
+
+        # user-stream keepalive
+        self._user_keepalive_stop: dict[str, threading.Event] = {}
+        self._user_keepalive_thr: dict[str, threading.Thread] = {}
+        self._user_listen_key: dict[str, str] = {}
 
         # bind context
         self.storage = None
@@ -82,6 +98,146 @@ class BinanceExchange(ExchangeAdapter):
             return base + "/".join(streams)
         return base.rstrip("/") + "/" + "/".join(streams)
 
+    # ---------------- internals ----------------
+
+    def _stop_ws_best_effort(self, ws: object) -> None:
+        """
+        Stop WS and join thread best-effort.
+        Prevents double WS threads => double events/ACK logs.
+        """
+        try:
+            if hasattr(ws, "stop") and callable(getattr(ws, "stop")):
+                ws.stop()
+            elif hasattr(ws, "close") and callable(getattr(ws, "close")):
+                ws.close()
+        except Exception:
+            self.logger.debug("WS stop failed", exc_info=True)
+
+        try:
+            if isinstance(ws, threading.Thread):
+                ws.join(timeout=2.0)
+        except Exception:
+            pass
+
+    def _stop_user_keepalive(self, account: str) -> None:
+        ev = self._user_keepalive_stop.get(account)
+        if ev is not None:
+            try:
+                ev.set()
+            except Exception:
+                pass
+
+        thr = self._user_keepalive_thr.get(account)
+        if thr is not None:
+            try:
+                thr.join(timeout=2.0)
+            except Exception:
+                pass
+
+        self._user_keepalive_stop.pop(account, None)
+        self._user_keepalive_thr.pop(account, None)
+
+    @staticmethod
+    def _is_http_429(exc: BaseException) -> bool:
+        s = str(exc)
+        return ("HTTP 429" in s) or ("Too many requests" in s) or ("-1003" in s)
+
+    def _start_user_keepalive(self, *, account: str, rest: BinanceFuturesREST, listen_key: str) -> None:
+        """
+        Binance Futures: keepalive listenKey.
+        ВАЖНО: НЕ делать keepalive сразу после старта — первый раз через ~25-30 минут.
+        env:
+          BINANCE_LISTENKEY_KEEPALIVE_SEC=1500  (25 мин)  [default]
+        """
+        self._stop_user_keepalive(account)
+
+        stop_ev = threading.Event()
+        self._user_keepalive_stop[account] = stop_ev
+
+        try:
+            interval_sec = int(os.environ.get("BINANCE_LISTENKEY_KEEPALIVE_SEC", "1500"))
+        except Exception:
+            interval_sec = 1500
+
+        interval_sec = max(60, int(interval_sec))
+
+        # small jitter to avoid synchronized bursts if multiple processes
+        def jitter() -> float:
+            return random.uniform(0.0, 5.0)
+
+        def loop() -> None:
+            self.logger.info("[BinanceUser] keepalive thread started: account=%s interval=%ss", account, interval_sec)
+
+            # FIRST keepalive must be delayed (no early PUT spam)
+            if stop_ev.wait(float(interval_sec) + jitter()):
+                self.logger.info("[BinanceUser] keepalive thread stopped: account=%s", account)
+                return
+
+            backoff = 60.0          # start backoff on failure
+            backoff_max = 15 * 60.0 # cap 15 min
+
+            while not stop_ev.is_set():
+                try:
+                    rest.keepalive_listen_key(listen_key)
+                    # success => reset backoff
+                    backoff = 60.0
+                    self.logger.debug("[BinanceUser] keepalive ok: account=%s", account)
+
+                    # next scheduled keepalive
+                    if stop_ev.wait(float(interval_sec) + jitter()):
+                        break
+
+                except Exception as e:
+                    # 429 => do not spam exceptions, do controlled backoff
+                    if self._is_http_429(e):
+                        self.logger.warning(
+                            "[BinanceUser] keepalive rate-limited (429). Backoff %.1fs account=%s",
+                            backoff, account
+                        )
+                    else:
+                        self.logger.exception("[BinanceUser] keepalive failed: account=%s", account)
+
+                    if stop_ev.wait(backoff + jitter()):
+                        break
+
+                    backoff = min(backoff * 2.0, backoff_max)
+
+            self.logger.info("[BinanceUser] keepalive thread stopped: account=%s", account)
+
+        thr = threading.Thread(
+            target=loop,
+            name=f"BinanceUserKeepalive-{account}",
+            daemon=True,
+        )
+        thr.start()
+        self._user_keepalive_thr[account] = thr
+
+    @staticmethod
+    def _ws_warmup_seconds() -> float:
+        """
+        Warmup to reduce chance missing very fast fills after submit.
+        env:
+          BINANCE_USER_WARMUP_SEC=1.5
+          BINANCE_WS_WARMUP_SEC=1.5 (alias)
+        """
+        v = os.environ.get("BINANCE_USER_WARMUP_SEC") or os.environ.get("BINANCE_WS_WARMUP_SEC") or "1.5"
+        v = str(v).strip()
+        try:
+            return max(0.0, float(v))
+        except Exception:
+            return 1.5
+
+    @staticmethod
+    def _extract_listen_key(resp: Any) -> str:
+        """
+        create_listen_key may return dict {"listenKey": "..."} OR str "...".
+        """
+        if isinstance(resp, str):
+            return resp.strip()
+        if isinstance(resp, dict):
+            return str(resp.get("listenKey") or "").strip()
+        return str(getattr(resp, "listenKey", "") or "").strip()
+
     # ---------------- subscriptions ----------------
 
     def subscribe_ticks(self, *, account: str, symbols: list[str], cb: TickCallback) -> None:
@@ -92,33 +248,83 @@ class BinanceExchange(ExchangeAdapter):
         url = self._stream_url(streams)
         self.logger.info("WS TICKS URL = %s", url)
 
-        def on_msg(data: dict):
+        def on_msg(data: dict) -> None:
             res = norm_markprice_tick(data)
             if res:
                 sym, px = res
                 cb(sym, px)
+
+        old = self._tick_ws.get(account)
+        if old is not None:
+            self._stop_ws_best_effort(old)
 
         ws = BinanceWS(url=url, on_message=on_msg, name=f"BinanceTicks-{account}")
         ws.start()
         self._tick_ws[account] = ws
 
     def subscribe_user_stream(self, *, account: str, cb: UserEventCallback) -> None:
-        # NOTE: listenKey is REST and may fail on bans/rate limits.
+        """
+        User Data Stream:
+          1) REST create_listen_key()
+          2) WS connect WS_WS_BASE/<listenKey>
+          3) keepalive ~ every 25-30 minutes (NO early calls, 429 backoff)
+          4) warmup wait (важно для OMS)
+        """
         rest = self._rest(account)
+
         try:
             resp = rest.create_listen_key()
         except Exception as e:
             self.logger.error("[BinanceUser] create_listen_key failed: %s", e)
             raise
 
-        lk = (resp or {}).get("listenKey")
-        if not lk:
-            raise RuntimeError("listenKey error")
+        listen_key = self._extract_listen_key(resp)
+        if not listen_key:
+            raise RuntimeError(f"listenKey error: {resp!r}")
 
-        url = f"{WS_WS_BASE}/{lk}"
-        ws = BinanceWS(url=url, on_message=cb, name=f"BinanceUser-{account}")
+        self._user_listen_key[account] = listen_key
+
+        # stop old user WS
+        old = self._user_ws.get(account)
+        if old is not None:
+            self._stop_ws_best_effort(old)
+
+        # keepalive
+        self._start_user_keepalive(account=account, rest=rest, listen_key=listen_key)
+
+        # start user WS (safe wrapper)
+        url = f"{WS_WS_BASE}/{listen_key}"
+
+        def on_user_payload(payload: dict) -> None:
+            ev = payload.get("e") or payload.get("eventType") or "?"
+            if ev != "?":
+                self.logger.info("[BinanceUser][EVT] account=%s e=%s", account, ev)
+            else:
+                self.logger.debug("[BinanceUser][EVT] account=%s payload=%r", account, payload)
+
+            try:
+                cb(payload)
+            except Exception:
+                s = repr(payload)
+                if len(s) > 1200:
+                    s = s[:1200] + "…"
+                self.logger.exception(
+                    "[BinanceUser] handler failed: account=%s e=%s payload=%s",
+                    account, ev, s
+                )
+
+        ws = BinanceWS(url=url, on_message=on_user_payload, name=f"BinanceUser-{account}")
         ws.start()
         self._user_ws[account] = ws
+
+        # warmup: wait until connected (or timeout)
+        warmup = float(self._ws_warmup_seconds() or 0.0)
+        if warmup > 0:
+            self.logger.info("[BinanceUser] warmup wait: %.2fs (account=%s)", warmup, account)
+            try:
+                ws.connected.wait(timeout=warmup)
+            except Exception:
+                time.sleep(warmup)
 
     def subscribe_candles(
         self,
@@ -135,10 +341,14 @@ class BinanceExchange(ExchangeAdapter):
         url = self._stream_url(streams)
         self.logger.info("WS CANDLES URL = %s", url)
 
-        def on_msg(data: dict):
+        def on_msg(data: dict) -> None:
             row = norm_kline_event(data)
             if row:
                 cb(row)
+
+        old = self._kline_ws.get(account)
+        if old is not None:
+            self._stop_ws_best_effort(old)
 
         ws = BinanceWS(url=url, on_message=on_msg, name=f"BinanceKlines-{account}")
         ws.start()
@@ -147,10 +357,6 @@ class BinanceExchange(ExchangeAdapter):
     # ---------------- trading ----------------
 
     def _resolve_symbol_id_from_intent(self, intent: OrderIntent) -> int:
-        """
-        K6.8: OMS may set intent.symbol_id.
-        If not — take from registry self.symbol_ids.
-        """
         sid = int(getattr(intent, "symbol_id", 0) or 0)
         if sid > 0:
             return sid
@@ -161,21 +367,21 @@ class BinanceExchange(ExchangeAdapter):
 
         raise KeyError(f"symbol_id not found for symbol={intent.symbol}")
 
-    def _map_side(self, intent: OrderIntent) -> str:
-        if intent.side == Side.LONG:
+    @staticmethod
+    def _map_side(self_intent: OrderIntent) -> str:
+        if self_intent.side == Side.LONG:
             return "BUY"
-        if intent.side == Side.SHORT:
+        if self_intent.side == Side.SHORT:
             return "SELL"
-        raise ValueError(f"Unsupported intent.side={intent.side}")
+        raise ValueError(f"Unsupported intent.side={self_intent.side}")
 
     def place_order(self, intent: OrderIntent) -> dict:
         """
         Submit order to Binance Futures (UM).
 
-        K6.8:
-          - supports reduceOnly
-          - keeps client_order_id for idempotency
-          - normalizes qty/price using symbol filters
+        BinanceFuturesREST.new_order expects kwargs:
+          symbol, side, order_type, quantity, price, time_in_force,
+          reduce_only, client_order_id, **extra
         """
         if not self.storage or self.exchange_id is None:
             raise RuntimeError("BinanceExchange not bound")
@@ -189,13 +395,14 @@ class BinanceExchange(ExchangeAdapter):
         symbol_id = self._resolve_symbol_id_from_intent(intent)
         side = self._map_side(intent)
 
-        # filters from DB
         filters = self.storage.get_symbol_filters(
             exchange_id=self.exchange_id,
             symbol_id=symbol_id,
         )
         if not filters:
-            raise RuntimeError(f"symbol_filters not found: exchange_id={self.exchange_id} symbol_id={symbol_id} symbol={symbol}")
+            raise RuntimeError(
+                f"symbol_filters not found: exchange_id={self.exchange_id} symbol_id={symbol_id} symbol={symbol}"
+            )
 
         qty, price = normalize_order(
             qty=float(intent.qty),
@@ -210,39 +417,49 @@ class BinanceExchange(ExchangeAdapter):
         if qty <= 0:
             raise ValueError("Normalized qty <= 0")
 
-        params: dict[str, str] = {
-            "symbol": symbol,
-            "side": side,
-            "type": intent.order_type.value,
-            "quantity": str(qty),
-        }
+        order_type = str(intent.order_type.value).upper()
+        reduce_only = bool(getattr(intent, "reduce_only", False))
+        client_order_id = getattr(intent, "client_order_id", None)
 
-        # reduceOnly
-        if bool(intent.reduce_only):
-            params["reduceOnly"] = "true"
-
-        # idempotency
-        if getattr(intent, "client_order_id", None):
-            params["newClientOrderId"] = str(intent.client_order_id)
-
-        # LIMIT price/TIF
+        time_in_force: str | None = None
         if intent.order_type == OrderType.LIMIT:
             if price is None or price <= 0:
                 raise ValueError("LIMIT order requires price")
-            params["price"] = str(price)
-            params["timeInForce"] = "GTC"
+            time_in_force = "GTC"
 
-        # Optional: positionSide (hedge mode)
+        extra: dict[str, Any] = {}
         pos_side = os.environ.get("BINANCE_POSITION_SIDE", "").strip().upper()
         if pos_side in ("LONG", "SHORT", "BOTH"):
-            params["positionSide"] = pos_side
+            extra["positionSide"] = pos_side
 
         self.logger.info(
-            "[ORDER SUBMIT] %s %s qty=%s price=%s reduce_only=%s cid=%s",
-            symbol, side, qty, price, bool(intent.reduce_only), getattr(intent, "client_order_id", None),
+            "[ORDER SUBMIT] %s %s type=%s qty=%s price=%s reduce_only=%s cid=%s",
+            symbol, side, order_type, qty, price, reduce_only, client_order_id
         )
 
-        return rest.new_order(**params)
+        resp = rest.new_order(
+            symbol=symbol,
+            side=side,
+            order_type=order_type,
+            quantity=float(qty),
+            price=float(price) if price is not None else None,
+            time_in_force=time_in_force,
+            reduce_only=reduce_only if reduce_only else None,
+            client_order_id=str(client_order_id) if client_order_id else None,
+            **extra,
+        )
+
+        if isinstance(resp, dict):
+            self.logger.info(
+                "[ORDER ACK] symbol=%s orderId=%s status=%s cid=%s",
+                symbol, resp.get("orderId"), resp.get("status"), client_order_id
+            )
+            if not resp.get("orderId"):
+                self.logger.error("[ORDER ACK][BAD] resp=%r", resp)
+        else:
+            self.logger.error("[ORDER ACK][BAD] resp=%r", resp)
+
+        return dict(resp or {})
 
     # ---------------- state ----------------
 
@@ -263,9 +480,47 @@ class BinanceExchange(ExchangeAdapter):
         equity = float(raw.get("totalMarginBalance") or (wallet + unreal))
         available = float(raw.get("availableBalance") or 0.0)
 
+        margin_used = raw.get("totalInitialMargin")
+        if margin_used is None:
+            pm = float(raw.get("totalPositionInitialMargin") or 0.0)
+            om = float(raw.get("totalOpenOrderInitialMargin") or 0.0)
+            margin_used = pm + om
+        margin_used = float(margin_used or 0.0)
+
         return {
             "wallet_balance": wallet,
             "equity": equity,
             "available_balance": available,
+            "margin_used": margin_used,
             "unrealized_pnl": unreal,
         }
+
+    # ---------------- lifecycle ----------------
+
+    def close(self) -> None:
+        """
+        Best-effort: stop keepalive + stop ws + close listenKey.
+        """
+        # stop keepalive threads
+        for account in list(self._user_keepalive_stop.keys()):
+            self._stop_user_keepalive(account)
+
+        # best-effort close listenKey
+        for account, lk in list(self._user_listen_key.items()):
+            try:
+                if lk:
+                    rest = self._rest_by_account.get(account)
+                    if rest is not None and hasattr(rest, "close_listen_key"):
+                        rest.close_listen_key(lk)
+            except Exception:
+                self.logger.debug("[BinanceUser] close_listen_key failed: account=%s", account, exc_info=True)
+
+        self._user_listen_key.clear()
+
+        # stop WS
+        for ws in list(self._tick_ws.values()) + list(self._kline_ws.values()) + list(self._user_ws.values()):
+            self._stop_ws_best_effort(ws)
+
+        self._tick_ws.clear()
+        self._kline_ws.clear()
+        self._user_ws.clear()

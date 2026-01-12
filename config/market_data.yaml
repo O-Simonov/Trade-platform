@@ -1,93 +1,164 @@
+# config/market_data.yaml
 exchange: binance
 exchange_id: 1
 
+# ------------------------------------------------------------
+# Глобальные лимиты REST для BinanceFuturesREST
+# ВАЖНО:
+# - лимитер внутри BinanceFuturesREST "на процесс", но общий IP-лимит Binance — на IP.
+# - если параллельно запущены другие процессы/боты на том же IP — 429 возможны даже при "скромных" настройках.
+# ------------------------------------------------------------
+rest_limits:
+  max_rps: 0.8     # было 1.2; делаем консервативнее
+  max_rpm: 300     # было 500; делаем консервативнее
+  force: false
+
+# ------------------------------------------------------------
+# Небольшие паузы между запуском потоков (против burst по REST)
+# ------------------------------------------------------------
+startup_stagger:
+  after_universe: 0.5
+  after_symbol_filters: 0.8
+  after_candles: 1.0
+  after_candles_active: 1.0
+  after_open_interest: 1.0
+  after_funding: 0.8
+  after_ticker_24h: 0.8
+
+# ============================================================
+# 1) Universe (список доступных символов)
+# ============================================================
 universe:
   enabled: true
-  refresh_sec: 21600
-  seed_on_start: true
-  min_size: 200
-  max_drop_ratio: 0.30
+  seed_on_start: false
 
+# ============================================================
+# 2) Symbol filters (tick size, step size, min notional и т.д.)
+# ============================================================
 symbol_filters:
   enabled: true
-  refresh_sec: 3600
+  refresh_sec: 7200        # 2 часа
   seed_on_start: true
 
+# ============================================================
+# 3) Candles (основные таймфреймы)
+# ============================================================
 market_data:
   enabled: true
   candle_intervals: ["1h", "4h", "1d"]
 
-  poll_sec: 120
-  symbols_per_cycle: 1
-  req_sleep_sec: 0.35
+  # Консервативные значения
+  poll_sec: 300
+  symbols_per_cycle: 2
+  req_sleep_sec: 1.10      # было 0.90; немного увеличили
 
-  seed_on_start: true
-  # Вариант A: seed_days (рекомендую)
-  seed_days: 180
+  # Seed обычно выключен, если уже есть watermarks
+  seed_on_start: false
+  seed_days: 0
   seed_chunk_limit: 1500
+  seed_limit: 0
 
-  # Вариант B: seed_limit (если коллектор так устроен)
-  # seed_limit: 300
+  # “Хвост” свечей в near-realtime режиме
+  loop_limit: 5
 
-  loop_limit: 3
+  # Эти ключи будут использованы, если твой start_candles_collector их реально принимает
+  overlap_points: 1
+  lookback_days_if_empty: 2
 
+# ============================================================
+# 3.1) CandlesActive (быстрые 1m)
+# ВАЖНО: новый коллектор работает round-robin:
+# - на каждый poll берёт только symbols_per_cycle символов
+# - список активных обновляет раз в active_refresh_sec
+# ============================================================
 market_data_active:
-  enabled: false
-  candle_intervals: ["1m", "5m"]
-  poll_sec: 5
-  symbols_per_cycle: 10
-  req_sleep_sec: 0.15
-  seed_on_start: true
-  seed_limit: 300
-  active_ttl_sec: 1800
+  enabled: true
+  candle_intervals: ["1m"]
+
+  poll_sec: 60
+  symbols_per_cycle: 2
+  req_sleep_sec: 1.2
+
+  active_ttl_sec: 600
+  active_refresh_sec: 120   # ✅ важно для нового collector_candles_active.py
+  loop_limit: 2
+  max_active_symbols: 10
+
+  seed_on_start: false
+  seed_limit: 120
+
   extra_symbols: ["BTCUSDT", "ETHUSDT"]
 
+# ============================================================
+# 4) Open Interest
+# ============================================================
 open_interest:
   enabled: true
-  periods: ["5m", "15m", "1h"]
-  poll_sec: 120
-  symbols_per_cycle: 10
-  req_sleep_sec: 0.35
+  periods: ["1h"]
 
-  seed_on_start: true
-  seed_days: 30
-  seed_symbols_per_cycle: 3
-  seed_req_sleep_sec: 0.50
+  poll_sec: 300
+  symbols_per_cycle: 2
+  req_sleep_sec: 1.0
 
-  limit: 500
+  # Seed выключен
+  seed_on_start: false
+  seed_days: 0
+
+  # Если когда-нибудь включишь seed:
+  seed_symbols_per_cycle: 1
+  seed_req_sleep_sec: 1.2
+  seed_page_sleep_sec: 1.0
+  seed_page_backoff_sec: 2.0
+
+  limit: 200
   overlap_points: 2
-  lookback_hours_if_empty: 48
+  lookback_hours_if_empty: 24
 
+  # Локальный лимитер внутри OI-коллектора (доп. защита)
+  max_rps: 0.8
+  max_rpm: 250
+
+  # Работает только если текущая версия OI-коллектора это поддерживает
+  skip_if_fresh: true
+  fresh_ratio: 0.7
+
+# ============================================================
+# 5) Funding
+# ============================================================
 funding:
   enabled: true
-  poll_sec: 600
-  symbols_per_cycle: 5
-  req_sleep_sec: 0.35
+
+  poll_sec: 1800
+  symbols_per_cycle: 2
+  req_sleep_sec: 1.0
+
   seed_on_start: false
   seed_days: 365
   limit: 1000
 
-  # важно: если старый funding-коллектор дергает premiumIndex по каждому символу —
-  # ставь false, иначе ты быстро ловишь 429/418.
   also_premium_index: true
+  premium_poll_sec: 1800
+  lookback_hours_if_empty: 72
 
+# ============================================================
+# 6) Ticker 24h
+# ============================================================
+ticker_24h:
+  enabled: true
+  poll_sec: 600
+  source: rest_24h
+
+# ============================================================
+# 7) Retention (очистка старых данных)
+# ============================================================
 retention:
   enabled: true
   run_sec: 3600
-  candles_days: 180
-  candle_intervals: ["1m", "5m", "1h", "4h", "1d"]
 
-  oi_5m_days: 90
-  oi_15m_days: 180
+  candles_days: 180
+  candle_intervals: ["1h", "4h", "1d"]
+
   oi_1h_days: 365
 
   funding_days: 365
-
-# 6.5) 24h ticker snapshot (цены/объёмы/изменение за 24ч)
-ticker_24h:
-  enabled: true
-  poll_sec: 300          # раз в 5 минут (можно 60, но смысла мало)
-  upsert_batch: 1000     # чанки UPSERT в БД
-  backoff_min_sec: 2
-  backoff_max_sec: 60
   ticker_24h_days: 90

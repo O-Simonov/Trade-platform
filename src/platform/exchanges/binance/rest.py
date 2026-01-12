@@ -47,6 +47,9 @@ def _safe_int_env(name: str, default: int) -> int:
 
 
 def _fmt_params(params: dict[str, Any] | None, max_len: int = 220) -> str:
+    """
+    Красиво и коротко выводим "важные" параметры в лог, чтобы не печатать всё подряд.
+    """
     if not params:
         return ""
     keys = ("symbol", "symbols", "interval", "period", "limit", "startTime", "endTime", "listenKey")
@@ -61,6 +64,11 @@ def _fmt_params(params: dict[str, Any] | None, max_len: int = 220) -> str:
 
 
 def _is_rate_limited(resp_json: Any, status_code: int) -> bool:
+    """
+    Считаем, что нас отрейтили, если:
+      - status_code == 429
+      - или Binance вернул code=-1003 в JSON
+    """
     if status_code == 429:
         return True
     if isinstance(resp_json, dict):
@@ -68,13 +76,16 @@ def _is_rate_limited(resp_json: Any, status_code: int) -> bool:
             code = int(resp_json.get("code") or 0)
         except Exception:
             code = 0
-        # -1003 Too many requests
         if code == -1003:
             return True
     return False
 
 
 def _is_retryable_http(status_code: int) -> bool:
+    """
+    Какие статусы имеет смысл ретраить.
+    418/429 — лимиты/бан, 5xx — временная проблема.
+    """
     return status_code in (418, 429) or (500 <= status_code <= 599)
 
 
@@ -82,10 +93,14 @@ class _TokenBucket:
     """
     Простой token-bucket с ожиданием.
     tokens пополняются со скоростью refill_per_sec до capacity.
+
+    ВАЖНОЕ ИЗМЕНЕНИЕ:
+    - раньше capacity принудительно >= 1.0 => при маленьких лимитах был "бурст"
+    - теперь capacity допускает значения < 1.0, чтобы реально ограничивать скорость
     """
 
     def __init__(self, *, capacity: float, refill_per_sec: float) -> None:
-        self.capacity = float(max(1.0, capacity))
+        self.capacity = float(max(0.05, capacity))
         self.refill_per_sec = float(max(0.001, refill_per_sec))
         self.tokens = float(self.capacity)
         self.last = time.monotonic()
@@ -117,10 +132,10 @@ class _TokenBucket:
                 missing = amt - self.tokens
                 wait_sec = missing / self.refill_per_sec
 
-            # jitter чтобы много потоков не просыпались одновременно
+            # небольшая случайность, чтобы потоки не просыпались синхронно
             wait_sec = max(0.0, float(wait_sec)) + random.uniform(0.0, 0.05)
 
-            # НЕ делаем долгий sleep одной порцией — чтобы stop_event работал
+            # НЕ делаем длинный sleep одной порцией — чтобы stop_event мог остановить ожидание
             time.sleep(min(wait_sec, 1.0))
 
 
@@ -129,25 +144,27 @@ class _GlobalRateLimiter:
     Глобальный (на процесс) ограничитель:
       - bucket по RPS
       - bucket по RPM
+
     Вес запроса = weight (условный).
     """
 
     def __init__(self) -> None:
+        # ✅ теперь можно ставить меньше 1.0
         max_rps = _safe_float_env("BINANCE_REST_MAX_RPS", 8.0)
         max_rpm = _safe_float_env("BINANCE_REST_MAX_RPM", 900.0)
 
-        max_rps = max(1.0, max_rps)
-        max_rpm = max(60.0, max_rpm)
+        max_rps = max(0.05, float(max_rps))
+        max_rpm = max(10.0, float(max_rpm))
 
         self.max_rps = float(max_rps)
         self.max_rpm = float(max_rpm)
 
+        # capacity = max_* чтобы не было бурста выше лимита
         self.bucket_rps = _TokenBucket(capacity=max_rps, refill_per_sec=max_rps)
         self.bucket_rpm = _TokenBucket(capacity=max_rpm, refill_per_sec=max_rpm / 60.0)
 
         self.stop_event = threading.Event()
 
-        # INFO может быть выключен — поэтому продублируем WARN один раз позже (см. get_limiter())
         log.info(
             "[REST RL] init max_rps=%.2f max_rpm=%.0f (env BINANCE_REST_MAX_RPS/BINANCE_REST_MAX_RPM)",
             max_rps, max_rpm
@@ -155,12 +172,12 @@ class _GlobalRateLimiter:
 
     def acquire(self, weight: float) -> None:
         w = float(max(1.0, weight))
-        # порядок не принципиален, но обычно RPM важнее (меньше лимит) — берём сначала RPM
+        # Обычно RPM "важнее", поэтому сначала RPM, потом RPS
         self.bucket_rpm.acquire(w, stop_event=self.stop_event)
         self.bucket_rps.acquire(w, stop_event=self.stop_event)
 
 
-# ---------- Global singletons (per process) ----------
+# ---------- Глобальные singleton'ы (на процесс) ----------
 _GLOBAL_LIMITER: Optional[_GlobalRateLimiter] = None
 _LIMITER_LOCK = threading.Lock()
 _LIMITER_LOGGED = False
@@ -172,8 +189,8 @@ def _get_limiter() -> _GlobalRateLimiter:
         if _GLOBAL_LIMITER is None:
             _GLOBAL_LIMITER = _GlobalRateLimiter()
         if not _LIMITER_LOGGED:
-            # даже если INFO выключен — покажем один раз WARN-ом реальные лимиты
             _LIMITER_LOGGED = True
+            # даже если INFO выключен — покажем один раз WARN-ом реальные лимиты
             log.warning(
                 "[REST RL] effective max_rps=%.2f max_rpm=%.0f (env RPS/RPM, per-process limiter!)",
                 _GLOBAL_LIMITER.max_rps, _GLOBAL_LIMITER.max_rpm
@@ -193,16 +210,12 @@ class _GlobalCooldown:
         self._until_mono: float = 0.0
         self._last_reason: str | None = None
 
-    def until(self) -> float:
-        with self._lock:
-            return float(self._until_mono)
-
     def arm(self, *, seconds: float, reason: str) -> None:
         s = float(max(0.0, seconds))
         if s <= 0:
             return
         now = time.monotonic()
-        # jitter, чтобы разные потоки не стартовали одновременно после cooldown
+        # jitter, чтобы потоки не стартовали одновременно после cooldown
         s = s + random.uniform(0.0, 0.4)
         with self._lock:
             new_until = now + s
@@ -228,24 +241,37 @@ _GLOBAL_COOLDOWN = _GlobalCooldown()
 
 def _endpoint_weight(method: str, path: str) -> float:
     """
-    Грубые веса, чтобы не долбить тяжёлые эндпоинты.
-    Реальные веса Binance могут отличаться, но нам важен safety.
+    Грубые веса, чтобы "тяжёлые" эндпоинты съедали больше лимита
+    и не забивали всё остальное.
+
+    В реальности Binance weights могут отличаться, но нам нужен safety.
     """
     m = (method or "").upper()
     p = str(path or "")
 
+    # listenKey — лёгкий
     if p.startswith("/fapi/v1/listenKey"):
         return 1.0
 
+    # ордера — лёгкие/средние (оставим 1)
     if p.startswith("/fapi/v1/order"):
         return 1.0
 
-    # signed heavy
+    # подписанные "тяжёлые"
     if p.startswith("/fapi/v2/account"):
         return 10.0
-
     if p.startswith("/fapi/v3/positionRisk"):
         return 10.0
+
+    # market data
+    if p.startswith("/fapi/v1/klines"):
+        return 2.0  # ✅ важное: klines считаем тяжелее
+    if p.startswith("/fapi/v1/exchangeInfo"):
+        return 2.0
+    if p.startswith("/futures/data/openInterestHist"):
+        return 2.0
+    if p.startswith("/fapi/v1/premiumIndex"):
+        return 2.0
 
     if m in ("GET", "POST", "PUT", "DELETE"):
         return 1.0
@@ -270,7 +296,7 @@ class BinanceFuturesREST:
         # debug
         self.debug_headers = _truthy_env("BINANCE_REST_DEBUG_HEADERS", "0")
 
-        # TTL cache (чтобы не спамить heavy endpoints из tight-loop)
+        # TTL cache (чтобы не спамить тяжелые endpoints из tight-loop)
         self._cache_lock = threading.Lock()
         self._cache: Dict[str, Tuple[float, Any]] = {}  # key -> (until_monotonic, value)
 
@@ -286,7 +312,6 @@ class BinanceFuturesREST:
             until, val = item
             if now <= float(until):
                 return val
-            # expired
             self._cache.pop(key, None)
             return None
 
@@ -317,13 +342,13 @@ class BinanceFuturesREST:
         while True:
             attempt += 1
 
-            # если недавно был 429 — подождём (глобально на процесс)
+            # если недавно был 429 — ждём (глобально на процесс)
             _GLOBAL_COOLDOWN.wait_if_needed()
 
             # глобальный limiter (на процесс)
             _get_limiter().acquire(weight)
 
-            # prepare params
+            # параметры запроса
             if signed:
                 params_to_send = dict(params)
                 params_to_send.setdefault("recvWindow", 5000)
@@ -333,7 +358,7 @@ class BinanceFuturesREST:
             else:
                 send_params = params
 
-            # request
+            # запрос
             try:
                 if method == "GET":
                     response = self.session.get(url, params=send_params, timeout=self.timeout_sec)
@@ -378,6 +403,7 @@ class BinanceFuturesREST:
                     f"Binance REST non-JSON response: {method} {path} status={status} body={txt[:500]}"
                 )
 
+            # (опционально) показываем used weight
             if self.debug_headers:
                 used = response.headers.get("X-MBX-USED-WEIGHT-1M") or response.headers.get("x-mbx-used-weight-1m")
                 if used:
@@ -385,7 +411,6 @@ class BinanceFuturesREST:
 
             # rate-limited
             if _is_rate_limited(data, status):
-                # ставим глобальный cooldown, чтобы не ретраить штормом
                 retry_after = response.headers.get("Retry-After")
                 if retry_after:
                     try:
@@ -395,8 +420,7 @@ class BinanceFuturesREST:
                 else:
                     ra = 0.0
 
-                # Минимальный cooldown для 429: 20–60 сек (важно!)
-                # Берём max(retry_after, backoff, 20)
+                # Минимальный cooldown для 429: 20–60 сек
                 cooldown = max(ra, min(backoff, self.max_backoff), 20.0)
                 cooldown = min(cooldown, 120.0)
 
@@ -435,7 +459,7 @@ class BinanceFuturesREST:
                     code = 0
 
                 if code < 0:
-                    # -1021 timestamp drift: ретраим, но без спама
+                    # -1021 timestamp drift: ретраим аккуратно
                     if attempt <= self.max_retries and code in (-1021,):
                         sleep_s = min(backoff, self.max_backoff) + random.uniform(0.0, 0.3)
                         log.warning(
@@ -531,7 +555,7 @@ class BinanceFuturesREST:
     # ----------------------------
     def position_risk(self, *, symbol: str | None = None) -> Any:
         """
-        GET /fapi/v3/positionRisk (ПОДПИСАНО)
+        GET /fapi/v3/positionRisk (подписано)
         TTL cache по умолчанию 2 секунды (env BINANCE_REST_POSITION_RISK_TTL_SEC)
         """
         sym = str(symbol).upper() if symbol else ""
@@ -551,7 +575,7 @@ class BinanceFuturesREST:
 
     def account(self) -> Any:
         """
-        GET /fapi/v2/account (ПОДПИСАНО)
+        GET /fapi/v2/account (подписано)
         TTL cache по умолчанию 3 секунды (env BINANCE_REST_ACCOUNT_TTL_SEC)
         """
         cache_key = "account"
@@ -563,3 +587,123 @@ class BinanceFuturesREST:
         data = self._get("/fapi/v2/account", signed=True)
         self._cache_put(cache_key, self.account_ttl_sec, data)
         return data
+
+    # ----------------------------
+    # PUBLIC MARKET DATA (collectors)
+    # ----------------------------
+
+    def fetch_exchange_info(self, *, cache_ttl_sec: float = 300.0, force: bool = False) -> dict[str, Any]:
+        """
+        GET /fapi/v1/exchangeInfo
+        Используется Universe + SymbolFilters.
+        """
+        key = "exchange_info"
+        if not force:
+            cached = self._cache_get(key)
+            if cached is not None:
+                try:
+                    return dict(cached)
+                except Exception:
+                    pass
+
+        data = self._get("/fapi/v1/exchangeInfo", params=None, signed=False) or {}
+        try:
+            self._cache_put(key, float(cache_ttl_sec), data)
+        except Exception:
+            pass
+        return dict(data) if isinstance(data, dict) else {}
+
+    def klines(
+        self,
+        *,
+        symbol: str,
+        interval: str,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
+        limit: int = 500,
+    ) -> Any:
+        """
+        GET /fapi/v1/klines
+        Используется Candles collector.
+        """
+        params: dict[str, Any] = {
+            "symbol": str(symbol).upper(),
+            "interval": str(interval),
+            "limit": int(limit),
+        }
+        if start_time_ms is not None:
+            params["startTime"] = int(start_time_ms)
+        if end_time_ms is not None:
+            params["endTime"] = int(end_time_ms)
+
+        return self._get("/fapi/v1/klines", params=params, signed=False)
+
+    def open_interest_hist(
+        self,
+        *,
+        symbol: str,
+        period: str,
+        limit: int = 500,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
+    ) -> Any:
+        """
+        GET /futures/data/openInterestHist
+        Используется OpenInterest collector.
+        """
+        params: dict[str, Any] = {
+            "symbol": str(symbol).upper(),
+            "period": str(period),
+            "limit": int(limit),
+        }
+        if start_time_ms is not None:
+            params["startTime"] = int(start_time_ms)
+        if end_time_ms is not None:
+            params["endTime"] = int(end_time_ms)
+
+        return self._get("/futures/data/openInterestHist", params=params, signed=False)
+
+    def funding_rate(
+        self,
+        *,
+        symbol: str,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
+        limit: int = 1000,
+    ) -> Any:
+        """
+        GET /fapi/v1/fundingRate
+        Используется Funding collector (history).
+        """
+        params: dict[str, Any] = {
+            "symbol": str(symbol).upper(),
+            "limit": int(limit),
+        }
+        if start_time_ms is not None:
+            params["startTime"] = int(start_time_ms)
+        if end_time_ms is not None:
+            params["endTime"] = int(end_time_ms)
+
+        return self._get("/fapi/v1/fundingRate", params=params, signed=False)
+
+    def premium_index(self, *, symbol: str | None = None) -> Any:
+        """
+        GET /fapi/v1/premiumIndex
+        Если symbol=None — Binance вернёт список по всем символам (для USDⓈ-M).
+        Используется Funding collector (premium snapshot).
+        """
+        params: dict[str, Any] = {}
+        if symbol:
+            params["symbol"] = str(symbol).upper()
+        return self._get("/fapi/v1/premiumIndex", params=params or None, signed=False)
+
+    def ticker_24h(self, *, symbol: str | None = None) -> Any:
+        """
+        GET /fapi/v1/ticker/24hr
+        Если symbol=None — вернёт массив по всем.
+        Используется Ticker24h collector.
+        """
+        params: dict[str, Any] = {}
+        if symbol:
+            params["symbol"] = str(symbol).upper()
+        return self._get("/fapi/v1/ticker/24hr", params=params or None, signed=False)

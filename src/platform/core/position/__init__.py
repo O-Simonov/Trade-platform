@@ -2,4 +2,5 @@
 from .position_state import PositionState
 from .aggregator import PositionAggregator
 
-__all__ = ["PositionState", "PositionAggregator"]
+
+__all__ = ["PositionState", "PositionAggregator",]

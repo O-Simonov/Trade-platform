@@ -1,16 +1,3 @@
-retention:
-  candles_days: 180
-  snapshots_days: 14
-  balance_days: 30
-  oi_5m_days: 90
-  oi_15m_days: 180
-  oi_1h_days: 365
-  funding_days: 365
-  orders_days: 365
-  trades_days: 365
-  fills_days: 365
-  balance_5m_days: 180
-  balance_1h_days: 1825
 instances:
 - exchange: binance
   account: base_main
@@ -20,12 +7,13 @@ instances:
   - LTCUSDT
   candle_intervals:
   - 1m
-  - 5m
   funding_poll_sec: 120
+  # how often write account_balance_snapshots (history). If omitted, uses funding_poll_sec.
+  balance_snapshot_sec: 120
   oms_reconcile_sec: 60
   oms_pending_timeout_sec: 20
   params:
-    qty: 0.4
+    qty: 0.3
     hold_sec: 5
   risk:
     max_open_positions: 2
@@ -35,30 +23,30 @@ instances:
     max_drawdown_pct: 0.15
     min_available_margin_pct: 0.2
     max_margin_used_pct: 0.8
-- exchange: binance
-  account: hedge_main
-  role: HEDGE
-  base_ref:
-    exchange: binance
-    account: base_main
-  hedge_ratio: 1.0
-  strategy: one_shot_test
-  symbols:
-  - LTCUSDT
-  candle_intervals:
-  - 1m
-  - 5m
-  funding_poll_sec: 180
-  oms_reconcile_sec: 60
-  oms_pending_timeout_sec: 20
-  params:
-    qty: 0.4
-    hold_sec: 5
-  risk:
-    max_open_positions: 5
-    max_notional_usdt: 2000
-    max_order_qty: 1.5
-    max_daily_loss_usdt: 200
-    max_drawdown_pct: 0.15
-    min_available_margin_pct: 0.2
-    max_margin_used_pct: 0.8
+
+#- exchange: binance
+#  account: hedge_main
+#  role: HEDGE
+#  base_ref:
+#    exchange: binance
+#    account: base_main
+#  hedge_ratio: 1.0
+#  strategy: one_shot_test
+#  symbols:
+#  - LTCUSDT
+#  candle_intervals:
+#  - 1m
+#  funding_poll_sec: 120
+#  oms_reconcile_sec: 60
+#  oms_pending_timeout_sec: 20
+#  params:
+#    qty: 0.4
+#    hold_sec: 5
+#  risk:
+#    max_open_positions: 5
+#    max_notional_usdt: 2000
+#    max_order_qty: 1.5
+#    max_daily_loss_usdt: 200
+#    max_drawdown_pct: 0.15
+#    min_available_margin_pct: 0.2
+#    max_margin_used_pct: 0.8

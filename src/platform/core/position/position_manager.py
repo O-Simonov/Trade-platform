@@ -1,23 +1,46 @@
-# src/platform/core/position/position_manager.py
 from __future__ import annotations
 
 import logging
-from typing import Dict, Tuple, Optional, List, Any
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from src.platform.core.oms.events import TradeEvent
 from src.platform.core.position.aggregate import PositionAggregate
 
 
+@dataclass
+class LifecycleState:
+    """
+    Lifecycle state per (exchange_id, account_id, symbol_id).
+
+    We store this OUTSIDE PositionAggregate because PositionAggregate is slots=True
+    and cannot accept dynamic attrs like opened_at/closed_at/pos_uid.
+    """
+    opened_at: Optional[datetime] = None
+    closed_at: Optional[datetime] = None
+    pos_uid: str = ""
+    last_side: str = "FLAT"  # LONG/SHORT/FLAT
+
+    # baselines to compute per-lifecycle DELTA for ledger
+    realized_at_open: float = 0.0
+    fees_at_open: float = 0.0
+
+
 class PositionManager:
     """
-    In-memory position aggregates built strictly from TradeEvent stream.
+    In-memory position aggregates built strictly from TradeEvent stream (authoritative).
+    K6.7: qty>=0 + side (LONG/SHORT/FLAT)
 
-    Responsibilities:
-      ✔ deduplicate trades
-      ✔ maintain PositionAggregate per (exchange_id, account_id, symbol_id)
-      ✔ return updated aggregate when position changes
-      ✖ NO persistence
+    Key points:
+      - WS fills (TradeEvent) are authoritative for side/qty/entry/realized/fees.
+      - mark price ticks update only mark/uPnL.
+      - We keep lifecycle (opened_at/closed_at/pos_uid) in a separate cache (LifecycleState)
+        because PositionAggregate is dataclass(slots=True).
     """
+
+    MAX_SEEN_TRADE_IDS = 200_000
 
     def __init__(
         self,
@@ -32,119 +55,202 @@ class PositionManager:
         self.account_id = int(account_id)
         self.logger = logger or logging.getLogger(__name__)
 
-        # key = (exchange_id, account_id, symbol_id)
+        # (exchange_id, account_id, symbol_id) -> PositionAggregate
         self._aggs: Dict[Tuple[int, int, int], PositionAggregate] = {}
 
-        # trade_id deduplication
+        # de-dup executed trades
         self._seen_trade_ids: set[str] = set()
+
+        # lifecycle cache
+        self._life: Dict[Tuple[int, int, int], LifecycleState] = {}
+
+        # reconciler protection (optional)
+        self._last_event_ts: Dict[Tuple[int, int, int], float] = {}
 
     # ------------------------------------------------------------
     @staticmethod
     def _key(exchange_id: int, account_id: int, symbol_id: int) -> tuple[int, int, int]:
         return int(exchange_id), int(account_id), int(symbol_id)
 
+    @staticmethod
+    def _dt_from_ts_ms(ts_ms: int) -> datetime:
+        return datetime.fromtimestamp(float(ts_ms) / 1000.0, tz=timezone.utc)
+
+    @staticmethod
+    def _pos_uid(exchange_id: int, account_id: int, symbol_id: int, opened_at: datetime) -> str:
+        opened_ms = int(opened_at.timestamp() * 1000)
+        return f"{exchange_id}:{account_id}:{symbol_id}:{opened_ms}"
+
+    def get(self, exchange_id: int, account_id: int, symbol_id: int) -> Optional[PositionAggregate]:
+        return self._aggs.get(self._key(exchange_id, account_id, symbol_id))
+
     def get_or_create(self, exchange_id: int, account_id: int, symbol_id: int) -> PositionAggregate:
         key = self._key(exchange_id, account_id, symbol_id)
         agg = self._aggs.get(key)
         if agg is None:
-            agg = PositionAggregate.empty(
-                exchange_id=exchange_id,
-                account_id=account_id,
-                symbol_id=symbol_id,
-            )
+            agg = PositionAggregate.empty(exchange_id=exchange_id, account_id=account_id, symbol_id=symbol_id)
             self._aggs[key] = agg
         return agg
 
     # ------------------------------------------------------------
-    def on_trade_event(self, evt: TradeEvent) -> Optional[PositionAggregate]:
-        """
-        Apply TradeEvent to position aggregate.
+    def _dedup_trade_id(self, trade_id: str) -> bool:
+        if not trade_id:
+            return True
+        if trade_id in self._seen_trade_ids:
+            return False
 
-        Returns:
-          PositionAggregate if position changed,
-          None otherwise.
-        """
-        trade_id = str(getattr(evt, "trade_id", "") or "")
-        if trade_id:
-            if trade_id in self._seen_trade_ids:
-                return None
+        self._seen_trade_ids.add(trade_id)
+
+        if len(self._seen_trade_ids) > self.MAX_SEEN_TRADE_IDS:
+            self.logger.warning(
+                "[PositionManager] seen_trade_ids overflow (%d) -> reset cache",
+                len(self._seen_trade_ids),
+            )
+            self._seen_trade_ids.clear()
             self._seen_trade_ids.add(trade_id)
 
-        agg = self.get_or_create(
-            int(evt.exchange_id or self.exchange_id),
-            int(evt.account_id or self.account_id),
-            int(evt.symbol_id or 0),
-        )
+        return True
 
-        changed = agg.apply_trade(evt)
-        if not changed:
+    def reset_trade_id_cache(self) -> None:
+        self._seen_trade_ids.clear()
+
+    # ------------------------------------------------------------
+    def get_lifecycle(self, exchange_id: int, account_id: int, symbol_id: int) -> Optional[LifecycleState]:
+        return self._life.get(self._key(exchange_id, account_id, symbol_id))
+
+    def _life_get_or_create(self, key: Tuple[int, int, int]) -> LifecycleState:
+        st = self._life.get(key)
+        if st is None:
+            st = LifecycleState()
+            self._life[key] = st
+        return st
+
+    # ------------------------------------------------------------
+    def on_trade_event(self, evt: TradeEvent) -> Optional[PositionAggregate]:
+        """
+        Authoritative update from WS fills (TradeEvent).
+        Also updates lifecycle cache (opened_at/closed_at/pos_uid and baselines).
+        """
+        if evt is None:
             return None
+
+        symbol_id = int(getattr(evt, "symbol_id", 0) or 0)
+        if symbol_id <= 0:
+            return None
+
+        ex_id = int(getattr(evt, "exchange_id", 0) or self.exchange_id or 0)
+        acc_id = int(getattr(evt, "account_id", 0) or self.account_id or 0)
+        if ex_id <= 0 or acc_id <= 0:
+            return None
+
+        trade_id = str(getattr(evt, "trade_id", "") or "").strip()
+        if not trade_id:
+            # без trade_id высок риск дублей
+            return None
+
+        if not self._dedup_trade_id(trade_id):
+            return None
+
+        key = self._key(ex_id, acc_id, symbol_id)
+
+        agg = self.get_or_create(ex_id, acc_id, symbol_id)
+
+        # snapshot BEFORE apply_trade (для переходов open<->flat)
+        was_open = bool(getattr(agg, "is_open")() if hasattr(agg, "is_open") else False)
+        was_side = str(getattr(agg, "side_str")() if hasattr(agg, "side_str") else "FLAT").upper()
+
+        ok = agg.apply_trade(evt)
+        if not ok:
+            return None
+
+        # snapshot AFTER apply_trade
+        is_open = bool(getattr(agg, "is_open")() if hasattr(agg, "is_open") else False)
+        now_side = str(getattr(agg, "side_str")() if hasattr(agg, "side_str") else "FLAT").upper()
+
+        ts_ms = int(getattr(evt, "ts_ms", 0) or 0) or int(getattr(agg, "last_ts_ms", 0) or 0)
+        if ts_ms <= 0:
+            ts_ms = int(time.time() * 1000)
+        ts_dt = self._dt_from_ts_ms(ts_ms)
+
+        st = self._life_get_or_create(key)
+
+        # ---- transition: FLAT -> OPEN ----
+        if (not was_open) and is_open:
+            st.opened_at = ts_dt
+            st.closed_at = None
+            st.pos_uid = self._pos_uid(ex_id, acc_id, symbol_id, st.opened_at)
+            st.last_side = now_side if now_side in ("LONG", "SHORT") else "FLAT"
+
+            # baselines at open (after apply_trade)
+            st.realized_at_open = float(getattr(agg, "realized_pnl", 0.0) or 0.0)
+            st.fees_at_open = float(getattr(agg, "fees", 0.0) or 0.0)
+
+        # ---- transition: OPEN -> FLAT ----
+        if was_open and (not is_open):
+            # закрываем lifecycle
+            if st.opened_at is None:
+                # если вдруг пропустили открытие (редко), хотя бы не оставляем NULL
+                st.opened_at = ts_dt
+                st.pos_uid = self._pos_uid(ex_id, acc_id, symbol_id, st.opened_at)
+                st.realized_at_open = float(getattr(agg, "realized_pnl", 0.0) or 0.0)
+                st.fees_at_open = float(getattr(agg, "fees", 0.0) or 0.0)
+
+            st.closed_at = ts_dt
+            st.last_side = was_side if was_side in ("LONG", "SHORT") else st.last_side
+
+        # ---- still open ----
+        if is_open and now_side in ("LONG", "SHORT"):
+            st.last_side = now_side
+
+        # reconciler protection timestamp
+        self._last_event_ts[key] = time.time()
 
         return agg
 
     # ------------------------------------------------------------
+    def on_mark_price(
+        self,
+        *,
+        symbol_id: int,
+        price: float,
+        create_if_missing: bool = False,
+    ) -> Optional[PositionAggregate]:
+        """
+        Mark price updates (WS markPrice@1s).
+        """
+        symbol_id = int(symbol_id or 0)
+        price = float(price or 0.0)
+        if symbol_id <= 0 or price <= 0:
+            return None
+
+        key = (self.exchange_id, self.account_id, symbol_id)
+        agg = self._aggs.get(key)
+
+        if agg is None:
+            if not create_if_missing:
+                return None
+            agg = self.get_or_create(self.exchange_id, self.account_id, symbol_id)
+
+        if agg.apply_mark_price(price):
+            return agg
+        return None
+
+    # ------------------------------------------------------------
     def snapshot(self, *, include_flat: bool = True) -> List[PositionAggregate]:
-        """
-        Used by Engine/Instance for a quick in-memory view.
-        Added to satisfy instance.py references.
-        """
         aggs = list(self._aggs.values())
         if include_flat:
             return aggs
-        return [a for a in aggs if getattr(a, "qty", 0.0) != 0.0]
+        return [a for a in aggs if a.is_open()]
 
-    def snapshot_rows(self, *, include_flat: bool = True) -> List[dict]:
-        """Convenience: snapshot as DB-ready rows."""
-        return [a.to_row() for a in self.snapshot(include_flat=include_flat)]
+    def all_positions(self) -> List[PositionAggregate]:
+        return self.snapshot(include_flat=True)
 
-    # ------------------------------------------------------------
-    def rebuild_from_trades(self, *, since_ts_ms: int = 0, limit: int = 200_000) -> int:
-        """
-        STEP H.3
+    def iter_dirty_positions(self) -> Iterable[PositionAggregate]:
+        for agg in self._aggs.values():
+            if agg.is_dirty():
+                yield agg
 
-        Rebuild in-memory positions from trades table.
-        Persistence is done by caller (OMS / Engine).
-        """
-        if not hasattr(self.storage, "fetch_trades"):
-            self.logger.warning("[POSITIONS][REBUILD] storage.fetch_trades missing -> skip")
-            return 0
-
-        rows = self.storage.fetch_trades(
-            exchange_id=self.exchange_id,
-            account_id=self.account_id,
-            since_ts_ms=int(since_ts_ms or 0),
-            limit=int(limit or 200_000),
-        )
-
-        if not rows:
-            self.logger.info("[POSITIONS][REBUILD] no trades found")
-            return 0
-
-        for r in rows:
-            evt = TradeEvent(
-                exchange="",
-                account="",
-                symbol="",
-                exchange_id=int(r.get("exchange_id") or self.exchange_id),
-                account_id=int(r.get("account_id") or self.account_id),
-                symbol_id=int(r.get("symbol_id") or 0),
-                trade_id=str(r.get("trade_id") or ""),
-                order_id=str(r.get("order_id") or ""),
-                side=str(r.get("side") or ""),
-                price=float(r.get("price") or 0.0),
-                qty=float(r.get("qty") or 0.0),
-                realized_pnl=float(r.get("realized_pnl") or 0.0),
-                fee=float(r.get("fee") or 0.0),
-                fee_asset=str(r.get("fee_asset") or ""),
-                ts_ms=int(r.get("ts_ms") or 0),
-                source=str(r.get("source") or "db_rebuild"),
-                raw_json=r.get("raw_json") or {},
-            )
-            self.on_trade_event(evt)
-
-        self.logger.info(
-            "[POSITIONS][REBUILD] rebuilt %d positions from %d trades",
-            len(self._aggs),
-            len(rows),
-        )
-        return len(self._aggs)
+    def iter_positions(self, *, include_flat: bool = True) -> Iterable[PositionAggregate]:
+        for agg in self._aggs.values():
+            if include_flat or agg.is_open():
+                yield agg

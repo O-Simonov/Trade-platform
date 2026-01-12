@@ -5,8 +5,9 @@ import json
 import threading
 import time
 import logging
+from typing import Callable, Optional, Any
+
 import websocket
-from typing import Callable, Optional
 
 log = logging.getLogger("binance.ws")
 
@@ -15,18 +16,30 @@ WS_WS_BASE = "wss://fstream.binance.com/ws"
 
 
 class BinanceWS(threading.Thread):
+    """
+    Простая WS-обёртка с автопереподключением.
+
+    Важно:
+      ✅ разворачивает combined streams {"stream": "...", "data": {...}} -> отдаёт payload=data
+      ✅ ловит исключения callback-а и логирует (иначе OMS может молча не получать события)
+    """
+
     def __init__(
         self,
         *,
         url: str,
-        on_message,
+        on_message: Callable[[dict[str, Any]], None],
         name: str = "BinanceWS",
         on_open: Optional[Callable[[], None]] = None,
         on_close: Optional[Callable[[], None]] = None,
+        ping_interval: int = 20,
+        ping_timeout: int = 10,
+        reconnect_delay_sec: float = 2.0,
     ):
         super().__init__(daemon=True, name=name)
         self.url = url
         self.on_message_cb = on_message
+
         self._ws: websocket.WebSocketApp | None = None
         self._stop = threading.Event()
 
@@ -34,7 +47,11 @@ class BinanceWS(threading.Thread):
         self._on_open_hook = on_open
         self._on_close_hook = on_close
 
-    def run(self):
+        self._ping_interval = int(ping_interval)
+        self._ping_timeout = int(ping_timeout)
+        self._reconnect_delay_sec = float(reconnect_delay_sec)
+
+    def run(self) -> None:
         log.info("[%s] connecting → %s", self.name, self.url)
 
         def _on_open(_ws):
@@ -68,18 +85,20 @@ class BinanceWS(threading.Thread):
                     on_error=_on_error,
                     on_close=_on_close,
                 )
-                self._ws.run_forever(ping_interval=20, ping_timeout=10)
+                self._ws.run_forever(
+                    ping_interval=self._ping_interval,
+                    ping_timeout=self._ping_timeout,
+                )
             except Exception as e:
                 self.connected.clear()
                 log.exception("[%s] WS exception: %s", self.name, e)
 
-            # небольшой backoff
-            for _ in range(10):
-                if self._stop.is_set():
-                    break
-                time.sleep(0.2)
+            # backoff перед переподключением
+            if self._stop.is_set():
+                break
+            time.sleep(self._reconnect_delay_sec)
 
-    def stop(self):
+    def stop(self) -> None:
         self._stop.set()
         self.connected.clear()
         try:
@@ -88,7 +107,7 @@ class BinanceWS(threading.Thread):
         except Exception:
             pass
 
-    def _handle(self, msg: str):
+    def _handle(self, msg: str) -> None:
         try:
             data = json.loads(msg)
         except Exception:
@@ -100,7 +119,16 @@ class BinanceWS(threading.Thread):
         else:
             payload = data
 
-        if payload is None:
+        if not isinstance(payload, dict):
             return
 
-        self.on_message_cb(payload)
+        # 🔥 ключевой фикс: ошибки обработчика не должны быть "тихими"
+        try:
+            self.on_message_cb(payload)
+        except Exception:
+            ev = payload.get("e") or payload.get("eventType") or "?"
+            # обрезаем, чтобы лог не раздувался
+            snippet = str(payload)
+            if len(snippet) > 800:
+                snippet = snippet[:800] + "…"
+            log.exception("[%s] on_message_cb failed (event=%s) payload=%s", self.name, ev, snippet)

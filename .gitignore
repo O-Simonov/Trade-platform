@@ -208,3 +208,21 @@ __marimo__/
 .idea/
 .env
 .env.*
+
+*_marketdata.zip
+*_marketdata/
+
+
+# local
+logs/
+__pycache__/
+*.pyc
+.venv/
+.env
+.env.*
+
+
+# local run scripts
+restart
+starting
+

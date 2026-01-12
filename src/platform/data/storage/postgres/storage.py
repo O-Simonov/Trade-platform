@@ -2,22 +2,84 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import time
 import logging
-from datetime import datetime, timezone
-from typing import Any, Iterable, Sequence, Mapping, Any
+from datetime import datetime,timezone,timedelta
+from typing import Any,Iterable,Sequence,Mapping,List,Tuple,Dict,Optional
+
+
+
+
 from psycopg import sql as _sql
 
 from psycopg_pool import ConnectionPool
 
 logger = logging.getLogger(__name__)
 
-
 def _utcnow() -> datetime:
     return datetime.now(tz=timezone.utc)
 
+log = logging.getLogger("storage.sql")
+
 
 class PostgreSQLStorage:
+
+    @staticmethod
+    def _safe_int(v, default=None):
+        try:
+            return int(v) if v is not None else default
+        except Exception:
+            return default
+
+    @staticmethod
+    def _safe_str(v, default=None):
+        try:
+            if v is None:
+                return default
+            s = str(v)
+            return s if s else default
+        except Exception:
+            return default
+
+    @staticmethod
+    def _safe_float(v, default=None):
+        try:
+            return float(v) if v is not None else default
+        except Exception:
+            return default
+
+    @staticmethod
+    def _mk_fill_uid(
+            *,
+            exchange_id: int,
+            account_id: int,
+            symbol_id: int,
+            order_id: str | None,
+            trade_id: str | None,
+            ts_ms: int | None,
+            price,
+            qty,
+    ) -> str:
+        """
+        Детерминированный UID для fill.
+        """
+        if trade_id:
+            return f"tid:{trade_id}"
+
+        base = {
+            "ex": exchange_id,
+            "acc": account_id,
+            "sym": symbol_id,
+            "oid": order_id,
+            "ts": ts_ms,
+            "price": str(price),
+            "qty": str(qty),
+        }
+
+        raw = json.dumps(base, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        h = hashlib.sha1(raw).hexdigest()
+        return f"h:{h}"
 
     """
     PostgreSQL storage — registry, market state, OMS helpers, retention, exchangeInfo,
@@ -26,26 +88,100 @@ class PostgreSQLStorage:
 
     def __init__(self, pool: ConnectionPool):
         self.pool = pool
-
-
+        self.logger = logging.getLogger("storage.postgres")
     # ======================================================================
     # HELPERS
     # ======================================================================
 
-    def _exec_many(self, query: str, rows: list[dict]) -> int:
+    def _exec_many(self, query: str, rows: list[dict], *, chunk_size: int = 500) -> int:
+        """
+        Execute executemany() safely with rollback+logging.
+
+        Returns:
+          affected rows (best-effort). If driver doesn't provide rowcount reliably,
+          returns number of attempted rows.
+        """
         if not rows:
             return 0
-        with self.pool.connection() as conn:
-            with conn.cursor() as cur:
-                cur.executemany(query, rows)
-            conn.commit()
-        return len(rows)
 
-    def _exec_one(self, query: str, params: tuple):
+        # chunking to avoid huge packets and easier debugging
+        total_attempted = 0
+        total_affected: Optional[int] = 0
+
+        def chunks(xs: list[dict], n: int) -> Iterable[list[dict]]:
+            if n <= 0:
+                yield xs
+                return
+            for i in range(0, len(xs), n):
+                yield xs[i: i + n]
+
+        with self.pool.connection() as conn:
+            try:
+                with conn.cursor() as cur:
+                    for part in chunks(rows, int(chunk_size)):
+                        total_attempted += len(part)
+                        cur.executemany(query, part)
+
+                        # rowcount в executemany зависит от драйвера/режима
+                        rc = getattr(cur, "rowcount", None)
+                        if isinstance(rc, int) and rc >= 0:
+                            total_affected = (total_affected or 0) + rc
+                        else:
+                            total_affected = None
+
+                conn.commit()
+
+            except Exception as e:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+
+                # Логируем полезный контекст
+                sample = rows[0] if rows else None
+                sample_keys = sorted(list(sample.keys()))[:60] if isinstance(sample, dict) else None
+
+                log.exception(
+                    "[DB][_exec_many] FAILED: rows=%s chunk_size=%s err=%r sample_keys=%s sample_row=%r",
+                    len(rows), chunk_size, e, sample_keys, sample
+                )
+                raise
+
+        # если rowcount неинформативен — вернём попытку
+        return int(total_affected) if total_affected is not None else int(total_attempted)
+
+    def _exec_one_fetchone(self, query: str, params: Any = None):
+        """
+        For SELECT ... returning 1 row.
+        Does NOT commit.
+        """
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
-                cur.execute(query, params)
+                cur.execute(query, params or ())
                 return cur.fetchone()
+
+    def _exec_one_commit(self, query: str, params: Any = None) -> int:
+        """
+        For INSERT/UPDATE/DELETE single statement.
+        Commits and returns rowcount best-effort.
+        """
+        with self.pool.connection() as conn:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(query, params or ())
+                    rc = getattr(cur, "rowcount", None)
+                conn.commit()
+                return int(rc) if isinstance(rc, int) and rc >= 0 else 1
+            except Exception as e:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                log.exception("[DB][_exec_one_commit] FAILED err=%r query=%r params=%r", e, query[:500], params)
+                raise
+
+    def _exec_one(self, query: str, params: Any = None):
+        return self._exec_one_fetchone(query, params=params)
 
     # ======================================================================
     # IDS / REGISTRY (used by run_instances.py)
@@ -57,7 +193,8 @@ class PostgreSQLStorage:
         exchange: str,
         account: str,
         symbols: list[str],
-    ) -> dict:
+    ) -> tuple[int, int, dict[str, int]]:
+
         r"""
         Ensures exchange/account/symbols exist in DB and returns ids mapping.
 
@@ -112,82 +249,441 @@ class PostgreSQLStorage:
 
             conn.commit()
 
-        ids = {"_exchange_id": exchange_id, "_account_id": account_id}
-        ids.update(symbol_ids)
-        return ids
+        return int(exchange_id), int(account_id), symbol_ids
+
+
+    def ensure_exchange_account_symbol_map(
+            self,
+            *,
+            exchange: str,
+            account: str,
+            symbols: list[str],
+    ) -> dict:
+        """
+        Backward-compatible wrapper.
+        """
+        exchange_id, account_id, symbol_ids = self.ensure_exchange_account_symbol(
+            exchange=exchange,
+            account=account,
+            symbols=symbols,
+        )
+        out = {"_exchange_id": exchange_id, "_account_id": account_id}
+        out.update(symbol_ids)
+        return out
+
+
+    def upsert_symbols(
+            self,
+            *,
+            exchange_id: int,
+            symbols: list[str],
+            deactivate_missing: bool = True,
+    ) -> dict[str, int]:
+        symbols_norm = sorted({str(s).upper().strip() for s in (symbols or []) if str(s).strip()})
+        if not symbols_norm:
+            return {}
+
+        sql_upsert = """
+                     WITH incoming AS (SELECT UNNEST(%(symbols)s::text[]) AS symbol)
+                     INSERT
+                     INTO symbols (exchange_id, symbol, is_active, status, last_seen_at)
+                     SELECT %(exchange_id)s, symbol, TRUE, 'TRADING', NOW()
+                     FROM incoming ON CONFLICT (exchange_id, symbol)
+                     DO \
+                     UPDATE SET
+                         is_active = TRUE, \
+                         status = EXCLUDED.status, \
+                         last_seen_at = EXCLUDED.last_seen_at \
+                         RETURNING symbol, symbol_id;
+                     """
+
+        sql_deactivate_missing = """
+                                 UPDATE symbols
+                                 SET is_active = FALSE
+                                 WHERE exchange_id = %(exchange_id)s
+                                   AND NOT (symbol = ANY (%(symbols)s::text[]));
+                                 """
+
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql_upsert, {"exchange_id": int(exchange_id), "symbols": symbols_norm})
+                rows = cur.fetchall() or []
+
+                if deactivate_missing:
+                    # помечаем отсутствующие как неактивные
+                    cur.execute(sql_deactivate_missing, {"exchange_id": int(exchange_id), "symbols": symbols_norm})
+
+            conn.commit()
+
+        return {str(sym).upper(): int(sid) for (sym, sid) in rows}
+
+    def list_symbols(self, *, exchange_id: int) -> dict[str, int]:
+        """Return {SYMBOL: symbol_id} for all symbols known to DB for the exchange."""
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT symbol, symbol_id
+                    FROM symbols
+                    WHERE exchange_id = %s
+                    """,
+                    (int(exchange_id),),
+                )
+                rows = cur.fetchall() or []
+        return {str(sym).upper(): int(sid) for (sym, sid) in rows}
 
     # ======================================================================
-    # POSITIONS
+    # POSITIONS (FIXED)
     # ======================================================================
 
     def upsert_position(self, position: Any) -> int:
         return self.upsert_positions([position])
 
-    def upsert_positions(self, positions: Sequence[Any]) -> int:
-        if not positions:
-            return 0
+    @staticmethod
+    def _norm_side(v: Any) -> str:
+        s = str(v or "").upper().strip()
+        if s in ("LONG", "SHORT", "FLAT"):
+            return s
+        return "FLAT"
 
-        query = """
-        INSERT INTO positions (
-            exchange_id, account_id, symbol_id,
-            side, qty, entry_price,
-            realized_pnl, unrealized_pnl, exchange_realized_pnl,
-            fees, mark_price,
-            last_trade_id, status, last_ts,
-            updated_at, source
-        )
-        VALUES (
-            %(exchange_id)s, %(account_id)s, %(symbol_id)s,
-            %(side)s, %(qty)s, %(entry_price)s,
-            %(realized_pnl)s, %(unrealized_pnl)s, %(exchange_realized_pnl)s,
-            %(fees)s, %(mark_price)s,
-            %(last_trade_id)s, %(status)s, %(last_ts)s,
-            %(updated_at)s, %(source)s
-        )
-        ON CONFLICT (exchange_id, account_id, symbol_id)
-        DO UPDATE SET
-            side = EXCLUDED.side,
-            qty = EXCLUDED.qty,
-            entry_price = EXCLUDED.entry_price,
-            realized_pnl = EXCLUDED.realized_pnl,
-            unrealized_pnl = EXCLUDED.unrealized_pnl,
-            exchange_realized_pnl = EXCLUDED.exchange_realized_pnl,
-            fees = EXCLUDED.fees,
-            mark_price = EXCLUDED.mark_price,
-            last_trade_id = EXCLUDED.last_trade_id,
-            status = EXCLUDED.status,
-            last_ts = EXCLUDED.last_ts,
-            updated_at = EXCLUDED.updated_at,
-            source = EXCLUDED.source;
+    @staticmethod
+    def _f(x: Any, default: float = 0.0) -> float:
+        try:
+            v = float(x)
+            if v != v:  # NaN
+                return float(default)
+            return v
+        except Exception:
+            return float(default)
+
+    def _normalize_positions_row(self, row: dict) -> dict:
         """
+        Делает row безопасным для constraints таблицы positions:
+
+        chk_flat_consistency:
+          (side='FLAT' AND qty=0 AND status='CLOSED')
+          OR (side IN ('LONG','SHORT') AND qty>0 AND status='OPEN')
+
+        + гарантирует наличие ключей, которые ожидает SQL.
+        """
+        if not isinstance(row, dict):
+            raise TypeError("positions row must be dict")
 
         now = _utcnow()
 
-        def get(obj: Any, key: str, default=None):
-            return obj.get(key, default) if isinstance(obj, dict) else getattr(obj, key, default)
+        # обязательные идентификаторы
+        row["exchange_id"] = int(row.get("exchange_id") or 0)
+        row["account_id"] = int(row.get("account_id") or 0)
+        row["symbol_id"] = int(row.get("symbol_id") or 0)
 
-        rows: list[dict] = []
-        for p in positions:
-            rows.append({
-                "exchange_id": int(get(p, "exchange_id")),
-                "account_id": int(get(p, "account_id")),
-                "symbol_id": int(get(p, "symbol_id")),
-                "side": get(p, "side"),
-                "qty": float(get(p, "qty", 0.0) or 0.0),
-                "entry_price": float(get(p, "entry_price", 0.0) or 0.0),
-                "realized_pnl": float(get(p, "realized_pnl", 0.0) or 0.0),
-                "unrealized_pnl": float(get(p, "unrealized_pnl", 0.0) or 0.0),
-                "exchange_realized_pnl": float(get(p, "exchange_realized_pnl", 0.0) or 0.0),
-                "fees": float(get(p, "fees", 0.0) or 0.0),
-                "mark_price": float(get(p, "mark_price", 0.0) or 0.0),
-                "last_trade_id": get(p, "last_trade_id"),
-                "status": get(p, "status"),
-                "last_ts": get(p, "last_ts"),
-                "updated_at": get(p, "updated_at") or now,
-                "source": get(p, "source") or "snapshot",
-            })
+        # стратегия
+        row.setdefault("strategy_id", "unknown")
+        row.setdefault("strategy_name", None)
 
-        return self._exec_many(query, rows)
+        # lifecycle keys (ключи должны быть)
+        row.setdefault("pos_uid", "")
+        row.setdefault("opened_at", None)
+        row.setdefault("closed_at", None)
+
+        # торговые поля
+        side = self._norm_side(row.get("side"))
+        qty = abs(self._f(row.get("qty"), 0.0))
+
+        if qty <= 0.0:
+            row["side"] = "FLAT"
+            row["qty"] = 0.0
+            row["status"] = "CLOSED"
+
+            # при CLOSED можно выставлять нули (так удобнее для аналитики)
+            row.setdefault("entry_price", 0.0)
+            row.setdefault("avg_price", 0.0)
+            row.setdefault("exit_price", 0.0)
+            row.setdefault("mark_price", 0.0)
+            row.setdefault("unrealized_pnl", 0.0)
+        else:
+            if side not in ("LONG", "SHORT"):
+                side = "LONG"
+            row["side"] = side
+            row["qty"] = float(qty)
+            row["status"] = "OPEN"
+
+            row.setdefault("entry_price", None)
+            row.setdefault("avg_price", None)
+            row.setdefault("exit_price", None)
+            row.setdefault("mark_price", None)
+            row.setdefault("unrealized_pnl", None)
+
+        row.setdefault("position_value_usdt", None)
+        row.setdefault("scale_in_count", 0)
+        row.setdefault("realized_pnl", 0.0)
+        row.setdefault("fees", 0.0)
+
+        row.setdefault("last_trade_id", None)
+        row.setdefault("last_ts", None)
+
+        # ✅ updated_at NOT NULL — гарантируем
+        if row.get("updated_at") is None:
+            row["updated_at"] = now
+
+        row.setdefault("source", "position_aggregate")
+
+        # защита от None в NOT NULL side/status уже обеспечена выше
+        return row
+
+    def upsert_positions(self, rows):
+        if not rows:
+            return 0
+
+        norm_rows: list[dict] = []
+        for r in rows:
+            rr = dict(r or {})
+            rr = self._normalize_positions_row(rr)
+            norm_rows.append(rr)
+
+        sql = """
+              INSERT INTO positions (exchange_id, account_id, symbol_id, \
+                                     strategy_id, strategy_name, \
+                                     pos_uid, \
+                                     side, qty, \
+                                     entry_price, avg_price, exit_price, \
+                                     mark_price, unrealized_pnl, \
+                                     position_value_usdt, \
+                                     scale_in_count, \
+                                     realized_pnl, fees, \
+                                     last_trade_id, last_ts, \
+                                     status, \
+                                     opened_at, closed_at, \
+                                     updated_at, source)
+              VALUES (%(exchange_id)s, %(account_id)s, %(symbol_id)s, \
+                      %(strategy_id)s, %(strategy_name)s, \
+                      %(pos_uid)s, \
+                      %(side)s, %(qty)s, \
+                      %(entry_price)s, %(avg_price)s, %(exit_price)s, \
+                      %(mark_price)s, %(unrealized_pnl)s, \
+                      %(position_value_usdt)s, \
+                      %(scale_in_count)s, \
+                      %(realized_pnl)s, %(fees)s, \
+                      %(last_trade_id)s, %(last_ts)s, \
+                      %(status)s, \
+                      %(opened_at)s, %(closed_at)s, \
+                      %(updated_at)s, %(source)s) ON CONFLICT (exchange_id, account_id, symbol_id)
+            DO \
+              UPDATE SET
+                  -- стратегия: если в positions уже не unknown — не трогаем
+                  strategy_id = CASE \
+                  WHEN positions.strategy_id = 'unknown' AND EXCLUDED.strategy_id IS NOT NULL AND EXCLUDED.strategy_id <> 'unknown' \
+                  THEN EXCLUDED.strategy_id \
+                  ELSE positions.strategy_id
+              END \
+              ,
+                strategy_name = COALESCE(positions.strategy_name, EXCLUDED.strategy_name),
+
+                -- lifecycle write-once
+                pos_uid = CASE
+                    WHEN COALESCE(positions.pos_uid, '') <> '' THEN positions.pos_uid
+                    WHEN COALESCE(EXCLUDED.pos_uid, '') <> '' THEN EXCLUDED.pos_uid
+                    ELSE positions.pos_uid
+              END \
+              ,
+
+                opened_at = COALESCE(positions.opened_at, EXCLUDED.opened_at),
+
+                closed_at = CASE
+                    WHEN positions.closed_at IS NOT NULL THEN positions.closed_at
+                    WHEN EXCLUDED.closed_at IS NOT NULL THEN EXCLUDED.closed_at
+                    ELSE positions.closed_at
+              END \
+              ,
+
+                -- текущее состояние
+                side = EXCLUDED.side,
+                qty = EXCLUDED.qty,
+                status = EXCLUDED.status,
+
+                -- цены/поля
+                entry_price = EXCLUDED.entry_price,
+                avg_price = EXCLUDED.avg_price,
+                exit_price = EXCLUDED.exit_price,
+                mark_price = EXCLUDED.mark_price,
+                unrealized_pnl = EXCLUDED.unrealized_pnl,
+                position_value_usdt = EXCLUDED.position_value_usdt,
+
+                scale_in_count = COALESCE(EXCLUDED.scale_in_count, positions.scale_in_count),
+
+                realized_pnl = EXCLUDED.realized_pnl,
+                fees = EXCLUDED.fees,
+
+                last_trade_id = COALESCE(NULLIF(EXCLUDED.last_trade_id, ''), positions.last_trade_id),
+                last_ts = COALESCE(EXCLUDED.last_ts, positions.last_ts),
+
+                updated_at = EXCLUDED.updated_at,
+                source = EXCLUDED.source \
+              """
+
+        return self._exec_many(sql, norm_rows)
+
+    # ======================================================================
+    # POSITION SNAPSHOTS (OK + CLEAN SQL)
+    # ======================================================================
+
+    def upsert_position_snapshots(self, rows):
+        rows = list(rows or [])
+        if not rows:
+            return 0
+
+        now = _utcnow()
+        prepared: list[dict] = []
+
+        for r in rows:
+            d = dict(r or {})
+
+            d["exchange_id"] = int(d.get("exchange_id") or 0)
+            d["account_id"] = int(d.get("account_id") or 0)
+            d["symbol_id"] = int(d.get("symbol_id") or 0)
+
+            qty = abs(self._f(d.get("qty"), 0.0))
+            side = self._norm_side(d.get("side"))
+
+            if qty <= 0:
+                d["qty"] = 0.0
+                d["side"] = "FLAT"
+            else:
+                d["qty"] = float(qty)
+                if side not in ("LONG", "SHORT"):
+                    side = "LONG"
+                d["side"] = side
+
+            entry = self._f(d.get("entry_price"), 0.0)
+            mark = self._f(d.get("mark_price"), entry)
+
+            d["entry_price"] = float(entry)
+            d["mark_price"] = float(mark)
+
+            # position_value должен быть числом (часто NOT NULL)
+            pv = d.get("position_value", None)
+            if pv is None:
+                pv = abs(qty) * float(mark)
+            d["position_value"] = float(self._f(pv, 0.0))
+
+            d["unrealized_pnl"] = float(self._f(d.get("unrealized_pnl"), 0.0))
+            d["realized_pnl"] = float(self._f(d.get("realized_pnl"), 0.0))
+            d["fees"] = float(self._f(d.get("fees"), 0.0))
+
+            d.setdefault("last_ts", now)
+            d.setdefault("updated_at", now)
+            d.setdefault("source", "position_aggregate")
+
+            prepared.append(d)
+
+        sql = """
+              INSERT INTO position_snapshots (exchange_id, account_id, symbol_id, \
+                                              side, qty, entry_price, mark_price, \
+                                              position_value, unrealized_pnl, realized_pnl, fees, \
+                                              last_ts, updated_at, source)
+              VALUES (%(exchange_id)s, %(account_id)s, %(symbol_id)s, \
+                      %(side)s, %(qty)s, %(entry_price)s, %(mark_price)s, \
+                      %(position_value)s, %(unrealized_pnl)s, %(realized_pnl)s, %(fees)s, \
+                      %(last_ts)s, %(updated_at)s, %(source)s) ON CONFLICT (exchange_id, account_id, symbol_id)
+            DO \
+              UPDATE SET
+                  side = EXCLUDED.side, \
+                  qty = EXCLUDED.qty, \
+                  entry_price = EXCLUDED.entry_price, \
+                  mark_price = EXCLUDED.mark_price, \
+                  position_value = EXCLUDED.position_value, \
+                  unrealized_pnl = EXCLUDED.unrealized_pnl, \
+                  realized_pnl = EXCLUDED.realized_pnl, \
+                  fees = EXCLUDED.fees, \
+                  last_ts = EXCLUDED.last_ts, \
+                  updated_at = EXCLUDED.updated_at, \
+                  source = EXCLUDED.source \
+              """
+        return self._exec_many(sql, prepared)
+
+    # ======================================================================
+    # POSITION LEDGER (FIXED: closed_at write-once + strategy unknown protection)
+    # ======================================================================
+
+    def upsert_position_ledger(self, rows):
+        rows = list(rows or [])
+        if not rows:
+            return 0
+
+        now = _utcnow()
+        prepared: list[dict] = []
+
+        for r in rows:
+            d = dict(r or {})
+            d["exchange_id"] = int(d.get("exchange_id") or 0)
+            d["account_id"] = int(d.get("account_id") or 0)
+            d["symbol_id"] = int(d.get("symbol_id") or 0)
+
+            d["pos_uid"] = str(d.get("pos_uid") or "").strip()
+            if not d["pos_uid"]:
+                # pos_uid обязателен для PK, делаем детерминированный fallback
+                d["pos_uid"] = f"{d['exchange_id']}:{d['account_id']}:{d['symbol_id']}"
+
+            d.setdefault("strategy_id", "unknown")
+            d.setdefault("strategy_name", None)
+
+            d.setdefault("updated_at", now)
+            d.setdefault("source", "ledger")
+
+            prepared.append(d)
+
+        sql = """
+              INSERT INTO position_ledger (exchange_id, account_id, pos_uid, symbol_id, \
+                                           strategy_id, strategy_name, \
+                                           side, status, \
+                                           opened_at, closed_at, \
+                                           entry_price, avg_price, exit_price, \
+                                           qty_opened, qty_current, qty_closed, \
+                                           position_value_usdt, scale_in_count, \
+                                           realized_pnl, fees, \
+                                           updated_at, source)
+              VALUES (%(exchange_id)s, %(account_id)s, %(pos_uid)s, %(symbol_id)s, \
+                      %(strategy_id)s, %(strategy_name)s, \
+                      %(side)s, %(status)s, \
+                      %(opened_at)s, %(closed_at)s, \
+                      %(entry_price)s, %(avg_price)s, %(exit_price)s, \
+                      %(qty_opened)s, %(qty_current)s, %(qty_closed)s, \
+                      %(position_value_usdt)s, %(scale_in_count)s, \
+                      %(realized_pnl)s, %(fees)s, \
+                      %(updated_at)s, %(source)s) ON CONFLICT (exchange_id, account_id, pos_uid, opened_at)
+            DO \
+              UPDATE SET
+                  closed_at = COALESCE (position_ledger.closed_at, EXCLUDED.closed_at), \
+
+                  side = EXCLUDED.side, \
+                  status = EXCLUDED.status, \
+
+                  strategy_id = CASE \
+                  WHEN position_ledger.strategy_id = 'unknown' \
+                  AND EXCLUDED.strategy_id IS NOT NULL \
+                  AND EXCLUDED.strategy_id <> 'unknown' \
+                  THEN EXCLUDED.strategy_id \
+                  ELSE position_ledger.strategy_id
+              END \
+              ,
+                strategy_name = COALESCE(position_ledger.strategy_name, EXCLUDED.strategy_name),
+
+                entry_price = COALESCE(position_ledger.entry_price, EXCLUDED.entry_price),
+                avg_price = COALESCE(EXCLUDED.avg_price, position_ledger.avg_price),
+                exit_price = COALESCE(EXCLUDED.exit_price, position_ledger.exit_price),
+
+                qty_opened = COALESCE(position_ledger.qty_opened, EXCLUDED.qty_opened),
+                qty_current = EXCLUDED.qty_current,
+                qty_closed = GREATEST(COALESCE(position_ledger.qty_closed, 0), COALESCE(EXCLUDED.qty_closed, 0)),
+
+                position_value_usdt = EXCLUDED.position_value_usdt,
+                scale_in_count = EXCLUDED.scale_in_count,
+                realized_pnl = EXCLUDED.realized_pnl,
+                fees = EXCLUDED.fees,
+
+                updated_at = EXCLUDED.updated_at,
+                source = EXCLUDED.source \
+              """
+        return self._exec_many(sql, prepared)
 
     # ======================================================================
     # BALANCE / EQUITY SNAPSHOTS
@@ -463,6 +959,7 @@ class PostgreSQLStorage:
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.executemany(sql, prepared)
+            conn.commit()
 
         return len(prepared)
 
@@ -588,8 +1085,9 @@ class PostgreSQLStorage:
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(query, (status, int(exchange_id), int(account_id), str(order_id)))
-                return int(cur.rowcount or 0)
-
+                n = cur.rowcount
+            conn.commit()
+        return int(n or 0)
 
     def upsert_trades(self, trades: list[dict]) -> None:
         if not trades:
@@ -597,13 +1095,15 @@ class PostgreSQLStorage:
 
         query = """
                 INSERT INTO trades (exchange_id, account_id, trade_id, order_id, symbol_id, \
-                                    strategy_id, pos_uid, side, price, qty, fee, \
+                                    strategy_id, pos_uid, side, price, qty, fee, fee_asset, \
                                     realized_pnl, ts, source, raw_json)
                 VALUES (%(exchange_id)s, %(account_id)s, %(trade_id)s, %(order_id)s, %(symbol_id)s, \
-                        %(strategy_id)s, %(pos_uid)s, %(side)s, %(price)s, %(qty)s, %(fee)s, \
+                        %(strategy_id)s, %(pos_uid)s, %(side)s, %(price)s, %(qty)s, %(fee)s, %(fee_asset)s, \
                         %(realized_pnl)s, %(ts)s, %(source)s, %(raw_json)s) ON CONFLICT (exchange_id, account_id, trade_id)
         DO \
                 UPDATE SET
+                    fee = EXCLUDED.fee, \
+                    fee_asset = EXCLUDED.fee_asset, \
                     realized_pnl = EXCLUDED.realized_pnl, \
                     ts = EXCLUDED.ts, \
                     raw_json = EXCLUDED.raw_json; \
@@ -623,6 +1123,7 @@ class PostgreSQLStorage:
                 "price": float(t.get("price") or 0.0),
                 "qty": float(t.get("qty") or 0.0),
                 "fee": float(t.get("fee") or 0.0),
+                "fee_asset": str(t.get("fee_asset") or ""),
                 "realized_pnl": float(t.get("realized_pnl") or 0.0),
 
                 # ✔ datetime остаётся datetime (для PostgreSQL)
@@ -911,6 +1412,37 @@ class PostgreSQLStorage:
         return int(n or 0)
 
 
+    def get_candles_watermarks(self, *, exchange_id: int, intervals: List[str]) -> Dict[Tuple[int, str], datetime]:
+        """
+        Возвращает watermarks для candles:
+          (symbol_id, interval) -> MAX(open_time)
+
+        Нужно для collector_candles.py чтобы продолжать догрузку после рестарта.
+        """
+        wm: Dict[Tuple[int, str], datetime] = {}
+        intervals = [str(x).strip() for x in (intervals or []) if str(x).strip()]
+        if not intervals:
+            return wm
+
+        sql = """
+              SELECT symbol_id, MAX(open_time) AS last_open_time
+              FROM candles
+              WHERE exchange_id = %s \
+                AND interval = %s
+              GROUP BY symbol_id \
+              """
+
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                for itv in intervals:
+                    cur.execute(sql, (int(exchange_id), str(itv)))
+                    for sid, last_dt in (cur.fetchall() or []):
+                        if sid is None or last_dt is None:
+                            continue
+                        wm[(int(sid), str(itv))] = last_dt
+
+        return wm
+
     def list_non_terminal_orders(self, *, exchange_id: int, account_id: int, symbol_ids=None) -> list[dict]:
         base = """
                SELECT exchange_id, \
@@ -1075,7 +1607,6 @@ class PostgreSQLStorage:
             )
         return out
 
-
     def upsert_account_state(
             self,
             *,
@@ -1098,14 +1629,15 @@ class PostgreSQLStorage:
                 cur.execute(
                     sql,
                     (
-                        exchange_id,
-                        account_id,
+                        int(exchange_id),
+                        int(account_id),
                         state.get("wallet_balance"),
                         state.get("equity"),
                         state.get("available_balance"),
                         state.get("unrealized_pnl"),
                     ),
                 )
+            conn.commit()
 
     def exec_ddl(self, sql: str) -> None:
         """Execute DDL SQL that may contain multiple statements."""
@@ -1170,37 +1702,6 @@ class PostgreSQLStorage:
         return [dict(zip(cols, r)) for r in rows]
 
 
-    def upsert_position_snapshots(self, rows):
-        if not rows:
-            return 0
-
-        sql = """
-              INSERT INTO position_snapshots (exchange_id, account_id, symbol_id, \
-                                              side, qty, entry_price, mark_price, \
-                                              position_value, unrealized_pnl, realized_pnl, fees, \
-                                              last_ts, updated_at, source)
-              VALUES (%(exchange_id)s, %(account_id)s, %(symbol_id)s, \
-                      %(side)s, %(qty)s, %(entry_price)s, %(mark_price)s, \
-                      %(position_value)s, %(unrealized_pnl)s, %(realized_pnl)s, %(fees)s, \
-                      %(last_ts)s, %(updated_at)s, %(source)s) ON CONFLICT (exchange_id, account_id, symbol_id)
-        DO \
-              UPDATE SET
-                  side=EXCLUDED.side, \
-                  qty=EXCLUDED.qty, \
-                  entry_price=EXCLUDED.entry_price, \
-                  mark_price=EXCLUDED.mark_price, \
-                  position_value=EXCLUDED.position_value, \
-                  unrealized_pnl=EXCLUDED.unrealized_pnl, \
-                  realized_pnl=EXCLUDED.realized_pnl, \
-                  fees=EXCLUDED.fees, \
-                  last_ts=EXCLUDED.last_ts, \
-                  updated_at=EXCLUDED.updated_at, \
-                  source =EXCLUDED.source
-              ; \
-              """
-        return self._exec_many(sql, rows)
-
-
     # ------------------------------------------------------------
     def execute_raw(self, query: str, *, log: bool = False) -> None:
         """
@@ -1217,3 +1718,525 @@ class PostgreSQLStorage:
             with conn.cursor() as cur:
                 cur.execute(_sql.SQL(query))
             conn.commit()
+
+
+    def list_active_symbols(self, *, exchange_id: int, active_ttl_sec: int = 1800) -> List[str]:
+        """
+        Active symbols = symbols with OPEN positions OR NEW orders recently updated.
+        Returns list of SYMBOL strings (e.g. 'LTCUSDT').
+        """
+        exchange_id = int(exchange_id)
+        ttl = int(active_ttl_sec)
+
+        sql = """
+              WITH active_symbol_ids AS (SELECT p.symbol_id \
+                                         FROM positions p \
+                                         WHERE p.exchange_id = %s \
+                                           AND abs(p.qty) > 0 \
+                                           AND p.status = 'OPEN' \
+                                           AND p.closed_at IS NULL \
+
+                                         UNION ALL \
+
+                                         SELECT o.symbol_id \
+                                         FROM orders o \
+                                         WHERE o.exchange_id = %s \
+                                           AND o.status = 'NEW' \
+                                           AND o.updated_at >= (now() - (%s || ' seconds')::interval))
+              SELECT DISTINCT s.symbol
+              FROM symbols s
+                       JOIN active_symbol_ids a ON a.symbol_id = s.symbol_id
+              WHERE s.exchange_id = %s
+              ORDER BY s.symbol; \
+              """
+
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (exchange_id, exchange_id, ttl, exchange_id))
+                return [str(r[0]) for r in (cur.fetchall() or []) if r and r[0]]
+
+    def get_symbol_id(self, *, exchange_id: int, symbol: str) -> int | None:
+        """
+        Resolve symbol_id for (exchange_id, symbol).
+        Returns None if symbol not found.
+        """
+        symbol = str(symbol).upper().strip()
+        if not symbol:
+            return None
+
+        sql = "SELECT symbol_id FROM symbols WHERE exchange_id=%s AND symbol=%s"
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (int(exchange_id), symbol))
+                row = cur.fetchone()
+        return int(row[0]) if row else None
+
+    def fetch_symbols_map(self, *, exchange_id: int, only_active: bool = True) -> dict[str, int]:
+        where = "WHERE exchange_id=%s"
+        params = [int(exchange_id)]
+        if only_active:
+            where += " AND is_active = TRUE"
+
+        sql = f"""
+            SELECT symbol, symbol_id
+            FROM symbols
+            {where}
+            ORDER BY symbol
+        """
+
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                rows = cur.fetchall()
+
+        return {str(sym).upper(): int(sid) for (sym, sid) in rows}
+
+    def deactivate_missing_symbols(self, *, exchange_id: int, active_symbols: Iterable[str]) -> int:
+        """
+        Marks symbols NOT in active_symbols as inactive.
+        Returns number of rows updated.
+        """
+        active = [str(s).upper() for s in (active_symbols or [])]
+        if not active:
+            return 0
+
+        sql = """
+        UPDATE symbols
+        SET is_active = FALSE
+        WHERE exchange_id = %s
+          AND is_active = TRUE
+          AND NOT (symbol = ANY(%s))
+        """
+
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (int(exchange_id), active))
+                n = cur.rowcount
+            conn.commit()
+
+        return int(n or 0)
+
+
+    def upsert_funding(self, rows: list[dict]) -> int:
+        if not rows:
+            return 0
+
+        query = """
+            INSERT INTO funding (
+                exchange_id, symbol_id, funding_time,
+                funding_rate, mark_price, source
+            )
+            VALUES (
+                %(exchange_id)s, %(symbol_id)s, %(funding_time)s,
+                %(funding_rate)s, %(mark_price)s, %(source)s
+            )
+            ON CONFLICT (exchange_id, symbol_id, funding_time)
+            DO UPDATE SET
+                funding_rate = EXCLUDED.funding_rate,
+                mark_price   = EXCLUDED.mark_price,
+                source       = EXCLUDED.source
+        """
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.executemany(query, rows)
+                n = cur.rowcount
+            conn.commit()
+        return int(n or 0)
+
+    def upsert_open_interest(self, rows: list[dict]) -> int:
+        if not rows:
+            return 0
+
+        query = """
+            INSERT INTO open_interest (
+                exchange_id, symbol_id, interval, ts,
+                open_interest, open_interest_value, source
+            )
+            VALUES (
+                %(exchange_id)s, %(symbol_id)s, %(interval)s, %(ts)s,
+                %(open_interest)s, %(open_interest_value)s, %(source)s
+            )
+            ON CONFLICT (exchange_id, symbol_id, interval, ts)
+            DO UPDATE SET
+                open_interest       = EXCLUDED.open_interest,
+                open_interest_value = EXCLUDED.open_interest_value,
+                source              = EXCLUDED.source
+        """
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.executemany(query, rows)
+                n = cur.rowcount
+            conn.commit()
+        return int(n or 0)
+
+    def cleanup_funding(self, *, exchange_id: int, keep_days: int) -> int:
+        keep_days = int(keep_days)
+        if keep_days <= 0:
+            return 0
+
+        query = """
+            DELETE FROM funding
+            WHERE exchange_id = %s
+              AND funding_time < (NOW() - (%s || ' days')::interval)
+        """
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(query, (int(exchange_id), keep_days))
+                n = cur.rowcount
+            conn.commit()
+        return int(n or 0)
+
+    def cleanup_open_interest(self, *, exchange_id: int, interval: str, keep_days: int) -> int:
+        keep_days = int(keep_days)
+        if keep_days <= 0:
+            return 0
+
+        query = """
+            DELETE FROM open_interest
+            WHERE exchange_id = %s
+              AND interval = %s
+              AND ts < (NOW() - (%s || ' days')::interval)
+        """
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(query, (int(exchange_id), str(interval), keep_days))
+                n = cur.rowcount
+            conn.commit()
+        return int(n or 0)
+
+
+    def upsert_ticker_24h(self, rows: Iterable[dict]) -> int:
+        rows = list(rows)
+        if not rows:
+            return 0
+
+        query = """
+                INSERT INTO ticker_24h (exchange_id, symbol_id, \
+                                        open_time, close_time, \
+                                        open_price, high_price, low_price, last_price, \
+                                        volume, quote_volume, \
+                                        price_change, price_change_percent, weighted_avg_price, \
+                                        trades, source)
+                VALUES (%(exchange_id)s, %(symbol_id)s, \
+                        %(open_time)s, %(close_time)s, \
+                        %(open_price)s, %(high_price)s, %(low_price)s, %(last_price)s, \
+                        %(volume)s, %(quote_volume)s, \
+                        %(price_change)s, %(price_change_percent)s, %(weighted_avg_price)s, \
+                        %(trades)s, %(source)s) ON CONFLICT (exchange_id, symbol_id, close_time)
+            DO \
+                UPDATE SET
+                    open_time = EXCLUDED.open_time, \
+                    open_price = EXCLUDED.open_price, \
+                    high_price = EXCLUDED.high_price, \
+                    low_price = EXCLUDED.low_price, \
+                    last_price = EXCLUDED.last_price, \
+                    volume = EXCLUDED.volume, \
+                    quote_volume = EXCLUDED.quote_volume, \
+                    price_change = EXCLUDED.price_change, \
+                    price_change_percent = EXCLUDED.price_change_percent, \
+                    weighted_avg_price = EXCLUDED.weighted_avg_price, \
+                    trades = EXCLUDED.trades, \
+                    source = EXCLUDED.source
+                ; \
+                """
+
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.executemany(query, rows)
+                n = cur.rowcount
+            conn.commit()
+
+        return int(n if n is not None and n >= 0 else len(rows))
+
+    def cleanup_ticker_24h(self, exchange_id: int, keep_days: int) -> int:
+        """
+        Удаляет записи ticker_24h старше keep_days (по close_time).
+        Возвращает количество удалённых строк.
+        """
+        exchange_id = int(exchange_id)
+        keep_days = int(keep_days)
+
+        if keep_days <= 0:
+            return 0
+
+        cutoff = datetime.now(timezone.utc) - timedelta(days=keep_days)
+
+        sql = """
+              DELETE \
+              FROM public.ticker_24h
+              WHERE exchange_id = %s
+                AND close_time < %s \
+              """
+
+        try:
+            with self.pool.connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(sql, (exchange_id, cutoff))
+                    deleted = cur.rowcount or 0
+                conn.commit()
+
+            logger.info(
+                "[Retention] ticker_24h cleaned exchange_id=%s keep_days=%s deleted=%s",
+                exchange_id, keep_days, deleted
+            )
+            return int(deleted)
+
+        except Exception:
+            logger.exception("cleanup_ticker_24h failed exchange_id=%s keep_days=%s", exchange_id, keep_days)
+            return 0
+
+
+    def insert_order_fill(self, fill: Any) -> int:
+        return self.insert_order_fills([fill])
+
+    def insert_order_fills(self, fills: Sequence[Any]) -> int:
+        """
+        INSERT fills into public.order_fills.
+
+        OMS invariants:
+          • fill_uid == trade_id (ВСЕГДА)
+          • без trade_id → это НЕ fill
+          • qty / price обязательны
+          • NULL / мусор не пишем
+          • idempotent (ON CONFLICT DO NOTHING)
+        """
+        if not fills:
+            return 0
+
+        sql = """
+              INSERT INTO order_fills (exchange_id, \
+                                       account_id, \
+                                       fill_uid, \
+                                       symbol_id, \
+                                       order_id, \
+                                       trade_id, \
+                                       client_order_id, \
+                                       price, \
+                                       qty, \
+                                       realized_pnl, \
+                                       ts, \
+                                       source)
+              VALUES (%(exchange_id)s, \
+                      %(account_id)s, \
+                      %(fill_uid)s, \
+                      %(symbol_id)s, \
+                      %(order_id)s, \
+                      %(trade_id)s, \
+                      %(client_order_id)s, \
+                      %(price)s, \
+                      %(qty)s, \
+                      %(realized_pnl)s, \
+                      %(ts)s, \
+                      %(source)s) ON CONFLICT (exchange_id, account_id, fill_uid)
+            DO NOTHING; \
+              """
+
+        now = _utcnow()
+
+        def get(obj: Any, key: str, default=None):
+            return obj.get(key, default) if isinstance(obj, dict) else getattr(obj, key, default)
+
+        rows: list[dict[str, Any]] = []
+
+        for f in fills:
+            # ---------------------------
+            # обязательные идентификаторы
+            ex_id = get(f, "exchange_id")
+            acc_id = get(f, "account_id")
+            sym_id = get(f, "symbol_id")
+
+            if ex_id is None or acc_id is None or sym_id is None:
+                continue
+
+            trade_id = get(f, "trade_id")
+            if trade_id is None:
+                # ❌ без trade_id — это не fill
+                continue
+
+            # ---------------------------
+            # 🔒 ЖЁСТКИЙ OMS-инвариант
+            fill_uid = str(trade_id)
+
+            # ---------------------------
+            # price / qty обязательны
+            price = get(f, "price")
+            qty = get(f, "qty")
+
+            if price is None or qty is None:
+                continue
+
+            # ---------------------------
+            # ts нормализация
+            ts = get(f, "ts")
+            if isinstance(ts, (int, float)):
+                # если прилетело в ms
+                ts = datetime.fromtimestamp(ts / 1000, tz=timezone.utc)
+            elif ts is None:
+                ts = now
+
+            rows.append({
+                "exchange_id": int(ex_id),
+                "account_id": int(acc_id),
+                "fill_uid": fill_uid,  # ✅ ВСЕГДА = trade_id
+                "symbol_id": int(sym_id),
+
+                "order_id": str(get(f, "order_id")) if get(f, "order_id") is not None else None,
+                "trade_id": str(trade_id),
+                "client_order_id": (
+                    str(get(f, "client_order_id"))
+                    if get(f, "client_order_id") is not None
+                    else None
+                ),
+
+                "price": price,
+                "qty": qty,
+                "realized_pnl": get(f, "realized_pnl") or 0,
+
+                "ts": ts,
+                "source": get(f, "source") or "ws_user",
+            })
+
+        if not rows:
+            return 0
+
+        return self._exec_many(sql, rows)
+
+
+    def upsert_order_event(self, ev: Any) -> None:
+        # ---------------------------
+        # side normalization
+        side = ev.side
+        if hasattr(side, "name"):
+            side = side.name
+        elif isinstance(side, str):
+            side = side.upper()
+        else:
+            side = None
+
+        # ---------------------------
+        # status / type normalization
+        status = ev.status.name if hasattr(ev.status, "name") else ev.status
+        otype = ev.type.name if hasattr(ev.type, "name") else ev.type
+
+        # ---------------------------
+        # raw_json (NOT NULL-ish)
+        raw = getattr(ev, "raw_json", None) or getattr(ev, "payload", None)
+        if raw is None:
+            raw = {}
+
+        if isinstance(raw, str):
+            raw_json = raw
+        else:
+            try:
+                raw_json = json.dumps(raw, ensure_ascii=False, default=str)
+            except Exception:
+                raw_json = "{}"
+
+        # ---------------------------
+        # recv_ts (NOT NULL)
+        recv_ts = getattr(ev, "recv_ts", None)
+        if isinstance(recv_ts, (int, float)):
+            recv_ts = datetime.fromtimestamp(recv_ts, tz=timezone.utc)
+        elif recv_ts is None:
+            recv_ts = datetime.now(timezone.utc)
+
+        # ---------------------------
+        # обязательные поля
+        if (
+                ev.exchange_id is None
+                or ev.account_id is None
+                or ev.symbol_id is None
+                or ev.order_id is None
+                or ev.ts_ms is None
+        ):
+            return  # не роняем WS
+
+        # стратегия / pos_uid
+        strategy_id = getattr(ev, "strategy_id", None) or "unknown"
+        pos_uid = getattr(ev, "pos_uid", None)
+
+        row = {
+            "exchange_id": int(ev.exchange_id),
+            "account_id": int(ev.account_id),
+            "order_id": str(ev.order_id),
+            "symbol_id": int(ev.symbol_id),
+
+            "client_order_id": getattr(ev, "client_order_id", None),
+            "status": str(status or ""),
+            "side": side,
+            "type": otype,
+            "reduce_only": bool(getattr(ev, "reduce_only", False)),
+            "price": getattr(ev, "price", None),
+            "qty": getattr(ev, "qty", None),
+            "filled_qty": getattr(ev, "filled_qty", None),
+
+            "strategy_id": str(strategy_id),
+            "pos_uid": str(pos_uid) if pos_uid else None,
+
+            "source": getattr(ev, "source", None) or "ws_user",
+            "ts_ms": int(ev.ts_ms),
+
+            "recv_ts": recv_ts,
+            "raw_json": raw_json,
+        }
+
+        query = """
+                INSERT INTO order_events (exchange_id, account_id, order_id, symbol_id, \
+                                          client_order_id, status, side, type, \
+                                          reduce_only, price, qty, filled_qty, \
+                                          strategy_id, pos_uid, \
+                                          source, ts_ms, recv_ts, raw_json)
+                VALUES (%(exchange_id)s, %(account_id)s, %(order_id)s, %(symbol_id)s, \
+                        %(client_order_id)s, %(status)s, %(side)s, %(type)s, \
+                        %(reduce_only)s, %(price)s, %(qty)s, %(filled_qty)s, \
+                        %(strategy_id)s, %(pos_uid)s, \
+                        %(source)s, %(ts_ms)s, %(recv_ts)s, %(raw_json)s) ON CONFLICT (exchange_id, account_id, order_id, ts_ms, status, filled_qty)
+            DO NOTHING; \
+                """
+        self._exec_many(query, [row])
+
+    def exists_order_event(self, *, exchange_id, account_id, order_id, status) -> bool:
+        sql = """
+              SELECT 1
+              FROM order_events
+              WHERE exchange_id = %s
+                AND account_id = %s
+                AND order_id = %s
+                AND status = %s LIMIT 1; \
+              """
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (exchange_id, account_id, order_id, status))
+                return cur.fetchone() is not None
+
+
+    def get_order_by_id(
+            self,
+            *,
+            exchange_id: int,
+            account_id: int,
+            order_id: str,
+        ) -> dict | None:
+        # SQL запрос для поиска ордера по order_id
+        query = """
+            SELECT *
+            FROM orders
+            WHERE exchange_id = %s
+              AND account_id = %s
+              AND order_id = %s
+            LIMIT 1
+        """
+
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                # Выполняем запрос с параметрами
+                cur.execute(query, (int(exchange_id), int(account_id), str(order_id)))
+                row = cur.fetchone()
+
+                # Если ордер найден, возвращаем его как словарь
+                if row:
+                    cols = [d[0] for d in cur.description]
+                    return dict(zip(cols, row))
+
+        # Если ордер не найден
+        return None

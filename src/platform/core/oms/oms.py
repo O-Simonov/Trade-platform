@@ -1,250 +1,254 @@
 # src/platform/core/oms/oms.py
 from __future__ import annotations
 
-import time
 import logging
-from dataclasses import dataclass
-from typing import Optional
+import time
+from typing import Any, Dict, Optional, Tuple
 
 from src.platform.core.models.order import OrderIntent
-from src.platform.core.oms.events import OrderEvent, TradeEvent
-from src.platform.core.oms.preflight import preflight_intent
-from src.platform.core.oms.writer import OmsWriter
-from src.platform.core.oms.aggregate import OrderAggregate
+from src.platform.core.models.enums import Side as ModelSide  # LONG/SHORT/FLAT
+from src.platform.core.oms.decisions import resolve_order, Side as DecSide
+from src.platform.core.oms.events import OrderEvent
 from src.platform.core.position.position_manager import PositionManager
-
-
-_FINAL_STATUSES = {"FILLED", "CANCELED", "REJECTED", "EXPIRED"}
-
-# ----------------------------------------------------------------------
-# Pending submit placeholder (idempotency / WS gaps)
-# ----------------------------------------------------------------------
-@dataclass(slots=True)
-class PendingSubmit:
-    client_order_id: str
-    symbol_id: int
-    strategy_id: str
-    pos_uid: str | None
-    intent: OrderIntent
-    created_ts: float
 
 
 class OrderManager:
     """
-    STEP G.2 / H.1 OrderManager
+    K6.8 OMS
 
     Responsibilities:
-      ✔ route OrderEvent / TradeEvent
-      ✔ append immutable events (order_events / trades)
-      ✔ maintain in-memory OrderAggregate (FSM)
-      ✔ persist order snapshot
-      ✔ maintain PositionAggregate via trades
-      ✔ minimal submit-side idempotency
+      ✔ order lifecycle FSM
+      ✔ pending submit tracking
+      ✔ Order ↔ Position decision (OPEN / REDUCE)
+      ✔ reduceOnly enforcement
+      ✖ NO exchange I/O
     """
 
-    # ------------------------------------------------------------------
-    # init
-    # ------------------------------------------------------------------
+    EPS_QTY_ABS: float = 1e-12
+
     def __init__(
         self,
         *,
-        storage,
+        storage: Any,
         exchange_id: int,
         account_id: int,
+        position_manager: PositionManager,
         logger: logging.Logger | None = None,
     ) -> None:
         self.storage = storage
         self.exchange_id = int(exchange_id)
         self.account_id = int(account_id)
-        self.logger = logger or logging.getLogger(__name__)
+        self.pm = position_manager
+        self.logger = logger or logging.getLogger("oms")
 
-        # persistence only
-        self.writer = OmsWriter(
-            storage=self.storage,
-            logger=self.logger,
-        )
+        # key: (exchange_id, account_id, client_order_id) -> ts
+        self._pending: Dict[Tuple[int, int, str], float] = {}
 
-        # submit-side idempotency
-        self._pending: dict[str, PendingSubmit] = {}
-        self._final_seen: dict[str, float] = {}
+        # remember last OPEN side to allow reduce-only close even if PM lags
+        self._last_open_side: Dict[Tuple[int, int, int], ModelSide] = {}
 
-        # order aggregates (FSM)
-        self._orders: dict[str, OrderAggregate] = {}
+        self.logger.info("[OMS] position_manager_id=%s", id(self.pm))
 
-        # position aggregates (from trades)
-        self.position_manager = PositionManager(
-            storage=self.storage,
-            exchange_id=self.exchange_id,
-            account_id=self.account_id,
-            logger=self.logger,
-        )
+    # ============================================================
+    # Pending submits
+    # ============================================================
 
-    # ------------------------------------------------------------------
-    # submit-side helpers
-    # ------------------------------------------------------------------
-    def should_submit(self, client_order_id: str) -> bool:
-        if not client_order_id:
-            return True
-        if client_order_id in self._pending:
-            return False
-        if client_order_id in self._final_seen:
-            return False
-        return True
-
-    def record_pending_submit(
-        self,
-        *,
-        client_order_id: str,
-        symbol_id: int,
-        strategy_id: str,
-        pos_uid: str | None,
-        intent: OrderIntent,
-    ) -> None:
+    def record_pending_submit(self, *, client_order_id: str) -> None:
         if not client_order_id:
             return
+        key = (self.exchange_id, self.account_id, str(client_order_id))
+        self._pending[key] = time.time()
 
-        self._pending[client_order_id] = PendingSubmit(
-            client_order_id=client_order_id,
-            symbol_id=int(symbol_id),
-            strategy_id=str(strategy_id or "unknown"),
-            pos_uid=str(pos_uid) if pos_uid else None,
-            intent=intent,
-            created_ts=time.time(),
-        )
+    def should_submit(self, client_order_id: str) -> bool:
+        if not client_order_id:
+            return False
+        key = (self.exchange_id, self.account_id, str(client_order_id))
+        return key not in self._pending
 
     def reconcile_pending_timeouts(self, timeout_sec: float) -> int:
         now = time.time()
-        timeout = float(timeout_sec or 20)
+        timeout_sec = float(timeout_sec or 0.0)
+        if timeout_sec <= 0:
+            return 0
 
-        expired: list[str] = []
-        for cid, p in list(self._pending.items()):
-            if now - p.created_ts >= timeout:
-                expired.append(cid)
+        removed = 0
+        for key, ts in list(self._pending.items()):
+            if now - float(ts or 0.0) >= timeout_sec:
+                self._pending.pop(key, None)
+                removed += 1
+                ex, acc, cid = key
+                self.logger.warning("[OMS] pending timeout ex=%s acc=%s cid=%s", ex, acc, cid)
+        return removed
 
-        for cid in expired:
-            self._pending.pop(cid, None)
-            self._final_seen[cid] = now
+    # ============================================================
+    # WS → OMS
+    # ============================================================
 
-        return len(expired)
-
-    # ------------------------------------------------------------------
-    # event ingestion
-    # ------------------------------------------------------------------
-    def apply_event(self, ev: object) -> None:
-        if isinstance(ev, OrderEvent):
-            self.on_order_event(ev)
-        elif isinstance(ev, TradeEvent):
-            self.on_trade_event(ev)
-        else:
-            self.logger.debug("[OMS] ignored unknown event=%s", type(ev))
-
-    # ------------------------------------------------------------------
-    # order events
-    # ------------------------------------------------------------------
-    def on_order_event(self, evt: OrderEvent) -> None:
+    def apply_event(self, ev: OrderEvent) -> None:
         """
-        OrderEvent flow (STEP G.2):
-
-          1) normalize routing ids
-          2) persist immutable event
-          3) apply to OrderAggregate (FSM)
-          4) persist order snapshot
+        Any ORDER_EVENT with client_order_id clears pending.
         """
+        cid = getattr(ev, "client_order_id", None)
+        if not cid:
+            return
+        ex = int(getattr(ev, "exchange_id", 0) or self.exchange_id)
+        acc = int(getattr(ev, "account_id", 0) or self.account_id)
+        key = (ex, acc, str(cid))
+        self._pending.pop(key, None)
 
-        # normalize routing ids
-        evt.exchange_id = int(evt.exchange_id or self.exchange_id)
-        evt.account_id = int(evt.account_id or self.account_id)
+    # ============================================================
+    # helpers
+    # ============================================================
 
-        # 1️⃣ immutable log
-        self.writer.append_order_event(evt)
+    @staticmethod
+    def _to_dec_side(v: Any) -> DecSide:
+        if v is None:
+            return DecSide.FLAT
+        if isinstance(v, DecSide):
+            return v
+        s = str(v).strip().upper()
+        if s in ("LONG", "BUY"):
+            return DecSide.LONG
+        if s in ("SHORT", "SELL"):
+            return DecSide.SHORT
+        return DecSide.FLAT
 
-        oid = str(evt.order_id)
-
-        # 2️⃣ aggregate / FSM
-        agg = self._orders.get(oid)
-        if agg is None:
-            agg = OrderAggregate.from_event(evt)
-            self._orders[oid] = agg
-        else:
-            changed = agg.apply(evt)
-            if not changed:
-                return
-
-        # mark final for idempotency
-        if agg.status in _FINAL_STATUSES and agg.client_order_id:
-            self._final_seen[agg.client_order_id] = time.time()
-            self._pending.pop(agg.client_order_id, None)
-
-        # 3️⃣ snapshot
-        self.writer.upsert_order_snapshot(agg)
-
-    # ------------------------------------------------------------------
-    # trade events (fills)
-    # ------------------------------------------------------------------
-    def on_trade_event(self, evt: TradeEvent) -> None:
-        """
-        TradeEvent flow (STEP H).
-
-        1) normalize routing ids
-        2) persist immutable trade
-        3) apply to PositionAggregate
-        4) persist position snapshot if changed.
-        """
-
-        # normalize routing ids
-        evt.exchange_id = int(evt.exchange_id or self.exchange_id)
-        evt.account_id = int(evt.account_id or self.account_id)
-
-        # immutable trade log
-        self.writer.write_trade(evt)
-
-        # update in-memory position
-        pos = self.position_manager.on_trade_event(evt)
-
-        if pos is not None:
-            # explicitly tell type checker what pos is
-            assert pos.symbol_id is not None
-
-            try:
-                self.storage.upsert_positions([pos.to_row()])
-            except Exception:
-                self.logger.exception(
-                    "[POS][SNAPSHOT] upsert failed symbol_id=%s",
-                    pos.symbol_id,
-                )
-
+    @staticmethod
+    def _to_model_side(v: Any) -> Optional[ModelSide]:
+        if v is None:
+            return None
+        if isinstance(v, ModelSide):
+            return v
+        s = str(v).strip().upper()
+        if s in ("LONG", "BUY"):
+            return ModelSide.LONG
+        if s in ("SHORT", "SELL"):
+            return ModelSide.SHORT
+        if s == "FLAT":
+            return ModelSide.FLAT
         return None
 
-    # ------------------------------------------------------------------
-    # submit preflight
-    # ------------------------------------------------------------------
-    def preflight(
-        self,
-        *,
-        symbol: str,
-        symbol_id: int,
-        intent: OrderIntent,
-        last_price: float,
-        logger=None,
-    ) -> Optional[OrderIntent]:
-        """
-        Normalize intent (qty/price rounding, minNotional, etc.).
-        """
+    @staticmethod
+    def _opposite_model_side(s: ModelSide) -> ModelSide:
+        if s == ModelSide.LONG:
+            return ModelSide.SHORT
+        if s == ModelSide.SHORT:
+            return ModelSide.LONG
+        # if unknown -> safe default (reduceOnly will protect)
+        return ModelSide.SHORT
+
+    @staticmethod
+    def _qty_abs(v: Any) -> float:
         try:
-            filters = self.storage.get_symbol_filters(
-                exchange_id=self.exchange_id,
-                symbol_id=int(symbol_id),
-            )
+            return abs(float(v or 0.0))
         except Exception:
-            self.logger.exception(
-                "[OMS][PREFLIGHT] get_symbol_filters failed symbol=%s",
-                symbol,
-            )
+            return 0.0
+
+    # ============================================================
+    # Intent resolution (Strategy → OMS decision)
+    # ============================================================
+
+    def resolve_intent(self, intent: OrderIntent) -> Optional[OrderIntent]:
+        if intent is None:
             return None
 
-        return preflight_intent(
-            intent=intent,
-            last_price=float(last_price or 0.0),
-            filters=filters,
-            logger=logger or self.logger,
+        sym = str(getattr(intent, "symbol", "") or "").upper()
+        qty_req = float(getattr(intent, "qty", 0.0) or 0.0)
+        if not sym or qty_req <= 0.0:
+            return None
+
+        symbol_id = int(getattr(intent, "symbol_id", 0) or 0)
+        if symbol_id <= 0:
+            return None
+
+        reduce_only_requested = bool(getattr(intent, "reduce_only", False))
+
+        # ----- current position from PM -----
+        agg = self.pm.get(self.exchange_id, self.account_id, symbol_id)
+
+        pos_qty_abs = 0.0
+        pos_side_model = ModelSide.FLAT
+        pos_side_dec = DecSide.FLAT
+
+        if agg is not None:
+            pos_qty_abs = self._qty_abs(getattr(agg, "qty", 0.0))
+            ms = self._to_model_side(getattr(agg, "side", None))
+            if ms is not None:
+                pos_side_model = ms
+            pos_side_dec = self._to_dec_side(pos_side_model)
+
+        if pos_qty_abs <= self.EPS_QTY_ABS:
+            pos_qty_abs = 0.0
+            pos_side_model = ModelSide.FLAT
+            pos_side_dec = DecSide.FLAT
+
+        # ----- requested side -----
+        req_model_side = self._to_model_side(getattr(intent, "side", None))
+
+        # If side missing but reduceOnly=True -> compute close side
+        if req_model_side is None and reduce_only_requested:
+            key = (self.exchange_id, self.account_id, symbol_id)
+
+            if pos_side_model in (ModelSide.LONG, ModelSide.SHORT) and pos_qty_abs > 0.0:
+                req_model_side = self._opposite_model_side(pos_side_model)
+            elif key in self._last_open_side:
+                req_model_side = self._opposite_model_side(self._last_open_side[key])
+            else:
+                req_model_side = ModelSide.SHORT  # safe default
+
+            # IMPORTANT: set into intent so Exchange will never see None
+            intent.side = req_model_side
+
+        if req_model_side is None:
+            self.logger.warning("[OMS][BLOCK] %s reason=missing_side", sym)
+            return None
+
+        order_side_dec = self._to_dec_side(req_model_side)
+
+        dec = resolve_order(
+            pos_side=pos_side_dec,
+            pos_qty=pos_qty_abs,
+            order_side=order_side_dec,
+            order_qty=qty_req,
         )
+
+        if not dec.allowed:
+            self.logger.warning("[OMS][BLOCK] %s reason=%s", sym, dec.reason)
+            return None
+
+        # Safe override: reduceOnly close even if PM says FLAT (WS lag)
+        if reduce_only_requested and dec.mode == "OPEN":
+            dec.mode = "REDUCE"
+            dec.reduce_only = True
+            dec.qty = qty_req
+            self.logger.warning(
+                "[OMS][SAFE OVERRIDE] %s reduceOnly requested but PM is FLAT → send reduceOnly anyway",
+                sym,
+            )
+
+        # persist normalized
+        intent.qty = float(dec.qty)
+        intent.reduce_only = bool(dec.reduce_only)
+        intent.side = req_model_side  # ensure not None
+
+        # remember last_open_side for laggy closes
+        if dec.mode == "OPEN" and req_model_side in (ModelSide.LONG, ModelSide.SHORT):
+            self._last_open_side[(self.exchange_id, self.account_id, symbol_id)] = req_model_side
+
+        if dec.mode == "OPEN":
+            self.logger.info(
+                "[OMS][OPEN] %s %s qty=%.6f reduce_only=%s",
+                sym, req_model_side, intent.qty, intent.reduce_only
+            )
+        elif dec.mode == "REDUCE":
+            self.logger.info(
+                "[OMS][REDUCE] %s %s qty=%.6f reduce_only=%s",
+                sym, req_model_side, intent.qty, intent.reduce_only
+            )
+        else:
+            self.logger.info(
+                "[OMS] %s mode=%s side=%s qty=%.6f reduce_only=%s",
+                sym, dec.mode, req_model_side, intent.qty, intent.reduce_only
+            )
+
+        return intent

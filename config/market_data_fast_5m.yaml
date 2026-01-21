@@ -1,0 +1,95 @@
+# FAST PROCESS: minimal REST load, WS candles (1m/5m) + liquidations
+# Purpose:
+#   - seed 2 days by REST for 1m/5m
+#   - then maintain via WS kline streams
+#   - liquidations fast flush
+# Notes:
+#   - Universe + SymbolFilters are handled by SLOW (no duplicates)
+#   - Retention is handled by SLOW
+
+exchange: binance
+exchange_id: 1
+
+rest_limits:
+  max_rps: 4.0
+  max_rpm: 450
+  force: true
+
+startup_stagger:
+  after_candles: 0.4
+  after_liquidations: 0.3
+
+# Universe handled by SLOW
+universe:
+  enabled: false
+
+# Filters handled by SLOW
+symbol_filters:
+  enabled: false
+
+symbols_refresh:
+  refresh_sec: 60
+
+market_data:
+  enabled: true
+  candle_intervals: ["1m", "5m"]
+
+  # ✅ REST seed to fill last 2 days fast
+  seed_on_start: true
+  seed_days: 2
+  seed_limit: 1500
+
+  # ✅ minimum pages for 1m (2 days) is usually 2+
+  seed_max_pages_per_symbol: 2
+  seed_symbols_per_cycle: 10
+  per_request_sleep_sec: 0.10
+
+  # ✅ WS for continuous updates
+  use_ws: true
+  ws_max_streams_per_conn: 60
+  update_open_candle: false
+
+  lookback_days_if_empty: 2
+  refresh_symbols_sec: 300
+
+# ✅ liquidations fast
+liquidations:
+  enabled: true
+  flush_sec: 2.0
+
+# optional: only for a few symbols, usually OFF
+market_data_active:
+  enabled: false
+  candle_intervals: ["1m"]
+  extra_symbols: ["BTCUSDT", "ETHUSDT"]
+  poll_sec: 30
+  symbols_per_cycle: 2
+  req_sleep_sec: 0.30
+  max_active_symbols: 10
+  seed_on_start: false
+  klines_limit: 2
+
+# everything heavy = OFF in FAST
+open_interest:
+  enabled: false
+
+funding:
+  enabled: false
+
+ticker_24h:
+  enabled: false
+
+market_trades:
+  enabled: false
+
+market_trades_all:
+  enabled: false
+
+market_state_5m:
+  enabled: false
+
+candles_gap_repair:
+  enabled: false
+
+retention:
+  enabled: false

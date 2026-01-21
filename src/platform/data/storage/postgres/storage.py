@@ -7,7 +7,8 @@ import time
 import logging
 from datetime import datetime,timezone,timedelta
 from typing import Any,Iterable,Sequence,Mapping,List,Tuple,Dict,Optional
-
+from psycopg.types.json import Jsonb
+from psycopg2.extras import execute_values
 
 
 
@@ -271,7 +272,6 @@ class PostgreSQLStorage:
         out.update(symbol_ids)
         return out
 
-
     def upsert_symbols(
             self,
             *,
@@ -297,21 +297,39 @@ class PostgreSQLStorage:
                          RETURNING symbol, symbol_id;
                      """
 
+        # ✅ Деактивация отсутствующих в universe:
+        #   - is_active = FALSE
+        #   - status = 'DELISTED'
+        #   - last_seen_at гарантированно не NULL
         sql_deactivate_missing = """
                                  UPDATE symbols
-                                 SET is_active = FALSE
+                                 SET is_active    = FALSE,
+                                     status       = 'DELISTED',
+                                     last_seen_at = COALESCE(last_seen_at, NOW())
                                  WHERE exchange_id = %(exchange_id)s
-                                   AND NOT (symbol = ANY (%(symbols)s::text[]));
+                                   AND is_active = TRUE
+                                   AND NOT (symbol = ANY (%(symbols)s::text[])); \
                                  """
 
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
-                cur.execute(sql_upsert, {"exchange_id": int(exchange_id), "symbols": symbols_norm})
+                cur.execute(
+                    sql_upsert,
+                    {
+                        "exchange_id": int(exchange_id),
+                        "symbols": symbols_norm,
+                    },
+                )
                 rows = cur.fetchall() or []
 
                 if deactivate_missing:
-                    # помечаем отсутствующие как неактивные
-                    cur.execute(sql_deactivate_missing, {"exchange_id": int(exchange_id), "symbols": symbols_norm})
+                    cur.execute(
+                        sql_deactivate_missing,
+                        {
+                            "exchange_id": int(exchange_id),
+                            "symbols": symbols_norm,
+                        },
+                    )
 
             conn.commit()
 
@@ -1366,51 +1384,70 @@ class PostgreSQLStorage:
 
         return [dict(zip(cols, r)) for r in rows]
 
+
+
     def upsert_candles(self, rows: list[dict]) -> int:
-        """
-        Bulk upsert candles into public.candles.
-        """
         if not rows:
             return 0
 
-        query = """
-                INSERT INTO candles (exchange_id, \
-                                     symbol_id, \
-                                     interval, \
-                                     open_time, \
-                                     open, \
-                                     high, \
-                                     low, \
-                                     close, \
-                                     volume, \
-                                     source)
-                VALUES (%(exchange_id)s, \
-                        %(symbol_id)s, \
-                        %(interval)s, \
-                        %(open_time)s, \
-                        %(open)s, \
-                        %(high)s, \
-                        %(low)s, \
-                        %(close)s, \
-                        %(volume)s, \
-                        %(source)s) ON CONFLICT (exchange_id, symbol_id, interval, open_time)
+        now = datetime.now(timezone.utc)
+        for r in rows:
+            r.setdefault("quote_volume", None)
+            r.setdefault("trades", None)
+            r.setdefault("taker_buy_base", None)
+            r.setdefault("taker_buy_quote", None)
+            r.setdefault("taker_sell_base", None)
+            r.setdefault("taker_sell_quote", None)
+            r.setdefault("delta_quote", None)
+            r.setdefault("delta_base", None)
+            r.setdefault("cvd_quote", None)
+            r.setdefault("source", "unknown")
+            r.setdefault("updated_at", now)
+
+        sql = """
+              INSERT INTO candles (exchange_id, symbol_id, interval, open_time, \
+                                   open, high, low, close, volume, \
+                                   quote_volume, trades, \
+                                   taker_buy_base, taker_buy_quote, \
+                                   taker_sell_base, taker_sell_quote, \
+                                   delta_quote, delta_base, \
+                                   cvd_quote, \
+                                   source, updated_at)
+              VALUES (%(exchange_id)s, %(symbol_id)s, %(interval)s, %(open_time)s, \
+                      %(open)s, %(high)s, %(low)s, %(close)s, %(volume)s, \
+                      %(quote_volume)s, %(trades)s, \
+                      %(taker_buy_base)s, %(taker_buy_quote)s, \
+                      %(taker_sell_base)s, %(taker_sell_quote)s, \
+                      %(delta_quote)s, %(delta_base)s, \
+                      %(cvd_quote)s, \
+                      %(source)s, %(updated_at)s) ON CONFLICT (exchange_id, symbol_id, interval, open_time)
         DO \
-                UPDATE SET \
-                    open = EXCLUDED.open, \
-                    high = EXCLUDED.high, \
-                    low = EXCLUDED.low, \
-                    close = EXCLUDED.close, \
-                    volume = EXCLUDED.volume \
-                """
+              UPDATE SET \
+                  open = EXCLUDED.open, \
+                  high = EXCLUDED.high, \
+                  low = EXCLUDED.low, \
+                  close = EXCLUDED.close, \
+                  volume = EXCLUDED.volume, \
+
+                  quote_volume = COALESCE (EXCLUDED.quote_volume, candles.quote_volume), \
+                  trades = COALESCE (EXCLUDED.trades, candles.trades), \
+                  taker_buy_base = COALESCE (EXCLUDED.taker_buy_base, candles.taker_buy_base), \
+                  taker_buy_quote = COALESCE (EXCLUDED.taker_buy_quote, candles.taker_buy_quote), \
+                  taker_sell_base = COALESCE (EXCLUDED.taker_sell_base, candles.taker_sell_base), \
+                  taker_sell_quote = COALESCE (EXCLUDED.taker_sell_quote, candles.taker_sell_quote), \
+                  delta_quote = COALESCE (EXCLUDED.delta_quote, candles.delta_quote), \
+                  delta_base = COALESCE (EXCLUDED.delta_base, candles.delta_base), \
+                  cvd_quote = COALESCE (EXCLUDED.cvd_quote, candles.cvd_quote), \
+                  source = EXCLUDED.source, \
+                  updated_at = GREATEST(candles.updated_at, EXCLUDED.updated_at) \
+              """
 
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
-                cur.executemany(query, rows)
-                n = cur.rowcount
+                cur.executemany(sql, rows)
             conn.commit()
 
-        return int(n or 0)
-
+        return len(rows)
 
     def get_candles_watermarks(self, *, exchange_id: int, intervals: List[str]) -> Dict[Tuple[int, str], datetime]:
         """
@@ -1640,12 +1677,153 @@ class PostgreSQLStorage:
             conn.commit()
 
     def exec_ddl(self, sql: str) -> None:
-        """Execute DDL SQL that may contain multiple statements."""
+        """Execute DDL SQL that may contain multiple statements.
+
+        Supports:
+          - multiple statements separated by ';'
+          - DO $$ ... $$; and DO $tag$ ... $tag$; blocks
+          - CREATE FUNCTION/PROCEDURE with dollar-quoting
+          - ignores ';' inside quotes and dollar-quoted blocks
+          - ignores '-- line comments' and '/* block comments */'
+        """
         if not sql:
             return
 
-        # very simple splitter by ';'
-        statements = [s.strip() for s in sql.split(";") if s.strip()]
+        def _split_sql_statements(script: str) -> list[str]:
+            s = script
+            out: list[str] = []
+            buf: list[str] = []
+
+            i = 0
+            n = len(s)
+
+            in_squote = False  # '...'
+            in_dquote = False  # "..."
+            in_line_comment = False  # -- ....
+            in_block_comment = False  # /* ... */
+            dollar_tag: str | None = None  # '$$' or '$tag$'
+
+            def startswith_at(prefix: str) -> bool:
+                return s.startswith(prefix, i)
+
+            def flush():
+                stmt = "".join(buf).strip()
+                if stmt:
+                    out.append(stmt)
+                buf.clear()
+
+            while i < n:
+                ch = s[i]
+
+                # -------- comments handling --------
+                if in_line_comment:
+                    buf.append(ch)
+                    if ch == "\n":
+                        in_line_comment = False
+                    i += 1
+                    continue
+
+                if in_block_comment:
+                    buf.append(ch)
+                    if startswith_at("*/"):
+                        buf.append("*")  # we already added current char; add '*'? (we'll handle properly below)
+                    # simpler: detect end and consume both chars
+                    if startswith_at("*/"):
+                        # we already appended ch ('*' maybe not), so do exact consume:
+                        buf.pop()  # remove current ch, we will append full "*/"
+                        buf.append("*/")
+                        i += 2
+                        in_block_comment = False
+                        continue
+                    i += 1
+                    continue
+
+                # start of comments (only if not inside quotes/dollar)
+                if not in_squote and not in_dquote and dollar_tag is None:
+                    if startswith_at("--"):
+                        buf.append("--")
+                        i += 2
+                        in_line_comment = True
+                        continue
+                    if startswith_at("/*"):
+                        buf.append("/*")
+                        i += 2
+                        in_block_comment = True
+                        continue
+
+                # -------- dollar-quoted blocks --------
+                if not in_squote and not in_dquote:
+                    if dollar_tag is not None:
+                        # check if we are closing the tag
+                        if s.startswith(dollar_tag, i):
+                            buf.append(dollar_tag)
+                            i += len(dollar_tag)
+                            dollar_tag = None
+                            continue
+                        # otherwise just consume
+                        buf.append(ch)
+                        i += 1
+                        continue
+                    else:
+                        # detect opening dollar tag: $...$
+                        if ch == "$":
+                            j = i + 1
+                            # find next '$' to close tag header
+                            while j < n and s[j] != "$":
+                                # allowed tag chars: letters/digits/underscore (but we can be permissive)
+                                j += 1
+                            if j < n and s[j] == "$":
+                                tag = s[i: j + 1]  # includes both '$'
+                                # start dollar mode
+                                dollar_tag = tag
+                                buf.append(tag)
+                                i = j + 1
+                                continue
+
+                # -------- string quotes --------
+                if dollar_tag is None:
+                    if not in_dquote and ch == "'":
+                        buf.append(ch)
+                        if in_squote:
+                            # handle escaped '' inside single-quote
+                            if i + 1 < n and s[i + 1] == "'":
+                                # stays inside string, consume both
+                                buf.append("'")
+                                i += 2
+                                continue
+                            in_squote = False
+                        else:
+                            in_squote = True
+                        i += 1
+                        continue
+
+                    if not in_squote and ch == '"':
+                        buf.append(ch)
+                        # double quotes escape by "" (rare, but handle)
+                        if in_dquote:
+                            if i + 1 < n and s[i + 1] == '"':
+                                buf.append('"')
+                                i += 2
+                                continue
+                            in_dquote = False
+                        else:
+                            in_dquote = True
+                        i += 1
+                        continue
+
+                # -------- statement boundary --------
+                if ch == ";" and not in_squote and not in_dquote and dollar_tag is None:
+                    flush()
+                    i += 1
+                    continue
+
+                buf.append(ch)
+                i += 1
+
+            flush()
+            return out
+
+        statements = _split_sql_statements(sql)
 
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
@@ -1848,26 +2026,24 @@ class PostgreSQLStorage:
             return 0
 
         query = """
-            INSERT INTO open_interest (
-                exchange_id, symbol_id, interval, ts,
-                open_interest, open_interest_value, source
-            )
-            VALUES (
-                %(exchange_id)s, %(symbol_id)s, %(interval)s, %(ts)s,
-                %(open_interest)s, %(open_interest_value)s, %(source)s
-            )
-            ON CONFLICT (exchange_id, symbol_id, interval, ts)
-            DO UPDATE SET
-                open_interest       = EXCLUDED.open_interest,
-                open_interest_value = EXCLUDED.open_interest_value,
-                source              = EXCLUDED.source
-        """
+                INSERT INTO open_interest (exchange_id, symbol_id, interval, ts, \
+                                           open_interest, open_interest_value, source)
+                VALUES (%(exchange_id)s, %(symbol_id)s, %(interval)s, %(ts)s, \
+                        %(open_interest)s, %(open_interest_value)s, %(source)s) ON CONFLICT (exchange_id, symbol_id, interval, ts)
+            DO \
+                UPDATE SET
+                    open_interest = EXCLUDED.open_interest, \
+                    open_interest_value = EXCLUDED.open_interest_value, \
+                    source = EXCLUDED.source \
+                """
+
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.executemany(query, rows)
-                n = cur.rowcount
             conn.commit()
-        return int(n or 0)
+
+        # ВАЖНО: rowcount может врать -> возвращаем len(rows)
+        return len(rows)
 
     def cleanup_funding(self, *, exchange_id: int, keep_days: int) -> int:
         keep_days = int(keep_days)
@@ -2240,3 +2416,297 @@ class PostgreSQLStorage:
 
         # Если ордер не найден
         return None
+
+    def insert_liquidation_events(self, rows: list[dict]) -> int:
+        if not rows:
+            return 0
+
+        from psycopg.types.json import Jsonb  # локально, чтобы точно работало
+
+        sql = """
+              INSERT INTO liquidation_events (exchange_id, symbol_id, ts, event_ms, \
+                                              side, price, qty, filled_qty, avg_price, \
+                                              status, order_type, time_in_force, \
+                                              notional, is_long_liq, raw_json)
+              VALUES (%(exchange_id)s, %(symbol_id)s, %(ts)s, %(event_ms)s, \
+                      %(side)s, %(price)s, %(qty)s, %(filled_qty)s, %(avg_price)s, \
+                      %(status)s, %(order_type)s, %(time_in_force)s, \
+                      %(notional)s, %(is_long_liq)s, %(raw_json)s) ON CONFLICT DO NOTHING \
+              """
+
+        fixed = []
+        for r in rows:
+            rr = dict(r)
+            # raw_json может быть dict/list -> оборачиваем в Jsonb
+            rr["raw_json"] = Jsonb(rr.get("raw_json"))
+            fixed.append(rr)
+
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.executemany(sql, fixed)
+            conn.commit()
+        return len(fixed)
+
+
+    def upsert_liquidation_1m(self, rows: list[dict]) -> int:
+        if not rows:
+            return 0
+
+        sql = """
+              INSERT INTO liquidation_1m (exchange_id, symbol_id, bucket_ts, \
+                                          long_notional, short_notional, long_qty, short_qty, events, updated_at)
+              VALUES (%(exchange_id)s, %(symbol_id)s, %(bucket_ts)s, \
+                      %(long_notional)s, %(short_notional)s, %(long_qty)s, %(short_qty)s, %(events)s, %(updated_at)s) ON CONFLICT (exchange_id, symbol_id, bucket_ts)
+        DO \
+              UPDATE SET
+                  long_notional = liquidation_1m.long_notional + EXCLUDED.long_notional, \
+                  short_notional = liquidation_1m.short_notional + EXCLUDED.short_notional, \
+                  long_qty = liquidation_1m.long_qty + EXCLUDED.long_qty, \
+                  short_qty = liquidation_1m.short_qty + EXCLUDED.short_qty, \
+                  events = liquidation_1m.events + EXCLUDED.events, \
+                  updated_at = EXCLUDED.updated_at \
+              """
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.executemany(sql, rows)
+            conn.commit()
+        return len(rows)
+
+
+    def cleanup_market_state_5m(self, *, exchange_id: int, keep_days: int) -> int:
+        """
+        Удаляет старые записи из market_state_5m.
+        keep_days: сколько дней хранить.
+        """
+        keep_days = int(keep_days)
+        if keep_days <= 0:
+            return 0
+
+        sql = """
+              DELETE \
+              FROM market_state_5m
+              WHERE exchange_id = %(exchange_id)s
+                AND open_time < now() - (%(keep_days)s || ' days')::interval \
+              """
+
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, {"exchange_id": int(exchange_id), "keep_days": keep_days})
+                deleted = cur.rowcount or 0
+            conn.commit()
+
+        return int(deleted)
+
+    def get_open_interest_watermarks_bulk(self, exchange_id: int, intervals: list[str]) -> dict[
+        str, dict[int, datetime]]:
+        """
+        Возвращает watermarks (MAX ts) по каждому symbol_id и interval одним SQL запросом.
+        out: { "5m": {symbol_id: ts, ...}, "15m": {...}, ... }
+        """
+        exchange_id = int(exchange_id)
+        intervals = list(intervals or [])
+        if not intervals:
+            return {}
+
+        sql = """
+              SELECT interval, symbol_id, MAX (ts) AS last_ts
+              FROM open_interest
+              WHERE exchange_id = %s
+                AND interval = ANY (%s)
+              GROUP BY interval, symbol_id \
+              """
+
+        out: dict[str, dict[int, datetime]] = {iv: {} for iv in intervals}
+
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (exchange_id, intervals))
+                for interval, symbol_id, last_ts in cur.fetchall():
+                    if last_ts is None:
+                        continue
+                    out[str(interval)][int(symbol_id)] = last_ts
+
+        return out
+
+    # ============================================================
+    # SYMBOL HELPERS (for collectors)
+    # ============================================================
+
+    def list_active_symbol_ids(self, exchange_id: int) -> list[int]:
+        """
+        Быстрый список активных symbol_id для exchange.
+        Используется collectors (OI/MarketState/etc).
+        """
+        sql = """
+        SELECT symbol_id
+        FROM symbols
+        WHERE exchange_id = %s AND is_active = true
+        ORDER BY symbol_id
+        """
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (int(exchange_id),))
+                rows = cur.fetchall() or []
+        return [int(r[0]) for r in rows]
+
+    def list_active_symbols_map(self, exchange_id: int) -> dict[str, int]:
+        """
+        {SYMBOL: symbol_id} только активные.
+        """
+        sql = """
+        SELECT symbol, symbol_id
+        FROM symbols
+        WHERE exchange_id = %s AND is_active = true
+        ORDER BY symbol
+        """
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (int(exchange_id),))
+                rows = cur.fetchall() or []
+        return {str(sym).upper(): int(sid) for sym, sid in rows}
+
+    def get_symbol_name(self, symbol_id: int) -> str | None:
+        """
+        Возвращает "BTCUSDT" по symbol_id.
+        Нужно для OpenInterest collector и любых REST коллекоров.
+        """
+        sql = "SELECT symbol FROM symbols WHERE symbol_id = %s"
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (int(symbol_id),))
+                row = cur.fetchone()
+        if not row:
+            return None
+        return str(row[0]).upper()
+
+
+    def cleanup_market_trades(
+            self,
+            *,
+            exchange_id: int,
+            keep_days: int,
+            batch_size: int = 50_000,
+            sleep_sec: float = 0.05,
+            max_batches: int = 0,
+    ) -> int:
+        """
+        ✅ Batched cleanup для market_trades по ts.
+
+        - keep_days <= 0 => skip
+        - batch_size: сколько строк удаляем за раз
+        - sleep_sec: пауза между батчами
+        - max_batches: 0 = без лимита, иначе ограничим число батчей за 1 запуск (полезно для safety)
+        """
+        keep_days = int(keep_days)
+        if keep_days <= 0:
+            return 0
+
+        batch_size = max(1000, int(batch_size))
+        sleep_sec = max(0.0, float(sleep_sec))
+        max_batches = int(max_batches or 0)
+
+        total_deleted = 0
+        batches = 0
+
+        sql = """
+              WITH del AS (SELECT ctid \
+                           FROM market_trades \
+                           WHERE exchange_id = %(exchange_id)s \
+                             AND ts < now() - (%(keep_days)s || ' days'):: interval
+                  LIMIT %(batch_size)s
+                  )
+              DELETE \
+              FROM market_trades
+              WHERE ctid IN (SELECT ctid FROM del); \
+              """
+
+        while True:
+            with self.pool.connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        sql,
+                        {
+                            "exchange_id": int(exchange_id),
+                            "keep_days": keep_days,
+                            "batch_size": batch_size,
+                        },
+                    )
+                    deleted = int(cur.rowcount or 0)
+                conn.commit()
+
+            if deleted <= 0:
+                break
+
+            total_deleted += deleted
+            batches += 1
+
+            if max_batches > 0 and batches >= max_batches:
+                break
+
+            if sleep_sec > 0:
+                time.sleep(sleep_sec)
+
+        return total_deleted
+
+    def cleanup_candles_trades_agg(
+            self,
+            *,
+            exchange_id: int,
+            keep_days: int,
+            batch_size: int = 50_000,
+            sleep_sec: float = 0.05,
+            max_batches: int = 0,
+    ) -> int:
+        """
+        ✅ Batched cleanup для candles_trades_agg по open_time.
+        """
+        keep_days = int(keep_days)
+        if keep_days <= 0:
+            return 0
+
+        batch_size = max(1000, int(batch_size))
+        sleep_sec = max(0.0, float(sleep_sec))
+        max_batches = int(max_batches or 0)
+
+        total_deleted = 0
+        batches = 0
+
+        sql = """
+              WITH del AS (SELECT ctid \
+                           FROM candles_trades_agg \
+                           WHERE exchange_id = %(exchange_id)s \
+                             AND open_time < now() - (%(keep_days)s || ' days'):: interval
+                  LIMIT %(batch_size)s
+                  )
+              DELETE \
+              FROM candles_trades_agg
+              WHERE ctid IN (SELECT ctid FROM del); \
+              """
+
+        while True:
+            with self.pool.connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        sql,
+                        {
+                            "exchange_id": int(exchange_id),
+                            "keep_days": keep_days,
+                            "batch_size": batch_size,
+                        },
+                    )
+                    deleted = int(cur.rowcount or 0)
+                conn.commit()
+
+            if deleted <= 0:
+                break
+
+            total_deleted += deleted
+            batches += 1
+
+            if max_batches > 0 and batches >= max_batches:
+                break
+
+            if sleep_sec > 0:
+                time.sleep(sleep_sec)
+
+        return total_deleted

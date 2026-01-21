@@ -20,15 +20,17 @@ class BinanceWS(threading.Thread):
     Простая WS-обёртка с автопереподключением.
 
     Важно:
-      ✅ разворачивает combined streams {"stream": "...", "data": {...}} -> отдаёт payload=data
+      ✅ combined streams {"stream": "...", "data": {...}} -> отдаёт payload=data
+      ✅ combined streams {"stream": "...", "data": [ {...}, {...} ]} -> отдаёт payload=list
       ✅ ловит исключения callback-а и логирует (иначе OMS может молча не получать события)
+      ✅ stop() корректно завершает цикл
     """
 
     def __init__(
         self,
         *,
         url: str,
-        on_message: Callable[[dict[str, Any]], None],
+        on_message: Callable[[Any], None],
         name: str = "BinanceWS",
         on_open: Optional[Callable[[], None]] = None,
         on_close: Optional[Callable[[], None]] = None,
@@ -37,7 +39,7 @@ class BinanceWS(threading.Thread):
         reconnect_delay_sec: float = 2.0,
     ):
         super().__init__(daemon=True, name=name)
-        self.url = url
+        self.url = str(url)
         self.on_message_cb = on_message
 
         self._ws: websocket.WebSocketApp | None = None
@@ -76,6 +78,9 @@ class BinanceWS(threading.Thread):
             # error не всегда означает close, поэтому connected не трогаем тут
             log.error("[%s] WS ERROR: %s", self.name, err)
 
+        # небольшой backoff можно постепенно увеличивать (если хочешь)
+        backoff = max(0.1, self._reconnect_delay_sec)
+
         while not self._stop.is_set():
             try:
                 self._ws = websocket.WebSocketApp(
@@ -85,22 +90,30 @@ class BinanceWS(threading.Thread):
                     on_error=_on_error,
                     on_close=_on_close,
                 )
+
+                # ws.run_forever блокирующий — выходим только когда сокет разорвётся
                 self._ws.run_forever(
                     ping_interval=self._ping_interval,
                     ping_timeout=self._ping_timeout,
                 )
+
             except Exception as e:
                 self.connected.clear()
                 log.exception("[%s] WS exception: %s", self.name, e)
 
-            # backoff перед переподключением
             if self._stop.is_set():
                 break
-            time.sleep(self._reconnect_delay_sec)
+
+            # backoff перед переподключением
+            time.sleep(backoff)
 
     def stop(self) -> None:
+        """
+        Остановка потока.
+        """
         self._stop.set()
         self.connected.clear()
+
         try:
             if self._ws:
                 self._ws.close()
@@ -108,27 +121,48 @@ class BinanceWS(threading.Thread):
             pass
 
     def _handle(self, msg: str) -> None:
+        """
+        msg: raw JSON string
+        """
         try:
             data = json.loads(msg)
         except Exception:
             return
 
-        # combined stream -> {"stream":"...", "data":{...}}
+        # combined stream -> {"stream":"...", "data":{...}} или {"stream":"...", "data":[...]}
         if isinstance(data, dict) and "data" in data and "stream" in data:
             payload = data.get("data")
         else:
             payload = data
 
-        if not isinstance(payload, dict):
+        # ✅ Принимаем dict И list — важно для !markPrice@arr
+        if not isinstance(payload, (dict, list)):
             return
 
-        # 🔥 ключевой фикс: ошибки обработчика не должны быть "тихими"
         try:
             self.on_message_cb(payload)
         except Exception:
-            ev = payload.get("e") or payload.get("eventType") or "?"
-            # обрезаем, чтобы лог не раздувался
+            ev = self._guess_event(payload)
+
             snippet = str(payload)
             if len(snippet) > 800:
                 snippet = snippet[:800] + "…"
+
             log.exception("[%s] on_message_cb failed (event=%s) payload=%s", self.name, ev, snippet)
+
+    @staticmethod
+    def _guess_event(payload: Any) -> str:
+        """
+        Пытаемся понять тип события для логов.
+        """
+        try:
+            if isinstance(payload, dict):
+                return str(payload.get("e") or payload.get("eventType") or "?")
+            if isinstance(payload, list) and payload:
+                first = payload[0]
+                if isinstance(first, dict):
+                    return str(first.get("e") or first.get("eventType") or "list")
+                return "list"
+            return "?"
+        except Exception:
+            return "?"

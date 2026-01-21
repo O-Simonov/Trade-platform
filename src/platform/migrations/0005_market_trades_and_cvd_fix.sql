@@ -1,5 +1,5 @@
--- 0004_market_trades_and_cvd_fix.sql
--- Fix for partially-applied 0003: ensure tables exist + remove duplicate indexes
+-- 0005_market_trades_and_cvd_fix.sql
+-- Fix for partially-applied migrations: ensure tables exist + remove duplicate indexes
 
 -- =========================================
 -- market_trades (ensure)
@@ -20,10 +20,9 @@ CREATE TABLE IF NOT EXISTS market_trades (
   CONSTRAINT market_trades_taker_side_check CHECK (taker_side IN ('BUY','SELL'))
 );
 
--- главный индекс для чтения по времени
+-- главный индекс для чтения по времени (у тебя он уже есть)
 CREATE INDEX IF NOT EXISTS idx_market_trades_ts
 ON market_trades (exchange_id, symbol_id, ts);
-
 
 -- =========================================
 -- candles_trades_agg (ensure)
@@ -50,7 +49,7 @@ CREATE TABLE IF NOT EXISTS candles_trades_agg (
 CREATE INDEX IF NOT EXISTS idx_candles_trades_agg_lookup
 ON candles_trades_agg (exchange_id, symbol_id, interval, open_time DESC);
 
--- (опционально) индекс для быстрых range-выборок
+-- индекс для быстрых range-выборок
 CREATE INDEX IF NOT EXISTS ix_candles_trades_agg_open_time
 ON candles_trades_agg (exchange_id, symbol_id, interval, open_time);
 
@@ -58,10 +57,5 @@ ON candles_trades_agg (exchange_id, symbol_id, interval, open_time);
 -- Remove duplicated indexes (if exist)
 -- =========================================
 
--- у тебя сейчас есть дубль idx_candles_trades_agg_lookup и ix_candles_trades_agg_lookup
+-- у тебя был дубль idx_candles_trades_agg_lookup и ix_candles_trades_agg_lookup
 DROP INDEX IF EXISTS ix_candles_trades_agg_lookup;
-
--- на всякий случай: если где-то есть лишние индексы на market_trades
-DROP INDEX IF EXISTS ix_market_trades_sym_ts;
-DROP INDEX IF EXISTS ix_market_trades_symbol_ts;
-DROP INDEX IF EXISTS idx_market_trades_trade_id;

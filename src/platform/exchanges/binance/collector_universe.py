@@ -3,9 +3,13 @@ from __future__ import annotations
 
 import inspect
 import logging
-from typing import Any, Dict, List, Tuple
+import re
+from typing import Any, Dict, List
 
 logger = logging.getLogger("src.platform.exchanges.binance.collector_universe")
+
+# строгий whitelist: только A-Z0-9
+_RE_VALID_SYMBOL = re.compile(r"^[A-Z0-9]+$")
 
 
 def _call_supported(fn, **kwargs):
@@ -25,16 +29,18 @@ def _call_supported(fn, **kwargs):
 
 
 def _count_active_symbols(storage, exchange_id: int) -> int:
-    # 1) if method exists
     if hasattr(storage, "count_active_symbols"):
         try:
             return int(storage.count_active_symbols(exchange_id=int(exchange_id)))  # type: ignore[attr-defined]
         except Exception:
             pass
 
-    # 2) SQL fallback
+    pool = getattr(storage, "pool", None)
+    if pool is None:
+        return 0
+
     try:
-        with storage.pool.connection() as conn:
+        with pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
@@ -52,22 +58,11 @@ def _count_active_symbols(storage, exchange_id: int) -> int:
 
 
 def _normalize_mapping(mapping: Any) -> Dict[str, int]:
-    """
-    Normalizes mapping returned by storage.upsert_symbols() into:
-      { "BTCUSDT": 123, ... }
-
-    Supports common variants:
-      - { "BTCUSDT": 123 }
-      - { 123: "BTCUSDT" }
-      - list/None/unknown -> {}
-    """
     if not isinstance(mapping, dict) or not mapping:
         return {}
 
     out: Dict[str, int] = {}
-
     for k, v in mapping.items():
-        # variant A: symbol -> id
         if isinstance(k, str):
             sym = k.upper().strip()
             if not sym:
@@ -79,7 +74,6 @@ def _normalize_mapping(mapping: Any) -> Dict[str, int]:
             out[sym] = sid
             continue
 
-        # variant B: id -> symbol
         if isinstance(v, str):
             sym = v.upper().strip()
             if not sym:
@@ -92,6 +86,32 @@ def _normalize_mapping(mapping: Any) -> Dict[str, int]:
             continue
 
     return out
+
+
+def _is_valid_fstream_symbol(sym: str) -> bool:
+    """
+    Защита от мусора в symbols.symbol.
+    Для fstream (Binance USD-M) символы типа BTCUSDT, 1000PEPEUSDT и т.п.
+    """
+    if not sym:
+        return False
+    sym = sym.upper().strip()
+
+    # только ASCII
+    try:
+        sym.encode("ascii")
+    except Exception:
+        return False
+
+    # только A-Z0-9, без пробелов/прочего
+    if _RE_VALID_SYMBOL.fullmatch(sym) is None:
+        return False
+
+    # разумная длина, чтобы отсечь странные строки
+    if len(sym) < 3 or len(sym) > 25:
+        return False
+
+    return True
 
 
 def sync_tradable_usdtm_perpetual_symbols(
@@ -118,6 +138,8 @@ def sync_tradable_usdtm_perpetual_symbols(
     symbols_info = info.get("symbols") or []
 
     universe: List[str] = []
+    bad = 0
+
     for s in symbols_info:
         if s.get("contractType") != "PERPETUAL":
             continue
@@ -125,12 +147,19 @@ def sync_tradable_usdtm_perpetual_symbols(
             continue
         if s.get("status") != "TRADING":
             continue
+
         sym = (s.get("symbol") or "").upper().strip()
-        if sym:
-            universe.append(sym)
+        if not _is_valid_fstream_symbol(sym):
+            bad += 1
+            continue
+
+        universe.append(sym)
 
     universe = sorted(set(universe))
     fetched = len(universe)
+
+    if bad:
+        logger.warning("[Universe] filtered bad symbols=%d", int(bad))
 
     if fetched < int(min_size):
         logger.warning("[Universe] fetched too small: %d < min_size=%d -> skip", fetched, int(min_size))
@@ -141,7 +170,7 @@ def sync_tradable_usdtm_perpetual_symbols(
     deactivate_missing = True
     if active_db > 0:
         drop_ratio = (float(active_db - fetched) / float(active_db)) if active_db else 0.0
-        drop_ratio = max(0.0, drop_ratio)  # make it explicit
+        drop_ratio = max(0.0, float(drop_ratio))
         if drop_ratio > float(max_drop_ratio):
             deactivate_missing = False
             logger.warning(
@@ -152,23 +181,15 @@ def sync_tradable_usdtm_perpetual_symbols(
                 float(max_drop_ratio),
             )
 
-    # upsert + mark active (adapt to signature)
+    # ВАЖНО: под твою сигнатуру upsert_symbols(..., deactivate_missing=...)
     raw_mapping = _call_supported(
         storage.upsert_symbols,
         exchange_id=int(exchange_id),
         symbols=universe,
-        mark_active=True,
+        deactivate_missing=bool(deactivate_missing),
     )
 
     mapping = _normalize_mapping(raw_mapping)
-
-    if deactivate_missing and hasattr(storage, "deactivate_missing_symbols"):
-        try:
-            deactivated = storage.deactivate_missing_symbols(exchange_id=int(exchange_id), active_symbols=universe)
-            if deactivated:
-                logger.info("[Universe] deactivated symbols: %d", int(deactivated))
-        except Exception:
-            logger.exception("[Universe] deactivate_missing_symbols failed (ignored)")
 
     logger.info(
         "[Universe] upserted=%d deactivate_missing=%s (active_db=%d fetched=%d)",

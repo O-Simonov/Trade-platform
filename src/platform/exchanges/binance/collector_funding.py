@@ -7,12 +7,14 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
+from src.platform.exchanges.binance.ws import BinanceWS, WS_STREAM_BASE
+
 logger = logging.getLogger("src.platform.exchanges.binance.collector_funding")
 
 
-# Funding on Binance USDT-M is every 8 hours (00:00, 08:00, 16:00 UTC)
-_FUNDING_INTERVAL_HOURS = 8
-
+# -------------------------
+# helpers
+# -------------------------
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -22,16 +24,13 @@ def _to_ms(dt: datetime) -> int:
     return int(dt.timestamp() * 1000)
 
 
-def _classify_http_error(exc: Exception) -> Optional[int]:
-    """
-    Пытаемся достать HTTP code из текста ошибки вида:
-      RuntimeError("Binance HTTP 429 GET /...: ...")
-    """
-    s = str(exc)
-    for code in (451, 418, 429, 403, 400):
-        if f"HTTP {code}" in s:
-            return code
-    return None
+def _from_ms(ms: Any) -> Optional[datetime]:
+    try:
+        if ms is None:
+            return None
+        return datetime.fromtimestamp(int(ms) / 1000.0, tz=timezone.utc)
+    except Exception:
+        return None
 
 
 def _safe_float(x: Any, default: float = 0.0) -> float:
@@ -43,16 +42,47 @@ def _safe_float(x: Any, default: float = 0.0) -> float:
         return default
 
 
+def _classify_http_error(exc: Exception) -> Optional[int]:
+    """
+    Достаём HTTP code из текста исключения.
+    Плюс учитываем бинанс -1003 Too many requests как 429.
+    """
+    s = str(exc)
+    for code in (451, 418, 429, 403, 400):
+        if f"HTTP {code}" in s:
+            return code
+    if "-1003" in s or "Too many requests" in s:
+        return 429
+    return None
+
+
+def _normalize_funding_time(dt: Optional[datetime]) -> Optional[datetime]:
+    """
+    ✅ ВАЖНО: Binance funding time по сути дискретен (обычно граница часа/8ч),
+    а WS иногда приходит с микро/миллисекундами.
+    Нормализуем до начала часа, чтобы:
+      - REST и WS попадали в один и тот же PK funding_time
+      - WS делал UPDATE одной записи, а не плодил "почти одинаковые" времена
+    """
+    if dt is None:
+        return None
+    return dt.replace(minute=0, second=0, microsecond=0)
+
+
+# -------------------------
+# DB watermarks
+# -------------------------
+
 def _load_watermarks_from_db(*, storage, exchange_id: int) -> Dict[int, datetime]:
     """
-    Один запрос вместо N запросов:
+    Один запрос:
       symbol_id -> max(funding_time)
     """
     wm: Dict[int, datetime] = {}
     try:
         pool = getattr(storage, "pool", None)
         if pool is None:
-            logger.warning("[Funding] storage.pool not found -> will use in-memory only")
+            logger.warning("[Funding] storage.pool not found -> DB watermark load skipped")
             return wm
 
         with pool.connection() as conn:
@@ -66,79 +96,141 @@ def _load_watermarks_from_db(*, storage, exchange_id: int) -> Dict[int, datetime
                     """,
                     (int(exchange_id),),
                 )
-                for sid, last_ts in cur.fetchall():
+                rows = cur.fetchall() or []
+                for sid, last_ts in rows:
                     if sid is None or last_ts is None:
                         continue
-                    wm[int(sid)] = last_ts
+                    # ✅ водяной знак тоже нормализуем, чтобы overlap работал ровно
+                    wm[int(sid)] = _normalize_funding_time(last_ts) or last_ts
     except Exception:
         logger.exception("[Funding] failed to load watermarks from DB")
 
     return wm
 
 
-def _parse_funding_rows(*, exchange_id: int, symbol_id: int, payload: List[dict], source: str) -> List[dict]:
+# -------------------------
+# parsing (REST fundingRate history)
+# -------------------------
+
+def _parse_funding_rows(
+    *,
+    exchange_id: int,
+    symbol_id: int,
+    payload: List[dict],
+    source: str,
+) -> List[dict]:
+    """
+    Парсим payload от rest.funding_rate(...)
+
+    Ожидаем поля:
+      fundingTime (ms), fundingRate, markPrice (optional)
+    """
     rows: List[dict] = []
     for r in payload or []:
+        if not isinstance(r, dict):
+            continue
+
         ft_ms = r.get("fundingTime") or r.get("time")
         rate = r.get("fundingRate")
         if ft_ms is None or rate is None:
             continue
 
-        funding_time = datetime.fromtimestamp(int(ft_ms) / 1000, tz=timezone.utc)
+        funding_time = _normalize_funding_time(_from_ms(ft_ms))
+        if funding_time is None:
+            continue
+
         mark_price = r.get("markPrice")
 
         rows.append(
-            dict(
-                exchange_id=int(exchange_id),
-                symbol_id=int(symbol_id),
-                funding_time=funding_time,
-                funding_rate=_safe_float(rate, 0.0),
-                mark_price=(_safe_float(mark_price, 0.0) if mark_price is not None else None),
-                source=str(source),
-            )
+            {
+                "exchange_id": int(exchange_id),
+                "symbol_id": int(symbol_id),
+                "funding_time": funding_time,
+                "funding_rate": _safe_float(rate, 0.0),
+                "mark_price": (_safe_float(mark_price, 0.0) if mark_price is not None else None),
+                "source": str(source),
+            }
         )
     return rows
 
 
-def _premium_index_to_row_last_funding(
+def _max_funding_time(rows: List[dict]) -> Optional[datetime]:
+    best: Optional[datetime] = None
+    for r in rows or []:
+        ft = r.get("funding_time")
+        if isinstance(ft, datetime):
+            if best is None or ft > best:
+                best = ft
+    return best
+
+
+# -------------------------
+# parsing (WS markPriceUpdate)
+# -------------------------
+
+def _parse_ws_mark_price_update(
     *,
     exchange_id: int,
-    symbol_id: int,
-    data: dict,
-    source: str,
+    symbol_ids: Dict[str, int],
+    msg: dict,
 ) -> Optional[dict]:
     """
-    premiumIndex содержит:
-      nextFundingTime (будущее)
-      lastFundingRate (ставка последнего фандинга)
-      markPrice
+    Binance USD-M Futures markPriceUpdate event:
+      {
+        "e": "markPriceUpdate",
+        "E": 1562305380000,
+        "s": "BTCUSDT",
+        "p": "11185.87786614",   # mark price
+        "r": "0.00030000",       # funding rate
+        "T": 1562306400000       # next funding time
+      }
 
-    Чтобы корректно положить в funding-таблицу, используем:
-      funding_time = nextFundingTime - 8h
+    Мы пишем funding_time = nextFundingTime (T).
+    Это будущая точка funding, которая обновляется до момента списания.
+    UPSERT будет обновлять rate/mark_price на одной и той же funding_time.
     """
-    if not data:
+    if not isinstance(msg, dict):
         return None
 
-    next_ms = data.get("nextFundingTime")
-    rate = data.get("lastFundingRate")
-    mark = data.get("markPrice")
-    if next_ms is None or rate is None:
+    ev = msg.get("e") or msg.get("eventType")
+    if ev != "markPriceUpdate":
         return None
 
-    next_dt = datetime.fromtimestamp(int(next_ms) / 1000, tz=timezone.utc)
-    funding_time = next_dt - timedelta(hours=_FUNDING_INTERVAL_HOURS)
+    sym = (msg.get("s") or "").upper().strip()
+    if not sym:
+        return None
 
-    return {
+    sid = symbol_ids.get(sym)
+    if sid is None:
+        return None
+
+    next_ft_ms = msg.get("T")
+    rate = msg.get("r")
+    mark_price = msg.get("p")
+
+    if next_ft_ms is None or rate is None:
+        return None
+
+    funding_time = _normalize_funding_time(_from_ms(next_ft_ms))
+    if funding_time is None:
+        return None
+
+    row = {
         "exchange_id": int(exchange_id),
-        "symbol_id": int(symbol_id),
+        "symbol_id": int(sid),
         "funding_time": funding_time,
         "funding_rate": _safe_float(rate, 0.0),
-        "mark_price": (_safe_float(mark, 0.0) if mark is not None else None),
-        "source": str(source),
+        "mark_price": (_safe_float(mark_price, 0.0) if mark_price is not None else None),
+        "source": "ws_markPriceUpdate",
     }
+    return row
 
 
-def _run_funding_history_one_symbol(
+# -------------------------
+# REST history runner (pagination-safe)
+# -------------------------
+
+def _run_funding_history_paged(
     *,
     storage,
     rest,
@@ -148,78 +240,286 @@ def _run_funding_history_one_symbol(
     start_dt: datetime,
     end_dt: datetime,
     limit: int,
+    max_pages: int,
+    page_sleep_sec: float,
+    stop_event: threading.Event,
 ) -> Tuple[int, Optional[datetime]]:
     """
-    Возвращает (upserts, max_funding_time)
+    Надёжная догрузка fundingRate history с пагинацией.
+
+    Binance обычно отдаёт максимум limit (<=1000).
+    Поэтому если диапазон большой — делаем paging.
     """
-    payload = rest.funding_rate(
-        symbol=sym,
-        start_time_ms=_to_ms(start_dt),
-        end_time_ms=_to_ms(end_dt),
-        limit=int(limit),
-    )
-    rows = _parse_funding_rows(exchange_id=exchange_id, symbol_id=sid, payload=payload or [], source="fundingRate")
-    if not rows:
+    limit = max(1, min(int(limit), 1000))
+    max_pages = max(1, int(max_pages))
+    page_sleep_sec = max(0.0, float(page_sleep_sec))
+
+    total_upserts = 0
+    best_total: Optional[datetime] = None
+    last_progress: Optional[datetime] = None
+
+    # защитимся от неверного окна
+    if start_dt >= end_dt:
         return 0, None
 
-    n = int(storage.upsert_funding(rows) or 0)
+    for _ in range(max_pages):
+        if stop_event.is_set():
+            break
 
-    best: Optional[datetime] = None
-    for r in rows:
-        ft = r.get("funding_time")
-        if isinstance(ft, datetime):
-            if best is None or ft > best:
-                best = ft
+        payload = rest.funding_rate(
+            symbol=str(sym),
+            start_time_ms=_to_ms(start_dt),
+            end_time_ms=_to_ms(end_dt),
+            limit=int(limit),
+        )
 
-    return n, best
+        payload_list: List[dict]
+        if isinstance(payload, list):
+            payload_list = [x for x in payload if isinstance(x, dict)]
+        elif isinstance(payload, dict):
+            payload_list = [payload]
+        else:
+            payload_list = []
+
+        rows = _parse_funding_rows(
+            exchange_id=int(exchange_id),
+            symbol_id=int(sid),
+            payload=payload_list,
+            source="fundingRate",
+        )
+
+        if not rows:
+            break
+
+        n = int(storage.upsert_funding(rows) or 0)
+        total_upserts += n
+
+        best = _max_funding_time(rows)
+        if best is not None:
+            if best_total is None or best > best_total:
+                best_total = best
+
+        # guard against infinite loop
+        if last_progress is not None and best is not None and best <= last_progress:
+            logger.warning(
+                "[Funding][%s] pagination stalled (best=%s <= last=%s) -> stop paging",
+                sym,
+                best,
+                last_progress,
+            )
+            break
+        if best is not None:
+            last_progress = best
+
+        # last page is not full -> no more in range
+        if len(rows) < limit:
+            break
+
+        # move window forward
+        if best is None:
+            break
+        start_dt = best + timedelta(milliseconds=1)
+        if start_dt >= end_dt:
+            break
+
+        if page_sleep_sec > 0 and stop_event.wait(page_sleep_sec):
+            break
+
+    return total_upserts, best_total
 
 
-def _run_premium_index_snapshot_all(
+# -------------------------
+# BACKFILL on start (SMART: up to backfill_days, not always full)
+# -------------------------
+
+def _run_backfill_all_symbols(
     *,
     storage,
     rest,
     exchange_id: int,
+    symbols: List[Tuple[str, int]],
+    watermarks: Dict[int, datetime],
+    backfill_days: int,
+    overlap_hours: int,
+    limit: int,
+    max_pages: int,
+    page_sleep_sec: float,
+    req_sleep_sec: float,
+    cooldown_until: Dict[str, datetime],
+    stop_event: threading.Event,
+) -> None:
+    """
+    Умный backfill:
+      - если по symbol данных нет -> качаем window [now-backfill_days .. now]
+      - если есть watermark -> качаем только хвост max(now-backfill_days, watermark-overlap_hours)
+    """
+    if backfill_days <= 0:
+        logger.info("[Funding][Backfill] backfill_days<=0 -> skip")
+        return
+    if not symbols:
+        return
+
+    now = _utc_now()
+    min_dt = now - timedelta(days=int(backfill_days))
+
+    logger.info(
+        "[Funding][Backfill] start symbols=%d backfill_days=%d overlap_hours=%d min_dt=%s",
+        len(symbols),
+        backfill_days,
+        overlap_hours,
+        min_dt.isoformat(),
+    )
+
+    done = 0
+    total_up = 0
+    backoff = 1.0
+
+    for sym, sid in symbols:
+        if stop_event.is_set():
+            break
+
+        cd = cooldown_until.get(sym)
+        if cd is not None and cd > now:
+            continue
+
+        try:
+            prev_wm = watermarks.get(int(sid))
+            if prev_wm is None:
+                start_dt = min_dt
+            else:
+                start_dt = max(min_dt, prev_wm - timedelta(hours=int(overlap_hours)))
+
+            if start_dt >= now:
+                done += 1
+                continue
+
+            n, best = _run_funding_history_paged(
+                storage=storage,
+                rest=rest,
+                exchange_id=int(exchange_id),
+                sym=sym,
+                sid=int(sid),
+                start_dt=start_dt,
+                end_dt=now,
+                limit=limit,
+                max_pages=max_pages,
+                page_sleep_sec=page_sleep_sec,
+                stop_event=stop_event,
+            )
+            total_up += int(n or 0)
+            done += 1
+
+            if best is not None:
+                prev = watermarks.get(int(sid))
+                if prev is None or best > prev:
+                    watermarks[int(sid)] = best
+
+            backoff = 1.0
+
+        except Exception as e:
+            code = _classify_http_error(e)
+            if code in (418, 429):
+                logger.warning("[Funding][Backfill] %s HTTP=%s -> cooldown 30m", sym, code, exc_info=True)
+                cooldown_until[sym] = _utc_now() + timedelta(minutes=30)
+            elif code == 451:
+                logger.warning("[Funding][Backfill] %s HTTP=451 -> cooldown 6h", sym, code, exc_info=True)
+                cooldown_until[sym] = _utc_now() + timedelta(hours=6)
+            else:
+                logger.exception("[Funding][Backfill] %s failed", sym)
+
+            stop_event.wait(backoff)
+            backoff = min(backoff * 2.0, 30.0)
+
+        if req_sleep_sec > 0 and stop_event.wait(req_sleep_sec):
+            break
+
+    logger.info("[Funding][Backfill] done symbols_processed=%d/%d upserts=%d", done, len(symbols), total_up)
+
+
+# -------------------------
+# WS Funding (markPrice@arr)
+# -------------------------
+
+def start_funding_ws_collector(
+    *,
+    storage,
+    exchange_id: int,
     symbol_ids: Dict[str, int],
-) -> Tuple[int, Dict[int, datetime]]:
+    stop_event: threading.Event,
+) -> BinanceWS:
     """
-    Один вызов premiumIndex без symbol -> список по всем.
-    Возвращает (upserts, {symbol_id: funding_time})
+    WS funding updates через !markPrice@arr (все символы одним потоком).
+    Требует улучшенный ws.py (payload может быть list).
+
+    ✅ Добавлена поддержка combined stream формата:
+      {"stream": "...", "data": [...]}
     """
-    data = rest.premium_index(symbol=None)  # None => all symbols
-    if not data:
-        return 0, {}
+    url = WS_STREAM_BASE + "!markPrice@arr"
 
-    data_list = [data] if isinstance(data, dict) else list(data)
+    def _on_message(payload: Any) -> None:
+        if stop_event.is_set():
+            return
 
-    rows: List[dict] = []
-    wm_updates: Dict[int, datetime] = {}
+        # combined stream wrapper: {"data":[...]}
+        if isinstance(payload, dict) and isinstance(payload.get("data"), list):
+            payload2 = payload.get("data")
+        else:
+            payload2 = payload
 
-    for item in data_list:
-        sym = str(item.get("symbol") or "").upper().strip()
-        if not sym:
-            continue
-        sid = symbol_ids.get(sym)
-        if sid is None:
-            continue
+        rows: List[dict] = []
 
-        row = _premium_index_to_row_last_funding(
-            exchange_id=exchange_id,
-            symbol_id=int(sid),
-            data=item,
-            source="premiumIndex",
-        )
-        if row:
-            rows.append(row)
-            ft = row.get("funding_time")
-            if isinstance(ft, datetime):
-                wm_updates[int(sid)] = ft
+        if isinstance(payload2, list):
+            for item in payload2:
+                if not isinstance(item, dict):
+                    continue
+                row = _parse_ws_mark_price_update(
+                    exchange_id=int(exchange_id),
+                    symbol_ids=symbol_ids,
+                    msg=item,
+                )
+                if row:
+                    rows.append(row)
 
-    if not rows:
-        return 0, {}
+        elif isinstance(payload2, dict):
+            row = _parse_ws_mark_price_update(
+                exchange_id=int(exchange_id),
+                symbol_ids=symbol_ids,
+                msg=payload2,
+            )
+            if row:
+                rows.append(row)
 
-    upserts = int(storage.upsert_funding(rows) or 0)
-    return upserts, wm_updates
+        if rows:
+            try:
+                storage.upsert_funding(rows)
+            except Exception:
+                logger.exception("[Funding][WS] upsert failed rows=%d", len(rows))
 
+    ws = BinanceWS(
+        url=url,
+        on_message=_on_message,
+        name="BinanceFundingWS",
+        reconnect_delay_sec=2.0,
+        ping_interval=20,
+        ping_timeout=10,
+    )
+    ws.start()
+    logger.info("[Funding][WS] started stream=!markPrice@arr")
+    return ws
+
+
+def stop_funding_ws_collector(ws: Optional[BinanceWS]) -> None:
+    if ws is None:
+        return
+    try:
+        ws.stop()
+    except Exception:
+        logger.exception("[Funding][WS] stop failed")
+
+
+# -------------------------
+# main collector
+# -------------------------
 
 def run_funding_collector(
     *,
@@ -230,99 +530,116 @@ def run_funding_collector(
     cfg: dict,
     stop_event: threading.Event,
 ) -> None:
+    """
+    Funding collector:
+      ✅ REST backfill history (на backfill_days, умно)
+      ✅ WS live updates (!markPrice@arr)
+      ✅ REST safety loop (страховка, закрывает дыры)
+    """
     cfg = cfg or {}
 
-    enabled = bool(cfg.get("enabled", True))
-    if not enabled:
+    if not bool(cfg.get("enabled", True)):
         logger.info("[Funding] disabled by config")
         return
 
-    poll_sec = float(cfg.get("poll_sec", 900))  # funding меняется редко → 15 минут ок
-    symbols_per_cycle = int(cfg.get("symbols_per_cycle", 3))
-    req_sleep_sec = float(cfg.get("req_sleep_sec", 0.40))  # чуть медленнее, чтобы не конкурировать со свечами/OI
+    # --- режимы ---
+    use_ws = bool(cfg.get("use_ws", True))
+    rest_safety_poll = bool(cfg.get("rest_safety_poll", True))
 
-    seed_on_start = bool(cfg.get("seed_on_start", False))
-    seed_days = max(0, int(cfg.get("seed_days", 365)))
+    # --- backfill ---
+    backfill_on_start = bool(cfg.get("backfill_on_start", True))
+    backfill_days = max(0, int(cfg.get("backfill_days", 10)))
 
-    lookback_hours_if_empty = max(24, int(cfg.get("lookback_hours_if_empty", 72)))
+    # --- polling REST safety ---
+    poll_sec = max(30.0, float(cfg.get("poll_sec", 1800.0)))  # 30 мин дефолт
+    symbols_per_cycle = max(1, int(cfg.get("symbols_per_cycle", 20)))
+    req_sleep_sec = max(0.0, float(cfg.get("req_sleep_sec", 0.20)))
 
-    limit = int(cfg.get("limit", 1000))
-    limit = max(1, min(limit, 1000))
+    # --- paging ---
+    limit = max(1, min(int(cfg.get("limit", 1000)), 1000))
+    max_pages = max(1, int(cfg.get("max_pages", 50)))
+    page_sleep_sec = max(0.0, float(cfg.get("page_sleep_sec", 0.0)))
 
-    also_premium_index = bool(cfg.get("also_premium_index", False))
-    premium_poll_sec = float(cfg.get("premium_poll_sec", 1800))  # раз в 30 минут достаточно
+    # --- overlap to close holes ---
+    overlap_hours = max(0, int(cfg.get("overlap_hours", 72)))
 
-    symbols = sorted(symbol_ids.items(), key=lambda x: x[0])  # [(SYMBOL, symbol_id)]
+    # symbols
+    symbols = sorted(
+        (
+            (str(sym).upper().strip(), int(sid))
+            for sym, sid in (symbol_ids or {}).items()
+            if str(sym).strip()
+        ),
+        key=lambda x: x[0],
+    )
     total = len(symbols)
 
     logger.info(
-        "[Funding] started symbols=%d poll=%.1fs batch=%d seed_on_start=%s seed_days=%d limit=%d premium=%s premium_poll=%.0fs",
+        "[Funding] started symbols=%d use_ws=%s rest_safety_poll=%s "
+        "backfill_on_start=%s backfill_days=%d rest_poll=%.1fs batch=%d "
+        "limit=%d max_pages=%d overlap_hours=%d",
         total,
+        use_ws,
+        rest_safety_poll,
+        backfill_on_start,
+        backfill_days,
         poll_sec,
         symbols_per_cycle,
-        seed_on_start,
-        seed_days,
         limit,
-        also_premium_index,
-        premium_poll_sec,
+        max_pages,
+        overlap_hours,
     )
 
-    # --- Watermarks ---
-    watermarks = _load_watermarks_from_db(storage=storage, exchange_id=exchange_id)
+    # watermarks + cooldowns
+    watermarks = _load_watermarks_from_db(storage=storage, exchange_id=int(exchange_id))
     logger.info("[Funding] loaded watermarks from DB: %d", len(watermarks))
 
-    # per-symbol cooldown after 418/429
     cooldown_until: Dict[str, datetime] = {}
 
-    # --- SEED ONCE (только для тех, у кого вообще нет данных) ---
-    if seed_on_start and seed_days > 0 and total > 0:
-        end_dt = _utc_now()
-        seed_from = end_dt - timedelta(days=seed_days)
-        total_seed = 0
-        seeded = 0
+    # -------------------------
+    # REST Backfill on start (SMART, bounded by backfill_days)
+    # -------------------------
+    if backfill_on_start and backfill_days > 0 and total > 0:
+        _run_backfill_all_symbols(
+            storage=storage,
+            rest=rest,
+            exchange_id=int(exchange_id),
+            symbols=symbols,
+            watermarks=watermarks,
+            backfill_days=int(backfill_days),
+            overlap_hours=int(overlap_hours),
+            limit=limit,
+            max_pages=max_pages,
+            page_sleep_sec=page_sleep_sec,
+            req_sleep_sec=req_sleep_sec,
+            cooldown_until=cooldown_until,
+            stop_event=stop_event,
+        )
 
-        for sym, sid in symbols:
-            if stop_event.is_set():
-                break
-            if watermarks.get(int(sid)) is not None:
-                continue
+    # -------------------------
+    # WS Live updates
+    # -------------------------
+    ws_client: Optional[BinanceWS] = None
+    if use_ws and total > 0:
+        ws_client = start_funding_ws_collector(
+            storage=storage,
+            exchange_id=int(exchange_id),
+            symbol_ids=dict(symbol_ids or {}),
+            stop_event=stop_event,
+        )
 
-            try:
-                n, max_ft = _run_funding_history_one_symbol(
-                    storage=storage,
-                    rest=rest,
-                    exchange_id=exchange_id,
-                    sym=sym,
-                    sid=int(sid),
-                    start_dt=seed_from,
-                    end_dt=end_dt,
-                    limit=limit,
-                )
-                total_seed += int(n or 0)
-                seeded += 1
-                if max_ft is not None:
-                    watermarks[int(sid)] = max_ft
+    # -------------------------
+    # REST safety loop (страховка)
+    # -------------------------
+    if not rest_safety_poll:
+        logger.info("[Funding] REST safety poll disabled -> WS only mode")
+        while not stop_event.is_set():
+            stop_event.wait(1.0)
+        stop_funding_ws_collector(ws_client)
+        return
 
-            except Exception as e:
-                code = _classify_http_error(e)
-                if code in (418, 429):
-                    logger.warning("[FundingSeed] %s HTTP=%s (rate/ban)", sym, code, exc_info=True)
-                    cooldown_until[sym] = _utc_now() + timedelta(minutes=30)
-                elif code == 451:
-                    logger.warning("[FundingSeed] %s HTTP=451 restricted", sym, exc_info=True)
-                    cooldown_until[sym] = _utc_now() + timedelta(hours=6)
-                else:
-                    logger.exception("[FundingSeed] %s failed", sym)
-
-            if stop_event.wait(req_sleep_sec):
-                break
-
-        logger.info("[FundingSeed] done seeded_symbols=%d upserts=%d", seeded, total_seed)
-
-    # --- LOOP ---
     idx = 0
     backoff = 1.0
-    last_premium_ts = 0.0
 
     while not stop_event.is_set():
         try:
@@ -333,13 +650,14 @@ def run_funding_collector(
                 stop_event.wait(5.0)
                 continue
 
-            # 1) fundingRate history incremental (маленький батч)
-            batch = symbols[idx : idx + max(1, symbols_per_cycle)]
+            batch = symbols[idx: idx + symbols_per_cycle]
             if not batch:
                 idx = 0
                 continue
 
             upserts = 0
+            min_dt = now - timedelta(days=max(1, int(backfill_days)))
+
             for sym, sid in batch:
                 if stop_event.is_set():
                     break
@@ -350,72 +668,53 @@ def run_funding_collector(
 
                 last_dt = watermarks.get(int(sid))
                 if last_dt is None:
-                    start_dt = now - timedelta(hours=lookback_hours_if_empty)
+                    start_dt = min_dt
                 else:
-                    # небольшой overlap, чтобы не терять точку вокруг границы
-                    start_dt = last_dt - timedelta(hours=1)
+                    # ✅ clamp by backfill_days (не качаем дальше чем backfill_days назад)
+                    start_dt = max(min_dt, last_dt - timedelta(hours=int(overlap_hours)))
+
+                if start_dt >= now:
+                    continue
 
                 try:
-                    n, max_ft = _run_funding_history_one_symbol(
+                    n, best = _run_funding_history_paged(
                         storage=storage,
                         rest=rest,
-                        exchange_id=exchange_id,
+                        exchange_id=int(exchange_id),
                         sym=sym,
                         sid=int(sid),
                         start_dt=start_dt,
                         end_dt=now,
                         limit=limit,
+                        max_pages=max_pages,
+                        page_sleep_sec=page_sleep_sec,
+                        stop_event=stop_event,
                     )
                     upserts += int(n or 0)
-                    if max_ft is not None:
+                    if best is not None:
                         prev = watermarks.get(int(sid))
-                        if prev is None or max_ft > prev:
-                            watermarks[int(sid)] = max_ft
+                        if prev is None or best > prev:
+                            watermarks[int(sid)] = best
 
                 except Exception as e:
                     code = _classify_http_error(e)
                     if code in (418, 429):
-                        logger.warning("[Funding] %s HTTP=%s (rate/ban)", sym, code, exc_info=True)
+                        logger.warning("[Funding][REST] %s HTTP=%s -> cooldown 30m", sym, code, exc_info=True)
                         cooldown_until[sym] = _utc_now() + timedelta(minutes=30)
                     elif code == 451:
-                        logger.warning("[Funding] %s HTTP=451 restricted", sym, exc_info=True)
+                        logger.warning("[Funding][REST] %s HTTP=451 -> cooldown 6h", sym, code, exc_info=True)
                         cooldown_until[sym] = _utc_now() + timedelta(hours=6)
                     else:
-                        logger.exception("[Funding] %s failed", sym)
+                        logger.exception("[Funding][REST] %s failed", sym)
 
-                if stop_event.wait(req_sleep_sec):
+                if req_sleep_sec > 0 and stop_event.wait(req_sleep_sec):
                     break
 
             idx += len(batch)
             if idx >= total:
                 idx = 0
 
-            # 2) premiumIndex snapshot (ОДИН запрос, не каждый цикл)
-            if also_premium_index and not stop_event.is_set():
-                if (time.time() - last_premium_ts) >= float(premium_poll_sec):
-                    try:
-                        n2, wm2 = _run_premium_index_snapshot_all(
-                            storage=storage,
-                            rest=rest,
-                            exchange_id=exchange_id,
-                            symbol_ids=symbol_ids,
-                        )
-                        upserts += int(n2 or 0)
-                        for sid, ft in (wm2 or {}).items():
-                            prev = watermarks.get(int(sid))
-                            if prev is None or ft > prev:
-                                watermarks[int(sid)] = ft
-                        last_premium_ts = time.time()
-                    except Exception as e:
-                        code = _classify_http_error(e)
-                        if code in (418, 429):
-                            logger.warning("[Funding] premiumIndex HTTP=%s (rate/ban)", code, exc_info=True)
-                            # глобальный backoff на premiumIndex
-                            last_premium_ts = time.time()  # чтобы не спамить
-                        else:
-                            logger.exception("[Funding] premiumIndex snapshot failed")
-
-            logger.info("[Funding] poll batch=%d upserts=%d premium=%s", len(batch), upserts, also_premium_index)
+            logger.info("[Funding][REST] poll batch=%d upserts=%d", len(batch), upserts)
 
             backoff = 1.0
             dt = time.time() - t0
@@ -423,9 +722,11 @@ def run_funding_collector(
             stop_event.wait(sleep)
 
         except Exception as e:
-            logger.warning("[Funding] error: %s", e, exc_info=True)
+            logger.warning("[Funding] loop error: %s", e, exc_info=True)
             stop_event.wait(backoff)
             backoff = min(backoff * 2.0, 300.0)
+
+    stop_funding_ws_collector(ws_client)
 
 
 def start_funding_collector(
@@ -443,7 +744,7 @@ def start_funding_collector(
             storage=storage,
             rest=rest,
             exchange_id=int(exchange_id),
-            symbol_ids=dict(symbol_ids),
+            symbol_ids=dict(symbol_ids or {}),
             cfg=dict(cfg or {}),
             stop_event=stop_event,
         ),

@@ -1,15 +1,22 @@
 # src/platform/exchanges/binance/collector_candles.py
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
-from collections import deque
 from datetime import datetime, timedelta, timezone
-from typing import Any, Deque, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
-logger = logging.getLogger(__name__)
+from src.platform.exchanges.binance.ws import WS_STREAM_BASE
+from src.platform.exchanges.binance.normalize import norm_kline_event
 
+logger = logging.getLogger("src.platform.exchanges.binance.collector_candles")
+
+
+# -------------------------
+# helpers
+# -------------------------
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -19,514 +26,606 @@ def _to_ms(dt: datetime) -> int:
     return int(dt.timestamp() * 1000)
 
 
-def _interval_ms(itv: str) -> int:
-    """
-    Переводим строковый интервал Binance (1m/5m/1h/4h/1d и т.п.) в миллисекунды.
-    """
-    itv = str(itv).strip().lower()
-    if itv.endswith("m"):
-        return int(itv[:-1]) * 60_000
-    if itv.endswith("h"):
-        return int(itv[:-1]) * 3_600_000
-    if itv.endswith("d"):
-        return int(itv[:-1]) * 86_400_000
-    raise ValueError(f"Unsupported interval: {itv}")
+def _from_ms(ms: Any) -> Optional[datetime]:
+    try:
+        if ms is None:
+            return None
+        return datetime.fromtimestamp(int(ms) / 1000.0, tz=timezone.utc)
+    except Exception:
+        return None
 
 
-def _floor_time_to_interval(dt: datetime, itv_ms: int) -> datetime:
-    """
-    Округление времени вниз до начала интервала.
-    Пример: для 1h -> начало текущего часа, для 4h -> начало текущего 4h-блока.
-    """
-    ms = _to_ms(dt)
-    floored = (ms // itv_ms) * itv_ms
-    return datetime.fromtimestamp(floored / 1000, tz=timezone.utc)
+def _safe_float(x: Any, default: float = 0.0) -> float:
+    try:
+        if x is None or x == "":
+            return float(default)
+        return float(x)
+    except Exception:
+        return float(default)
 
 
-def _classify_http_error(exc: Exception) -> Optional[int]:
-    """
-    Пытаемся извлечь HTTP-код из текста исключения.
-    В твоём rest.py ошибки выглядят как:
-      "Binance REST HTTP 429: GET /fapi/v1/klines resp=..."
-    Также иногда встречается код -1003 (Too many requests) внутри текста.
-    """
-    s = str(exc)
-    for code in (451, 418, 429, 403, 400):
-        if f"HTTP {code}" in s:
-            return code
-    if "-1003" in s:
-        return 429
-    return None
+def _safe_int(x: Any, default: int = 0) -> int:
+    try:
+        if x is None or x == "":
+            return int(default)
+        return int(float(x))
+    except Exception:
+        return int(default)
 
 
-def _parse_klines_payload(
+def _chunk(items: List[str], n: int) -> List[List[str]]:
+    n = max(1, int(n))
+    return [items[i : i + n] for i in range(0, len(items), n)]
+
+
+def _make_streams(symbols: List[str], interval: str) -> List[str]:
+    itv = str(interval).strip()
+    return [f"{s.lower()}@kline_{itv}" for s in symbols]
+
+
+def _combined_ws_url(streams: List[str]) -> str:
+    """
+    WS_STREAM_BASE уже содержит '.../stream?streams='
+    """
+    joined = "/".join(streams)
+    return f"{WS_STREAM_BASE}{joined}"
+
+# -------------------------
+# REST seed (klines)
+# -------------------------
+
+def _rest_klines_call(
+    rest: Any,
     *,
-    payload: Any,
+    symbol: str,
+    interval: str,
+    start_ms: int,
+    end_ms: int,
+    limit: int,
+) -> List[list]:
+    """
+    Вызываем REST klines через разные имена методов (на случай отличий в rest.py).
+    Ожидаем Binance /fapi/v1/klines формат: list of lists.
+    """
+    limit = max(1, min(int(limit), 1500))
+
+    fn = getattr(rest, "klines", None)
+    if callable(fn):
+        return fn(symbol=symbol, interval=interval, start_time_ms=start_ms, end_time_ms=end_ms, limit=limit) or []
+
+    fn = getattr(rest, "fapi_klines", None)
+    if callable(fn):
+        return fn(symbol=symbol, interval=interval, start_time_ms=start_ms, end_time_ms=end_ms, limit=limit) or []
+
+    fn = getattr(rest, "get_klines", None)
+    if callable(fn):
+        return fn(symbol=symbol, interval=interval, start_time_ms=start_ms, end_time_ms=end_ms, limit=limit) or []
+
+    raise RuntimeError("REST klines method not found on rest client (expected klines/get_klines/fapi_klines)")
+
+
+def _parse_rest_kline_rows(
+    *,
     exchange_id: int,
     symbol_id: int,
     interval: str,
-    source: str,
-) -> List[Dict[str, Any]]:
+    payload: List[list],
+    source: str = "rest_kline",
+) -> List[dict]:
     """
-    Нормализуем сырой payload Binance klines в список строк для upsert в БД.
+    Binance kline array:
+      [
+        0 openTime,
+        1 open,
+        2 high,
+        3 low,
+        4 close,
+        5 volume,
+        6 closeTime,
+        7 quoteVolume,
+        8 trades,
+        9 takerBuyBase,
+        10 takerBuyQuote,
+        11 ignore
+      ]
     """
-    rows: List[Dict[str, Any]] = []
-    if not payload:
-        return rows
-
+    out: List[dict] = []
     now = _utc_now()
-    for k in payload:
-        try:
-            open_time_ms = int(k[0])
-            open_time = datetime.fromtimestamp(open_time_ms / 1000, tz=timezone.utc)
-            rows.append(
-                dict(
-                    exchange_id=int(exchange_id),
-                    symbol_id=int(symbol_id),
-                    interval=str(interval),
-                    open_time=open_time,
-                    open=float(k[1]),
-                    high=float(k[2]),
-                    low=float(k[3]),
-                    close=float(k[4]),
-                    volume=float(k[5]),
-                    source=str(source),
-                    updated_at=now,
-                )
-            )
-        except Exception:
+
+    for r in payload or []:
+        if not isinstance(r, (list, tuple)) or len(r) < 11:
             continue
-    return rows
+
+        open_time = _from_ms(r[0])
+        if open_time is None:
+            continue
+
+        vol = _safe_float(r[5], 0.0)
+        qv = _safe_float(r[7], 0.0)
+        tbb = _safe_float(r[9], 0.0)
+        tbq = _safe_float(r[10], 0.0)
+
+        out.append(
+            {
+                "exchange_id": int(exchange_id),
+                "symbol_id": int(symbol_id),
+                "interval": str(interval),
+                "open_time": open_time,
+                "open": _safe_float(r[1], 0.0),
+                "high": _safe_float(r[2], 0.0),
+                "low": _safe_float(r[3], 0.0),
+                "close": _safe_float(r[4], 0.0),
+                "volume": vol,
+                "quote_volume": qv,
+                "trades": _safe_int(r[8], 0),
+                "taker_buy_base": tbb,
+                "taker_buy_quote": tbq,
+                "taker_sell_base": vol - tbb,
+                "taker_sell_quote": qv - tbq,
+                "source": str(source),
+                "updated_at": now,
+            }
+        )
+    return out
 
 
-def _load_watermarks_from_db(*, storage, exchange_id: int, intervals: List[str]) -> Dict[Tuple[int, str], datetime]:
-    """
-    Загружаем "watermarks" из БД: (symbol_id, interval) -> max(open_time).
-    Это позволяет:
-      - не сеедить, если данные уже есть
-      - пропускать опрос, если данные "достаточно свежие"
-    """
-    try:
-        wm = storage.get_candles_watermarks(exchange_id=int(exchange_id), intervals=list(intervals))
-        if isinstance(wm, dict):
-            return wm
-    except Exception:
-        logger.exception("[Candles] failed to load watermarks")
-    return {}
-
-
-def _backfill_symbol_interval(
+# --- BACKWARD COMPAT for collector_candles_gap_repair.py ---
+def _parse_klines_payload(
     *,
-    binance_rest,
-    storage,
+    exchange_id: int,
+    symbol_id: int,
+    interval: str,
+    payload: list,
+    source: str = "gap_repair",
+) -> list[dict]:
+    """
+    Совместимость со старым GapRepair:
+      - он импортирует _parse_klines_payload из collector_candles.py
+      - и передаёт source="gap_repair"
+    """
+    return _parse_rest_kline_rows(
+        exchange_id=int(exchange_id),
+        symbol_id=int(symbol_id),
+        interval=str(interval),
+        payload=payload or [],
+        source=str(source),
+    )
+
+
+def _load_last_candle_time_from_db(
+    *,
+    storage: Any,
+    exchange_id: int,
+    symbol_id: int,
+    interval: str,
+) -> Optional[datetime]:
+    """
+    Watermark из БД: MAX(open_time) по (exchange_id, symbol_id, interval)
+    Используем только для seed.
+    """
+    pool = getattr(storage, "pool", None)
+    if pool is None:
+        return None
+    try:
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT MAX(open_time)
+                    FROM candles
+                    WHERE exchange_id=%s AND symbol_id=%s AND interval=%s
+                    """,
+                    (int(exchange_id), int(symbol_id), str(interval)),
+                )
+                row = cur.fetchone()
+                return row[0] if row and row[0] else None
+    except Exception:
+        logger.exception("[CandlesSeed] failed to load last candle time from DB")
+        return None
+
+
+def _seed_symbol_interval_forward(
+    *,
+    storage: Any,
+    rest: Any,
     exchange_id: int,
     symbol: str,
     symbol_id: int,
     interval: str,
-    start_dt: datetime,
-    end_dt: datetime,
-    chunk_limit: int,
-    req_sleep_sec: float,
+    seed_days: int,
+    limit: int,
+    max_pages: int,
+    per_request_sleep_sec: float,
     stop_event: threading.Event,
-) -> Tuple[int, Optional[datetime]]:
+) -> int:
     """
-    Seed/backfill для ОДНОЙ пары (symbol, interval).
-
-    Делает paging через start/end. Это тяжёлая операция -> используем только при seed.
+    SEED "вперёд" (pagination-safe), чтобы не было дыр:
+      - определяем start_dt (либо now-seed_days, либо last_open_time-overlap)
+      - делаем запрос [start_dt..now], limit
+      - upsert
+      - двигаем start_dt = max_open_time + 1ms
+      - если пришло < limit -> конец
+      - ограничиваемся max_pages
     """
-    cur_start = start_dt
-    max_open: Optional[datetime] = None
-    upserts = 0
+    seed_days = max(1, int(seed_days))
+    limit = max(50, min(int(limit), 1500))
+    max_pages = max(1, int(max_pages))
+    per_request_sleep_sec = max(0.0, float(per_request_sleep_sec))
 
-    chunk_limit = max(1, min(int(chunk_limit), 1500))
+    now = _utc_now()
+    seed_from = now - timedelta(days=seed_days)
 
-    for _ in range(50_000):  # safety
+    last_dt = _load_last_candle_time_from_db(
+        storage=storage,
+        exchange_id=exchange_id,
+        symbol_id=symbol_id,
+        interval=interval,
+    )
+    if last_dt is not None:
+        # небольшой overlap для восстановления края
+        start_dt = max(seed_from, last_dt - timedelta(minutes=30))
+    else:
+        start_dt = seed_from
+
+    end_dt = now
+    total_upserts = 0
+    last_progress: Optional[datetime] = None
+
+    for _ in range(max_pages):
         if stop_event.is_set():
             break
 
-        payload = binance_rest.klines(
-            symbol=symbol,
-            interval=interval,
-            start_time_ms=_to_ms(cur_start),
-            end_time_ms=_to_ms(end_dt),
-            limit=int(chunk_limit),
+        payload = _rest_klines_call(
+            rest,
+            symbol=str(symbol),
+            interval=str(interval),
+            start_ms=_to_ms(start_dt),
+            end_ms=_to_ms(end_dt),
+            limit=limit,
         )
-        rows = _parse_klines_payload(
-            payload=payload,
+        if not payload:
+            break
+
+        rows = _parse_rest_kline_rows(
             exchange_id=exchange_id,
             symbol_id=symbol_id,
             interval=interval,
+            payload=payload,
             source="rest_seed",
         )
         if not rows:
             break
 
-        upserts += int(storage.upsert_candles(rows) or 0)
-
-        last_open = rows[-1].get("open_time")
-        if isinstance(last_open, datetime):
-            max_open = last_open if (max_open is None or last_open > max_open) else max_open
-            # +1ms чтобы не зациклиться на той же свече
-            cur_start = last_open + timedelta(milliseconds=1)
-
-        # если вернулось меньше chunk_limit — значит достигли конца
-        if len(rows) < int(chunk_limit):
-            break
-
-        if stop_event.wait(req_sleep_sec):
-            break
-
-    return upserts, max_open
-
-
-def _calc_interval_min_poll_sec(interval: str, base_poll_sec: float) -> float:
-    """
-    Интервалы разной "длины" нет смысла поллить одинаково часто.
-    Логика по умолчанию:
-      - минимум base_poll_sec (как задано конфигом)
-      - но также "не чаще чем каждые (interval / divisor)"
-
-    divisor подобран консервативно:
-      1h -> ~10 минут
-      4h -> ~40 минут
-      1d -> ~4 часа
-    """
-    itv_ms = _interval_ms(interval)
-    itv_sec = itv_ms / 1000.0
-
-    # чем больше divisor — тем чаще обновляем
-    # можно подобрать под себя позже, но это безопасный старт
-    if interval.endswith("m"):
-        divisor = 2.0   # минутные можно обновлять чаще
-    elif interval.endswith("h"):
-        divisor = 6.0
-    elif interval.endswith("d"):
-        divisor = 6.0
-    else:
-        divisor = 6.0
-
-    return max(float(base_poll_sec), float(itv_sec / divisor))
-
-
-def run_candles_collector(
-    *,
-    binance_rest,
-    storage,
-    exchange_id: int,
-    symbol_ids: Dict[str, int],
-    intervals: List[str],
-    poll_sec: float,
-    symbols_per_cycle: int,
-    per_request_sleep_sec: float,
-    seed_on_start: bool,
-    seed_days: int,
-    seed_chunk_limit: int,
-    overlap_points: int,
-    stop_event: threading.Event,
-    loop_limit: int = 5,
-    seed_limit: int = 0,
-    # ✅ новое: обновлять ли "текущую незакрытую" свечу слишком часто
-    # False = если watermark уже >= open_time текущей свечи, пропускаем запрос
-    update_open_candle: bool = False,
-) -> None:
-    """
-    Основной коллектор свечей.
-
-    Режимы:
-      - SEED (опционально): один раз заполнить историю
-      - MAIN LOOP: "tail mode" — берём небольшой хвост, чтобы поддерживать near-realtime данные
-
-    Ключевое улучшение:
-      - interval-aware polling: 1d/4h опрашиваем заметно реже
-      - skip-if-fresh: если текущая свеча уже есть в БД — запрос можно пропустить
-    """
-    intervals = [str(x).strip() for x in (intervals or []) if str(x).strip()]
-    if not intervals:
-        logger.info("[Candles] intervals не заданы -> стоп")
-        return
-
-    symbols = [(str(s).upper().strip(), int(sid)) for s, sid in (symbol_ids or {}).items()]
-    symbols = [(s, sid) for s, sid in symbols if s]
-    symbols.sort(key=lambda x: x[0])
-    if not symbols:
-        logger.info("[Candles] symbols не заданы -> стоп")
-        return
-
-    q: Deque[Tuple[str, int]] = deque(symbols)
-
-    # clamp входов
-    poll_sec = max(5.0, float(poll_sec))
-    symbols_per_cycle = max(1, int(symbols_per_cycle))
-    per_request_sleep_sec = max(0.05, float(per_request_sleep_sec))
-    overlap_points = max(0, int(overlap_points))
-    loop_limit = max(1, min(int(loop_limit), 10))
-    seed_limit = max(0, min(int(seed_limit), 1500))
-    seed_chunk_limit = max(1, min(int(seed_chunk_limit), 1500))
-    seed_days = max(0, int(seed_days))
-
-    # tail size: небольшой "хвост" + overlap
-    tail_limit = max(5, loop_limit + overlap_points + 1)
-
-    # заранее посчитаем минимальный poll для каждого интервала
-    min_poll_by_interval: Dict[str, float] = {itv: _calc_interval_min_poll_sec(itv, poll_sec) for itv in intervals}
-
-    logger.info(
-        "[Candles] started symbols=%d intervals=%s base_poll=%.1fs batch=%d req_sleep=%.2fs "
-        "seed=%s seed_days=%d seed_chunk=%d seed_limit=%d tail_limit=%d overlap=%d update_open=%s",
-        len(q),
-        ",".join(intervals),
-        poll_sec,
-        symbols_per_cycle,
-        per_request_sleep_sec,
-        seed_on_start,
-        seed_days,
-        seed_chunk_limit,
-        seed_limit,
-        tail_limit,
-        overlap_points,
-        update_open_candle,
-    )
-
-    # cooldown на пару (symbol, interval)
-    cooldown_until: Dict[Tuple[str, str], datetime] = {}
-
-    # next_due: (symbol_id, interval) -> когда в следующий раз можно опрашивать этот интервал
-    next_due: Dict[Tuple[int, str], datetime] = {}
-
-    watermarks = _load_watermarks_from_db(storage=storage, exchange_id=exchange_id, intervals=intervals)
-    logger.info("[Candles] loaded watermarks from DB: %d", len(watermarks))
-
-    # ------------------ SEED (однократно) ------------------
-    if seed_on_start:
-        now = _utc_now()
-        total_seed = 0
-        seeded_pairs = 0
-
-        if seed_days > 0:
-            end_dt = now
-            seed_from = end_dt - timedelta(days=seed_days)
-
-            for sym, sid in list(q):
-                for itv in intervals:
-                    if stop_event.is_set():
-                        break
-                    if watermarks.get((sid, itv)) is not None:
-                        continue
-
-                    try:
-                        n, max_open = _backfill_symbol_interval(
-                            binance_rest=binance_rest,
-                            storage=storage,
-                            exchange_id=exchange_id,
-                            symbol=sym,
-                            symbol_id=sid,
-                            interval=itv,
-                            start_dt=seed_from,
-                            end_dt=end_dt,
-                            chunk_limit=seed_chunk_limit,
-                            req_sleep_sec=per_request_sleep_sec,
-                            stop_event=stop_event,
-                        )
-                        total_seed += int(n or 0)
-                        seeded_pairs += 1
-                        if max_open is not None:
-                            watermarks[(sid, itv)] = max_open
-
-                    except Exception as e:
-                        code = _classify_http_error(e)
-                        if code in (418, 429):
-                            logger.warning("[CandlesSeed] %s %s HTTP=%s (rate/ban)", sym, itv, code, exc_info=True)
-                            cooldown_until[(sym, itv)] = _utc_now() + timedelta(minutes=5)
-                        elif code == 451:
-                            logger.warning("[CandlesSeed] %s %s HTTP=451 (restricted)", sym, itv, exc_info=True)
-                            cooldown_until[(sym, itv)] = _utc_now() + timedelta(hours=6)
-                        else:
-                            logger.exception("[CandlesSeed] %s %s failed", sym, itv)
-
-                    if stop_event.wait(per_request_sleep_sec):
-                        break
-
-        elif seed_limit > 0:
-            # "лёгкий seed": только хвост
-            for sym, sid in list(q):
-                for itv in intervals:
-                    if stop_event.is_set():
-                        break
-                    if watermarks.get((sid, itv)) is not None:
-                        continue
-
-                    try:
-                        payload = binance_rest.klines(symbol=sym, interval=itv, limit=int(seed_limit))
-                        rows = _parse_klines_payload(
-                            payload=payload,
-                            exchange_id=exchange_id,
-                            symbol_id=sid,
-                            interval=itv,
-                            source="rest_seed_tail",
-                        )
-                        if rows:
-                            total_seed += int(storage.upsert_candles(rows) or 0)
-                            seeded_pairs += 1
-                            last_open = rows[-1].get("open_time")
-                            if isinstance(last_open, datetime):
-                                watermarks[(sid, itv)] = last_open
-
-                    except Exception as e:
-                        code = _classify_http_error(e)
-                        if code in (418, 429):
-                            logger.warning("[CandlesSeedTail] %s %s HTTP=%s (rate/ban)", sym, itv, code, exc_info=True)
-                            cooldown_until[(sym, itv)] = _utc_now() + timedelta(minutes=5)
-                        elif code == 451:
-                            logger.warning("[CandlesSeedTail] %s %s HTTP=451 (restricted)", sym, itv, exc_info=True)
-                            cooldown_until[(sym, itv)] = _utc_now() + timedelta(hours=6)
-                        else:
-                            logger.warning("[CandlesSeedTail] %s %s failed", sym, itv, exc_info=True)
-
-                    if stop_event.wait(per_request_sleep_sec):
-                        break
-
-        logger.info("[CandlesSeed] done seeded_pairs=%d upserts=%d", seeded_pairs, total_seed)
-
-    # ------------------ MAIN LOOP (tail mode) ------------------
-    backoff = 1.0
-    while not stop_event.is_set():
         try:
-            t0 = time.time()
+            n = int(storage.upsert_candles(rows) or 0)
+            total_upserts += n
+        except Exception:
+            logger.exception("[CandlesSeed] upsert_candles failed sym=%s itv=%s", symbol, interval)
 
-            # выбираем batch символов round-robin
-            batch: List[Tuple[str, int]] = []
-            for _ in range(symbols_per_cycle):
-                sym, sid = q.popleft()
-                batch.append((sym, sid))
-                q.append((sym, sid))
+        best: Optional[datetime] = None
+        for r in rows:
+            ot = r.get("open_time")
+            if isinstance(ot, datetime):
+                if best is None or ot > best:
+                    best = ot
 
-            upserts = 0
-            now = _utc_now()
+        if best is None:
+            break
 
-            for sym, sid in batch:
-                for itv in intervals:
-                    if stop_event.is_set():
-                        break
+        if last_progress is not None and best <= last_progress:
+            logger.warning("[CandlesSeed] stalled sym=%s itv=%s best=%s last=%s", symbol, interval, best, last_progress)
+            break
+        last_progress = best
 
-                    # 1) cooldown по ошибкам (429/418/451)
-                    cd = cooldown_until.get((sym, itv))
-                    if cd is not None and cd > now:
-                        continue
+        if len(rows) < limit:
+            break
 
-                    # 2) interval-aware throttling: не опрашиваем интервал чаще, чем нужно
-                    due = next_due.get((sid, itv))
-                    if due is not None and due > now:
-                        continue
+        start_dt = best + timedelta(milliseconds=1)
+        if start_dt >= end_dt:
+            break
 
-                    # 3) skip-if-fresh: если текущая свеча уже есть в БД — можно пропустить
-                    # Если update_open_candle=True, то мы НЕ пропускаем и обновляем текущую свечу чаще.
-                    itv_ms = _interval_ms(itv)
-                    cur_open = _floor_time_to_interval(now, itv_ms)
-                    last_open = watermarks.get((sid, itv))
+        if per_request_sleep_sec > 0 and stop_event.wait(per_request_sleep_sec):
+            break
 
-                    if (not update_open_candle) and isinstance(last_open, datetime) and last_open >= cur_open:
-                        # следующая свеча начнётся через itv_ms, но дадим небольшой лаг (15с)
-                        next_due[(sid, itv)] = cur_open + timedelta(milliseconds=itv_ms) + timedelta(seconds=15)
-                        continue
+    return total_upserts
 
-                    # 4) REST запрос "хвоста"
+
+# -------------------------
+# WS worker (kline)
+# -------------------------
+
+class _WSKlineWorker(threading.Thread):
+    def __init__(
+        self,
+        *,
+        name: str,
+        storage: Any,
+        exchange_id: int,
+        symbol_ids: Dict[str, int],
+        interval: str,
+        symbols: List[str],
+        stop_event: threading.Event,
+        update_open_candle: bool,
+        flush_sec: float = 1.0,
+        max_buffer: int = 2000,
+    ) -> None:
+        super().__init__(daemon=True, name=name)
+
+        self.storage = storage
+        self.exchange_id = int(exchange_id)
+        self.symbol_ids = {str(k).upper(): int(v) for k, v in (symbol_ids or {}).items()}
+
+        self.interval = str(interval)
+        self.symbols = [str(s).upper() for s in (symbols or [])]
+        self.stop_event = stop_event
+        self.update_open_candle = bool(update_open_candle)
+
+        self.flush_sec = max(0.2, float(flush_sec))
+        self.max_buffer = max(100, int(max_buffer))
+
+        self._buf: List[dict] = []
+        self._last_flush = time.time()
+
+    def _flush(self) -> None:
+        if not self._buf:
+            return
+
+        batch = self._buf
+        self._buf = []
+        self._last_flush = time.time()
+
+        for r in batch:
+            if isinstance(r, dict) and "is_closed" in r:
+                r.pop("is_closed", None)
+
+        try:
+            n = int(self.storage.upsert_candles(batch) or 0)
+            if n > 0:
+                logger.info("[CandlesWS][%s] flush upserts=%d", self.name, n)
+        except Exception:
+            logger.exception("[CandlesWS][%s] upsert_candles failed", self.name)
+
+    def _on_message(self, msg: dict) -> None:
+        data = msg.get("data") if isinstance(msg, dict) else None
+        if not isinstance(data, dict):
+            return
+
+        row = norm_kline_event(self.exchange_id, self.symbol_ids, data)
+        if not row:
+            return
+
+        is_closed = bool(row.get("is_closed"))
+        if (not is_closed) and (not self.update_open_candle):
+            return
+
+        self._buf.append(row)
+
+        if len(self._buf) >= self.max_buffer:
+            self._flush()
+
+        if (time.time() - self._last_flush) >= self.flush_sec:
+            self._flush()
+
+    def run(self) -> None:
+        import websocket  # websocket-client
+
+        streams = _make_streams(self.symbols, self.interval)
+        url = _combined_ws_url(streams)
+
+        logger.info(
+            "[CandlesWS][%s] start interval=%s symbols=%d update_open=%s",
+            self.name,
+            self.interval,
+            len(self.symbols),
+            self.update_open_candle,
+        )
+
+        backoff = 1.0
+
+        while not self.stop_event.is_set():
+            try:
+
+                def on_message(_ws, message: str) -> None:
                     try:
-                        payload = binance_rest.klines(symbol=sym, interval=itv, limit=int(tail_limit))
-                        rows = _parse_klines_payload(
-                            payload=payload,
-                            exchange_id=exchange_id,
-                            symbol_id=sid,
-                            interval=itv,
-                            source="rest_tail",
-                        )
+                        msg = json.loads(message)
+                    except Exception:
+                        return
+                    self._on_message(msg)
 
-                    except Exception as e:
-                        code = _classify_http_error(e)
-                        if code in (418, 429):
-                            logger.warning("[Candles] %s %s HTTP=%s (rate/ban)", sym, itv, code, exc_info=True)
-                            cooldown_until[(sym, itv)] = _utc_now() + timedelta(minutes=5)  # было 2m, делаем безопаснее
-                        elif code == 451:
-                            logger.warning("[Candles] %s %s HTTP=451 (restricted)", sym, itv, exc_info=True)
-                            cooldown_until[(sym, itv)] = _utc_now() + timedelta(hours=6)
-                        else:
-                            logger.debug("[Candles] %s %s poll failed", sym, itv, exc_info=True)
-                        rows = []
+                def on_open(_ws) -> None:
+                    logger.info("[CandlesWS][%s] connected", self.name)
 
-                    # 5) upsert + watermark
-                    if rows:
-                        upserts += int(storage.upsert_candles(rows) or 0)
-                        last_open2 = rows[-1].get("open_time")
-                        if isinstance(last_open2, datetime):
-                            prev = watermarks.get((sid, itv))
-                            if prev is None or last_open2 > prev:
-                                watermarks[(sid, itv)] = last_open2
+                def on_error(_ws, err) -> None:
+                    logger.warning("[CandlesWS][%s] error: %s", self.name, err)
 
-                    # 6) выставляем next_due по интервалу (даже если rows пустые — не спамим)
-                    next_due[(sid, itv)] = _utc_now() + timedelta(seconds=float(min_poll_by_interval[itv]))
+                def on_close(_ws, status_code, msg) -> None:
+                    logger.warning("[CandlesWS][%s] closed code=%s msg=%s", self.name, status_code, msg)
 
-                    # 7) пауза между запросами
-                    if stop_event.wait(per_request_sleep_sec):
-                        break
+                ws_app = websocket.WebSocketApp(
+                    url,
+                    on_open=on_open,
+                    on_message=on_message,
+                    on_error=on_error,
+                    on_close=on_close,
+                )
+                ws_app.run_forever(ping_interval=20, ping_timeout=10)
 
-            logger.info("[Candles] poll batch=%d upserts=%d", len(batch), upserts)
-            backoff = 1.0
+            except Exception:
+                logger.exception("[CandlesWS][%s] crash", self.name)
 
-            # базовый poll_sec — это пауза между циклами
-            dt = time.time() - t0
-            sleep = max(0.0, poll_sec - dt)
-            stop_event.wait(sleep)
+            try:
+                self._flush()
+            except Exception:
+                pass
 
-        except Exception as e:
-            logger.warning("[Candles] error: %s", e, exc_info=True)
-            stop_event.wait(backoff)
-            backoff = min(backoff * 2.0, 300.0)
+            if self.stop_event.wait(backoff):
+                break
+            backoff = min(backoff * 2.0, 60.0)
 
+        self._flush()
+        logger.info("[CandlesWS][%s] stopped", self.name)
+
+
+# -------------------------
+# public start
+# -------------------------
 
 def start_candles_collector(
     *,
-    rest,
-    storage,
+    storage: Any,
+    rest: Any,
     exchange_id: int,
-    symbol_ids: Dict[str, int],
+    symbol_ids: Dict[str, int],     # {SYMBOL: symbol_id}
     intervals: List[str],
-    poll_sec: float = 120.0,
-    symbols_per_cycle: int = 2,
-    per_request_sleep_sec: float = 0.35,
-    seed_on_start: bool = False,
-    seed_days: int = 0,
+
+    # --- NEW seed+ws mode ---
+    seed_on_start: bool = True,
+    seed_days: int = 2,
+    seed_limit: int = 1500,
+    seed_max_pages_per_symbol: int = 2,
+    seed_symbols_per_cycle: int = 5,
+    per_request_sleep_sec: float = 0.20,
+
+    use_ws: bool = True,
+    ws_max_streams_per_conn: int = 120,
+    update_open_candle: bool = True,
+
+    stop_event: threading.Event | None = None,
+
+    # --- OLD params (backward compat) ---
+    poll_sec: float = 30.0,
+    symbols_per_cycle: int = 40,
     seed_chunk_limit: int = 1500,
-    overlap_points: int = 2,
-    stop_event: threading.Event,
-    loop_limit: int = 5,
-    seed_limit: int = 0,
-    update_open_candle: bool = False,  # ✅ новое
-) -> threading.Thread:
+    loop_limit: int = 0,
+    overlap_points: int = 1,
+    lookback_days_if_empty: int = 2,
+    refresh_symbols_sec: int = 300,
+
+    # allow extra kwargs from config
+    **_kwargs,
+) -> List[threading.Thread]:
     """
-    Стартуем коллектор в отдельном потоке.
+    Режим под твой кейс (много символов):
+      1) SEED (REST): на старте догружаем историю батчами.
+      2) LIVE (WS): дальше свечи пополняются по kline websocket.
+
+    ВАЖНО:
+      - Старые параметры оставлены для совместимости, но в новом режиме почти не нужны.
+      - stop_event обязателен: если None — создадим локальный (но лучше передавать из run_market_data).
     """
-    t = threading.Thread(
-        target=run_candles_collector,
-        kwargs=dict(
-            binance_rest=rest,
-            storage=storage,
-            exchange_id=int(exchange_id),
-            symbol_ids=dict(symbol_ids),
-            intervals=list(intervals),
-            poll_sec=float(poll_sec),
-            symbols_per_cycle=int(symbols_per_cycle),
-            per_request_sleep_sec=float(per_request_sleep_sec),
-            seed_on_start=bool(seed_on_start),
-            seed_days=int(seed_days),
-            seed_chunk_limit=int(seed_chunk_limit),
-            overlap_points=int(overlap_points),
-            stop_event=stop_event,
-            loop_limit=int(loop_limit),
-            seed_limit=int(seed_limit),
-            update_open_candle=bool(update_open_candle),
-        ),
-        daemon=True,
-        name=f"BinanceCandlesCollector-{exchange_id}",
+    if stop_event is None:
+        stop_event = threading.Event()
+
+    intervals = [str(x).strip() for x in (intervals or []) if str(x).strip()]
+    if not intervals:
+        intervals = ["5m"]
+
+    pairs = sorted(
+        ((str(sym).upper().strip(), int(sid)) for sym, sid in (symbol_ids or {}).items() if str(sym).strip()),
+        key=lambda x: x[0],
     )
-    t.start()
-    logger.info("[Candles] collector thread started")
-    return t
+    symbols = [sym for sym, _ in pairs]
+    if not symbols:
+        logger.warning("[Candles] no symbols -> nothing to start")
+        return []
+
+    # "backward" compat fallback:
+    # - если в коде/конфиге не передали новые seed_* поля,
+    #   можно использовать старые seed_chunk_limit/loop_limit как суррогаты.
+    # (но мы предпочитаем новые параметры)
+    if not seed_max_pages_per_symbol or int(seed_max_pages_per_symbol) <= 0:
+        seed_max_pages_per_symbol = max(1, int(loop_limit or 2))
+    if not seed_symbols_per_cycle or int(seed_symbols_per_cycle) <= 0:
+        # старый seed_chunk_limit у тебя раньше означал "батч символов"
+        seed_symbols_per_cycle = max(1, int(seed_chunk_limit or 5))
+
+    # -------------------------
+    # SEED: REST history
+    # -------------------------
+    if bool(seed_on_start) and int(seed_days) > 0:
+        batch_size = max(1, int(seed_symbols_per_cycle))
+        max_pages = max(1, int(seed_max_pages_per_symbol))
+        limit = max(50, min(int(seed_limit), 1500))
+        sleep_s = max(0.0, float(per_request_sleep_sec))
+
+        logger.info(
+            "[CandlesSeed] start seed_days=%d intervals=%s symbols=%d rest_limit=%d max_pages_per_symbol=%d batch=%d sleep=%.2fs",
+            int(seed_days),
+            ",".join(intervals),
+            len(symbols),
+            int(limit),
+            int(max_pages),
+            int(batch_size),
+            float(sleep_s),
+        )
+
+        for itv in intervals:
+            if stop_event.is_set():
+                break
+
+            for i in range(0, len(pairs), batch_size):
+                if stop_event.is_set():
+                    break
+
+                batch = pairs[i : i + batch_size]
+                up_total = 0
+
+                for sym, sid in batch:
+                    if stop_event.is_set():
+                        break
+                    try:
+                        n = _seed_symbol_interval_forward(
+                            storage=storage,
+                            rest=rest,
+                            exchange_id=int(exchange_id),
+                            symbol=sym,
+                            symbol_id=int(sid),
+                            interval=str(itv),
+                            seed_days=int(seed_days),
+                            limit=int(limit),
+                            max_pages=int(max_pages),
+                            per_request_sleep_sec=float(sleep_s),
+                            stop_event=stop_event,
+                        )
+                        up_total += int(n or 0)
+                    except Exception:
+                        logger.exception("[CandlesSeed] failed sym=%s itv=%s", sym, itv)
+
+                logger.info("[CandlesSeed] interval=%s batch=%d upserts=%d", itv, len(batch), up_total)
+
+    # -------------------------
+    # LIVE: websocket klines
+    # -------------------------
+    if not bool(use_ws):
+        logger.warning("[Candles] use_ws=false -> LIVE WS disabled; with many symbols REST live polling will hit 429. Enable use_ws.")
+        return []
+
+    max_streams = max(20, int(ws_max_streams_per_conn))
+    chunks = _chunk(symbols, max_streams)
+
+    threads: List[threading.Thread] = []
+    for itv in intervals:
+        for idx, syms in enumerate(chunks):
+            t = _WSKlineWorker(
+                name=f"BinanceCandlesWS-{itv}-{idx + 1}",
+                storage=storage,
+                exchange_id=int(exchange_id),
+                symbol_ids=dict(symbol_ids or {}),
+                interval=str(itv),
+                symbols=syms,
+                stop_event=stop_event,
+                update_open_candle=bool(update_open_candle),
+                flush_sec=1.0,
+                max_buffer=2000,
+            )
+            t.start()
+            threads.append(t)
+
+    logger.info(
+        "[CandlesWS] started threads=%d intervals=%s symbols=%d chunks=%d",
+        len(threads),
+        ",".join(intervals),
+        len(symbols),
+        len(chunks),
+    )
+    return threads

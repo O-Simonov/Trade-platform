@@ -43,27 +43,27 @@ symbols_refresh:
   refresh_sec: 60
 
 # ✅ Higher TF candles only (NO 1m/5m)
+#candles:
 market_data:
   enabled: true
-  candle_intervals: ["15m", "1h", "4h", "1d"]
+  candle_intervals: [ "15m","1h","4h","1d" ]
+  seed_on_start: true
+  seed_days: 30
+  seed_limit: 1500
+  seed_max_pages_per_symbol: 0      # ✅ авто под интервал
+  seed_symbols_per_cycle: 4
+  per_request_sleep_sec: 0.20
+  seed_overlap_minutes: 60
 
-  poll_sec: 120
-  symbols_per_cycle: 25
-  req_sleep_sec: 0.20
-
+  use_ws: true
+  ws_max_streams_per_conn: 120
   update_open_candle: true
 
-  # keep off by default (you can enable if DB empty)
-  seed_on_start: false
-  seed_days: 0
-  seed_chunk_limit: 1500
-  seed_limit: 0
-
-  loop_limit: 4
-  overlap_points: 1
-
-  lookback_days_if_empty: 3
-  refresh_symbols_sec: 300
+  # ✅ фикс разрывов при падениях WS
+  rest_catchup_on_connect: true
+  rest_catchup_overlap_minutes: 120
+  rest_catchup_limit: 1500
+  rest_catchup_max_pages: 2
 
 # ✅ Open Interest (heavy)
 open_interest:
@@ -177,24 +177,22 @@ market_trades:
 # ✅ gap repair - NO 5m (avoid FAST conflict)
 candles_gap_repair:
   enabled: true
-  intervals: ["15m", "1h", "4h", "1d"]
-
-  every_sec: 3600
-  max_symbols_per_cycle: 35
-  gaps_per_symbol: 2
-  max_gaps_per_cycle: 12
-
-  limit: 600
-  sleep_sec: 0.75
-
+  intervals: ["4h", "1h", "15m", "5m"]     # можно расширять
+  every_sec: 600                          # раз в 10 минут
   only_active_symbols: true
 
-  priority: 2
-  max_gap_days: 7
-  max_backfill_span_days: 3
-  min_gap_points: 3
+  max_symbols_per_cycle: 60
+  max_gaps_per_cycle: 20
+  gaps_per_symbol: 2
 
-  priority_symbols: ["BTCUSDT", "ETHUSDT"]
+  max_gap_days: 30                        # ✅ критично (не 0)
+  min_gap_points: 1
+
+  limit: 1500
+  sleep_sec: 0.25
+
+  priority: 1                             # 0=агрессивно, 1=норм, 2=медленно
+  priority_symbols: ["BTCUSDT","ETHUSDT"]
 
 # ✅ retention only in SLOW
 retention:

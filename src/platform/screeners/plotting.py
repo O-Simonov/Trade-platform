@@ -1,16 +1,39 @@
 # src/platform/screeners/plotting.py
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Optional, Sequence, Dict, Any
+from datetime import timedelta
 
-# ✅ IMPORTANT: fix Windows/Server crash (no GUI backend)
-# Must be set BEFORE importing pyplot
-import matplotlib
-matplotlib.use("Agg")
+# ======================================================================
+# HARD-SAFE matplotlib setup (Windows Server / no GUI / no crashes)
+# ======================================================================
 
-import matplotlib.pyplot as plt
+os.environ.setdefault("MPLBACKEND", "Agg")
 
+try:
+    _ROOT = Path(__file__).resolve().parents[3]  # .../Trade-platform
+except Exception:
+    _ROOT = Path.cwd()
+
+_MPL_CACHE = _ROOT / ".cache" / "matplotlib"
+_MPL_CACHE.mkdir(parents=True, exist_ok=True)
+os.environ.setdefault("MPLCONFIGDIR", str(_MPL_CACHE))
+
+import matplotlib  # noqa
+matplotlib.use("Agg", force=True)
+
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
+
+import matplotlib.dates as mdates
+from matplotlib.patches import Rectangle
+
+
+# ======================================================================
+# Helpers
+# ======================================================================
 
 def _ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
@@ -20,10 +43,248 @@ def _safe_float(x: Any, default: float = 0.0) -> float:
     try:
         if x is None:
             return default
-        return float(x)
+        v = float(x)
+        if v != v:  # NaN
+            return default
+        return v
     except Exception:
         return default
 
+
+def _safe_ts_list(candles: Sequence[Dict[str, Any]]) -> list:
+    try:
+        return [c["ts"] for c in candles]
+    except Exception:
+        return []
+
+
+def _find_nearest_index(x: Sequence[Any], target: Any) -> int | None:
+    if not x or target is None:
+        return None
+    try:
+        best_i = None
+        best_d = None
+        for i, t in enumerate(x):
+            if t is None:
+                continue
+            d = abs((t - target).total_seconds())
+            if best_d is None or d < best_d:
+                best_d = d
+                best_i = i
+        return best_i
+    except Exception:
+        return None
+
+
+def _parse_interval_td(interval: str) -> timedelta:
+    s = str(interval).strip().lower()
+    if s.endswith("m"):
+        return timedelta(minutes=int(s[:-1]))
+    if s.endswith("h"):
+        return timedelta(hours=int(s[:-1]))
+    if s.endswith("d"):
+        return timedelta(days=int(s[:-1]))
+    return timedelta(hours=1)
+
+
+def _nice_time_axis(ax) -> None:
+    try:
+        locator = mdates.AutoDateLocator(minticks=4, maxticks=10)
+        formatter = mdates.ConciseDateFormatter(locator)
+        ax.xaxis.set_major_locator(locator)
+        ax.xaxis.set_major_formatter(formatter)
+    except Exception:
+        pass
+
+
+def _candlestick_width_days(x_num: list[float]) -> float:
+    if len(x_num) < 3:
+        return 0.02
+    try:
+        deltas = [abs(x_num[i] - x_num[i - 1]) for i in range(1, len(x_num))]
+        deltas = [d for d in deltas if d > 0]
+        if not deltas:
+            return 0.02
+        deltas.sort()
+        median = deltas[len(deltas) // 2]
+        return max(0.0005, median * 0.65)
+    except Exception:
+        return 0.02
+
+
+def _pct_to_level(level: Optional[float], base: float) -> Optional[float]:
+    try:
+        if level is None:
+            return None
+        lv = float(level)
+        if base <= 0:
+            return None
+        return (lv / float(base) - 1.0) * 100.0
+    except Exception:
+        return None
+
+
+def _plot_candles(ax, *, x_dt: list, o: list[float], h: list[float], l: list[float], c: list[float]) -> float:
+    if not x_dt:
+        return 0.02
+
+    x_num = mdates.date2num(x_dt)
+    w = _candlestick_width_days(list(x_num))
+
+    for i in range(len(x_num)):
+        x = x_num[i]
+        oo = o[i]
+        hh = h[i]
+        ll = l[i]
+        cc = c[i]
+
+        if hh <= 0 and ll <= 0 and oo <= 0 and cc <= 0:
+            continue
+
+        up = cc >= oo
+        col = "green" if up else "red"
+
+        ax.vlines(x, ll, hh, linewidth=1.0, alpha=0.9)
+
+        body_low = min(oo, cc)
+        body_h = abs(cc - oo)
+        if body_h < 1e-12:
+            body_h = 1e-12
+
+        rect = Rectangle(
+            (x - w / 2.0, body_low),
+            w,
+            body_h,
+            facecolor=col,
+            edgecolor=col,
+            alpha=0.65,
+        )
+        ax.add_patch(rect)
+
+    ax.set_xlim(x_num[0] - w * 2, x_num[-1] + w * 2)
+    return w
+
+
+def _aggregate_liq_to_candles(
+    *,
+    candles: Sequence[Dict[str, Any]],
+    liq: Sequence[Dict[str, Any]],
+    interval: str,
+) -> tuple[list, list, list]:
+    """
+    Возвращает:
+      x_c      список datetime свечей
+      long_y   long ликвидации (положительные)
+      short_y  short ликвидации (отрицательные)
+    """
+    if not candles or not liq:
+        return [], [], []
+
+    x_c = [c["ts"] for c in candles]
+    dt = _parse_interval_td(interval)
+    if dt.total_seconds() <= 0:
+        return [], [], []
+
+    try:
+        liq_sorted = sorted(liq, key=lambda r: r.get("ts") or x_c[0])
+    except Exception:
+        liq_sorted = list(liq)
+
+    long_y = [0.0] * len(x_c)
+    short_y = [0.0] * len(x_c)
+
+    i = 0
+    for r in liq_sorted:
+        ts = r.get("ts")
+        if ts is None:
+            continue
+
+        while i < len(x_c) - 1 and ts >= (x_c[i] + dt):
+            i += 1
+
+        if i < 0 or i >= len(x_c):
+            continue
+
+        if not (x_c[i] <= ts < (x_c[i] + dt)):
+            continue
+
+        long_y[i] += _safe_float(r.get("long_usdt"), 0.0)
+        short_y[i] += _safe_float(r.get("short_usdt"), 0.0)
+
+    short_y = [-abs(v) for v in short_y]
+    return x_c, long_y, short_y
+
+
+def _fallback_liq_series(
+    *,
+    candles: Sequence[Dict[str, Any]],
+    idx: int | None,
+    liq_long_usdt: float | None,
+    liq_short_usdt: float | None,
+) -> tuple[list, list, list]:
+    """
+    Если liquidation_series нет, рисуем 1 точку по ctx (liq_long_usdt/liq_short_usdt)
+    """
+    if not candles:
+        return [], [], []
+
+    x = [c["ts"] for c in candles]
+    long_y = [0.0] * len(x)
+    short_y = [0.0] * len(x)
+
+    if idx is None or idx < 0 or idx >= len(x):
+        return [], [], []
+
+    if liq_long_usdt is not None:
+        long_y[idx] = _safe_float(liq_long_usdt, 0.0)
+    if liq_short_usdt is not None:
+        short_y[idx] = -abs(_safe_float(liq_short_usdt, 0.0))
+
+    return x, long_y, short_y
+
+
+def _draw_level_zone(
+    ax,
+    *,
+    x0_dt,
+    level: float,
+    zone_pct: float,
+    label: str,
+    kind: str,
+    pct_from_entry: Optional[float] = None,
+) -> None:
+    lv = _safe_float(level, 0.0)
+    if lv <= 0:
+        return
+
+    z = abs(float(zone_pct)) if zone_pct else 0.003
+    if z <= 0:
+        z = 0.003
+
+    y0 = lv * (1.0 - z)
+    y1 = lv * (1.0 + z)
+
+    if kind == "up":
+        c = "green"
+        alpha = 0.10
+        va = "bottom"
+    else:
+        c = "blue"
+        alpha = 0.10
+        va = "top"
+
+    ax.axhspan(y0, y1, xmin=0.0, xmax=1.0, alpha=alpha)
+    ax.axhline(lv, linestyle="--", color=c, alpha=0.85)
+
+    if pct_from_entry is None:
+        ax.text(x0_dt, lv, f"{label}={lv:.6f}", va=va)
+    else:
+        ax.text(x0_dt, lv, f"{label}={lv:.6f} ({pct_from_entry:+.2f}%)", va=va)
+
+
+# ======================================================================
+# Plot API (3 panels)
+# ======================================================================
 
 def save_signal_plot(
     *,
@@ -31,133 +292,282 @@ def save_signal_plot(
     symbol: str,
     timeframe: str,
     candles: Sequence[Dict[str, Any]],
-    signal_ts: Any,
+    entry_ts: Any,
+    touch_ts: Any = None,
     side: str,
     entry_price: float,
     up_level: Optional[float] = None,
     down_level: Optional[float] = None,
+    stop_loss: Optional[float] = None,
+    take_profit: Optional[float] = None,
+    liquidation_series: Optional[Sequence[Dict[str, Any]]] = None,
     liq_short_usdt: Optional[float] = None,
     liq_long_usdt: Optional[float] = None,
-    enable_oi: bool = False,
-    oi_series: Optional[Sequence[Dict[str, Any]]] = None,
-    enable_cvd: bool = False,
-    cvd_series: Optional[Sequence[Dict[str, Any]]] = None,
-    enable_funding: bool = False,
-    funding_series: Optional[Sequence[Dict[str, Any]]] = None,
+    level_zone_pct: float = 0.003,  # 0.3%
+    **_: Any,
 ) -> None:
-    """
-    Надёжный PNG-плот по сигналу (без GUI, безопасно для Windows Server).
-
-    Рисуем:
-      - Close price (line)
-      - UP/DOWN level
-      - Entry marker
-      - Volume
-      - OI / CVD / Funding (опционально)
-    """
-
     if not candles:
         return
 
-    # --- prepare arrays ---
-    try:
-        x = [c["ts"] for c in candles]
-    except Exception:
+    out_path = Path(out_path)
+    x = _safe_ts_list(candles)
+    if not x:
         return
 
-    close = [_safe_float(c.get("close"), 0.0) for c in candles]
-    vol = [_safe_float(c.get("quote_volume") or c.get("volume"), 0.0) for c in candles]
+    o = [_safe_float(c.get("open"), 0.0) for c in candles]
+    h = [_safe_float(c.get("high"), 0.0) for c in candles]
+    l = [_safe_float(c.get("low"), 0.0) for c in candles]
+    c_ = [_safe_float(c.get("close"), 0.0) for c in candles]
 
-    # Panels:
-    # 0 price
-    # 1 volume
-    panels = 2
-    if enable_oi:
-        panels += 1
-    if enable_cvd:
-        panels += 1
-    if enable_funding:
-        panels += 1
+    # volume: quote_volume preferred
+    vol = []
+    for cc in candles:
+        qv = cc.get("quote_volume")
+        vv = cc.get("volume")
+        v = _safe_float(qv, 0.0)
+        if v <= 0:
+            v = _safe_float(vv, 0.0)
+        vol.append(v)
 
-    fig_h = max(6, panels * 2.2)
+    title_side = str(side or "").upper().strip()
+    if title_side == "LONG":
+        title_side = "BUY"
+    if title_side == "SHORT":
+        title_side = "SELL"
 
-    fig, axes = plt.subplots(panels, 1, figsize=(14, fig_h), sharex=True)
-    if panels == 1:
-        axes = [axes]
+    entry_p = _safe_float(entry_price, 0.0)
 
-    ax_price = axes[0]
-    ax_vol = axes[1]
+    up_pct = _pct_to_level(up_level, entry_p)
+    dn_pct = _pct_to_level(down_level, entry_p)
 
-    # --- PRICE ---
-    ax_price.plot(x, close)
-    ax_price.set_title(f"{symbol} [{timeframe}] {side} | entry={entry_price}")
+    extra_pct = ""
+    if up_pct is not None:
+        extra_pct += f" | UP {up_pct:+.2f}%"
+    if dn_pct is not None:
+        extra_pct += f" | DOWN {dn_pct:+.2f}%"
 
+    fig = Figure(figsize=(14, 9.5), dpi=110)
+    _ = FigureCanvas(fig)
+
+    ax_price, ax_vol, ax_liq = fig.subplots(3, 1, sharex=True, height_ratios=[3.2, 1.0, 1.6])
+
+    # =========================================================
+    # PRICE (Candles)
+    # =========================================================
+    candle_w = _plot_candles(ax_price, x_dt=x, o=o, h=h, l=l, c=c_)
+    ax_price.set_title(f"{symbol} [{timeframe}] {title_side} | entry={entry_p:.6f}{extra_pct}")
+
+    # уровни зонами
     if up_level is not None:
-        ax_price.axhline(_safe_float(up_level), linestyle="--")
-        ax_price.text(x[0], _safe_float(up_level), f"UP={up_level}", va="bottom")
-
-    if down_level is not None:
-        ax_price.axhline(_safe_float(down_level), linestyle="--")
-        ax_price.text(x[0], _safe_float(down_level), f"DOWN={down_level}", va="bottom")
-
-    # Entry marker
-    ax_price.axhline(_safe_float(entry_price), linestyle=":")
-    ax_price.text(x[-1], _safe_float(entry_price), f"ENTRY={entry_price}", ha="right", va="bottom")
-
-    # Info text
-    info_lines = []
-    if liq_short_usdt is not None:
-        info_lines.append(f"liq_short_usdt={_safe_float(liq_short_usdt):,.0f}")
-    if liq_long_usdt is not None:
-        info_lines.append(f"liq_long_usdt={_safe_float(liq_long_usdt):,.0f}")
-    if info_lines:
-        ax_price.text(
-            0.01,
-            0.98,
-            "\n".join(info_lines),
-            transform=ax_price.transAxes,
-            ha="left",
-            va="top",
+        _draw_level_zone(
+            ax_price,
+            x0_dt=x[0],
+            level=float(up_level),
+            zone_pct=level_zone_pct,
+            label="UP",
+            kind="up",
+            pct_from_entry=up_pct,
         )
 
-    # --- VOLUME ---
-    ax_vol.plot(x, vol)
-    ax_vol.set_title("Volume (quote_volume)")
+    if down_level is not None:
+        _draw_level_zone(
+            ax_price,
+            x0_dt=x[0],
+            level=float(down_level),
+            zone_pct=level_zone_pct,
+            label="DOWN",
+            kind="down",
+            pct_from_entry=dn_pct,
+        )
 
-    idx = 2
+    # SL / TP
+    slv = _safe_float(stop_loss, 0.0) if stop_loss is not None else 0.0
+    tpv = _safe_float(take_profit, 0.0) if take_profit is not None else 0.0
+    if slv > 0:
+        ax_price.axhline(slv, linestyle=":", color="red", alpha=0.7)
+        ax_price.text(x[0], slv, f"SL={slv:.6f}", va="bottom", color="red")
 
-    # --- OI ---
-    if enable_oi:
-        ax = axes[idx]
-        idx += 1
-        if oi_series:
-            xx = [r["ts"] for r in oi_series]
-            yy = [_safe_float(r.get("open_interest") or r.get("oi"), 0.0) for r in oi_series]
-            ax.plot(xx, yy)
-        ax.set_title("Open Interest")
+    if tpv > 0:
+        ax_price.axhline(tpv, linestyle=":", color="orange", alpha=0.7)
+        ax_price.text(x[0], tpv, f"TP={tpv:.6f}", va="bottom", color="orange")
 
-    # --- CVD ---
-    if enable_cvd:
-        ax = axes[idx]
-        idx += 1
-        if cvd_series:
-            xx = [r["ts"] for r in cvd_series]
-            yy = [_safe_float(r.get("cvd_quote") or r.get("cvd"), 0.0) for r in cvd_series]
-            ax.plot(xx, yy)
-        ax.set_title("CVD")
+    idx_entry = _find_nearest_index(x, entry_ts)
+    idx_touch = _find_nearest_index(x, touch_ts) if touch_ts is not None else None
 
-    # --- FUNDING ---
-    if enable_funding:
-        ax = axes[idx]
-        idx += 1
-        if funding_series:
-            xx = [r["ts"] for r in funding_series]
-            yy = [_safe_float(r.get("funding_rate") or r.get("rate"), 0.0) for r in funding_series]
-            ax.plot(xx, yy)
-        ax.set_title("Funding Rate")
+    # TOUCH marker (без подписей ликвидаций на цене — как ты просил)
+    if idx_touch is not None:
+        try:
+            x_t = x[idx_touch]
+            if title_side == "SELL":
+                y_t = h[idx_touch] if h[idx_touch] > 0 else c_[idx_touch]
+            elif title_side == "BUY":
+                y_t = l[idx_touch] if l[idx_touch] > 0 else c_[idx_touch]
+            else:
+                y_t = c_[idx_touch]
 
-    fig.tight_layout()
+            ax_price.axvline(x_t, linestyle=":", color="purple", alpha=0.9)
+            ax_price.scatter([x_t], [y_t], marker="x", color="purple")
+            ax_price.text(x_t, y_t, " TOUCH", va="bottom", ha="left", color="purple")
+        except Exception:
+            pass
+
+    # CONFIRM / ENTRY marker
+    if idx_entry is not None:
+        try:
+            x_e = x[idx_entry]
+            y_e = entry_p
+            marker = "^" if title_side == "BUY" else "v" if title_side == "SELL" else "o"
+
+            ax_price.axvline(x_e, linestyle="--", color="blue", alpha=0.9)
+            ax_price.scatter([x_e], [y_e], marker=marker, color="blue")
+            ax_price.text(x_e, y_e, f" {title_side} ", va="bottom", ha="left", color="blue")
+        except Exception:
+            pass
+
+    ax_price.grid(True, alpha=0.15)
+    _nice_time_axis(ax_price)
+
+    # =========================================================
+    # VOLUME panel (цветные)
+    # =========================================================
+    try:
+        ax_vol.set_title("Volume")
+        x_num = mdates.date2num(x)
+        w = candle_w * 0.85
+
+        vol_colors = ["green" if c_[i] >= o[i] else "red" for i in range(len(c_))]
+
+        ax_vol.bar(
+            x_num,
+            vol,
+            width=w,
+            align="center",
+            alpha=0.55,
+            color=vol_colors,
+            edgecolor=vol_colors,
+            linewidth=0.2,
+        )
+
+        ax_vol.grid(True, alpha=0.15)
+        ax_vol.set_ylabel("Vol")
+    except Exception:
+        pass
+
+    # =========================================================
+    # LIQUIDATIONS panel (СТОЛБИКИ ✅)
+    # =========================================================
+    ax_liq.set_title("Liquidations (USDT)  |  LONG (+)  /  SHORT (-)")
+    ax_liq.axhline(0.0, linestyle="--", color="black", alpha=0.4)
+
+    plotted = False
+
+    # 1) серия из БД -> агрегируем по свечам
+    lx, long_y, short_y = [], [], []
+    if liquidation_series:
+        try:
+            lx, long_y, short_y = _aggregate_liq_to_candles(
+                candles=candles,
+                liq=liquidation_series,
+                interval=timeframe,
+            )
+        except Exception:
+            lx, long_y, short_y = [], [], []
+
+    if lx and (len(lx) == len(long_y) == len(short_y)):
+        try:
+            x_num_l = mdates.date2num(lx)
+            w = candle_w * 0.85
+
+            # LONG вверх (зелёные)
+            ax_liq.bar(
+                x_num_l,
+                long_y,
+                width=w,
+                align="center",
+                alpha=0.55,
+                color="green",
+                edgecolor="green",
+                linewidth=0.2,
+                label="LONG liq (+)",
+            )
+
+            # SHORT вниз (красные)
+            ax_liq.bar(
+                x_num_l,
+                short_y,
+                width=w,
+                align="center",
+                alpha=0.55,
+                color="red",
+                edgecolor="red",
+                linewidth=0.2,
+                label="SHORT liq (-)",
+            )
+
+            plotted = True
+        except Exception:
+            plotted = False
+
+    # 2) fallback: если нет liquidation_series — рисуем одну свечу
+    if not plotted:
+        base_idx = idx_touch if idx_touch is not None else idx_entry
+        fx, fy_long, fy_short = _fallback_liq_series(
+            candles=candles,
+            idx=base_idx,
+            liq_long_usdt=liq_long_usdt,
+            liq_short_usdt=liq_short_usdt,
+        )
+        if fx:
+            try:
+                x_num_f = mdates.date2num(fx)
+                w = candle_w * 0.85
+
+                ax_liq.bar(
+                    x_num_f,
+                    fy_long,
+                    width=w,
+                    align="center",
+                    alpha=0.55,
+                    color="green",
+                    edgecolor="green",
+                    linewidth=0.2,
+                    label="LONG liq (+)",
+                )
+                ax_liq.bar(
+                    x_num_f,
+                    fy_short,
+                    width=w,
+                    align="center",
+                    alpha=0.55,
+                    color="red",
+                    edgecolor="red",
+                    linewidth=0.2,
+                    label="SHORT liq (-)",
+                )
+            except Exception:
+                pass
+
+    # вертикальные линии touch/entry на панели ликвидаций
+    if idx_touch is not None:
+        try:
+            ax_liq.axvline(x[idx_touch], linestyle=":", color="purple", alpha=0.8)
+        except Exception:
+            pass
+
+    if idx_entry is not None:
+        try:
+            ax_liq.axvline(x[idx_entry], linestyle="--", color="blue", alpha=0.8)
+        except Exception:
+            pass
+
+    ax_liq.grid(True, alpha=0.15)
+    ax_liq.legend(loc="upper left")
+    _nice_time_axis(ax_liq)
+
+    try:
+        fig.tight_layout()
+    except Exception:
+        pass
 
     _ensure_dir(out_path.parent)
-    fig.savefig(out_path, dpi=140)
-    plt.close(fig)
+    fig.savefig(out_path, dpi=140, bbox_inches="tight")

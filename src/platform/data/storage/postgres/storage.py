@@ -1,40 +1,102 @@
 # src/platform/data/storage/postgres/storage.py
 from __future__ import annotations
 
+import re
 import json
 import hashlib
 import time
 import logging
-from datetime import datetime,timezone,timedelta
-from typing import Any,Iterable,Sequence,Mapping,List,Tuple,Dict,Optional
+from datetime import date, datetime, timezone, timedelta
+from typing import Any, Iterable, Sequence, Mapping, List, Tuple, Dict, Optional
+
 from psycopg.types.json import Jsonb
-from psycopg2.extras import execute_values
-
-
-
 from psycopg import sql as _sql
-
 from psycopg_pool import ConnectionPool
 
 logger = logging.getLogger(__name__)
+log = logging.getLogger("storage.sql")
+
 
 def _utcnow() -> datetime:
     return datetime.now(tz=timezone.utc)
 
-log = logging.getLogger("storage.sql")
+def _interval_to_timedelta(interval: str) -> timedelta:
+    """
+    '1m','5m','15m','1h','4h','1d' -> timedelta
+    """
+    s = str(interval or "").strip().lower()
+    m = re.match(r"^(\d+)\s*([mhd])$", s)
+    if not m:
+        return timedelta(hours=1)
+
+    n = int(m.group(1))
+    unit = m.group(2)
+
+    if unit == "m":
+        return timedelta(minutes=n)
+    if unit == "h":
+        return timedelta(hours=n)
+    if unit == "d":
+        return timedelta(days=n)
+
+    return timedelta(hours=1)
+
+def datetime_converter(o):
+    if isinstance(o, datetime):
+        return o.isoformat()  # Преобразует datetime в строку ISO 8601
+    raise TypeError("Type not serializable")
+
+def _utc(dt: Any) -> datetime:
+    if isinstance(dt, datetime):
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    raise TypeError(f"Expected datetime, got {type(dt)}")
+
+
+def _pg_interval(interval: str) -> str:
+    """
+    '4h' -> '4 hours'
+    '15m' -> '15 minutes'
+    '1d' -> '1 days'
+    """
+    s = str(interval).strip().lower()
+    try:
+        if s.endswith("m"):
+            return f"{int(s[:-1])} minutes"
+        if s.endswith("h"):
+            return f"{int(s[:-1])} hours"
+        if s.endswith("d"):
+            return f"{int(s[:-1])} days"
+    except Exception:
+        pass
+    return "1 hours"
 
 
 class PostgreSQLStorage:
+    """
+    PostgreSQL storage — registry, market state, OMS helpers, retention, exchangeInfo,
+    positions, balances snapshots, orders, trades, stats.
+    """
+
+    def __init__(self, pool: ConnectionPool):
+        self.pool = pool
+        self.logger = logging.getLogger("storage.postgres")
+        self._screeners_schema_ready = False
+
+    # ======================================================================
+    # SAFE CAST HELPERS
+    # ======================================================================
 
     @staticmethod
-    def _safe_int(v, default=None):
+    def _safe_int(v: Any, default: Any = None) -> Any:
         try:
             return int(v) if v is not None else default
         except Exception:
             return default
 
     @staticmethod
-    def _safe_str(v, default=None):
+    def _safe_str(v: Any, default: Any = None) -> Any:
         try:
             if v is None:
                 return default
@@ -44,23 +106,43 @@ class PostgreSQLStorage:
             return default
 
     @staticmethod
-    def _safe_float(v, default=None):
+    def _safe_float(v: Any, default: Any = None) -> Any:
         try:
             return float(v) if v is not None else default
         except Exception:
             return default
 
     @staticmethod
+    def _to_jsonb(v: Any) -> Jsonb:
+        if v is None:
+            return Jsonb({})
+        if isinstance(v, Jsonb):
+            return v
+        if isinstance(v, (dict, list)):
+            return Jsonb(v)
+        if isinstance(v, str):
+            try:
+                return Jsonb(json.loads(v))
+            except Exception:
+                return Jsonb({"_raw": v})
+        return Jsonb({"_raw": str(v)})
+
+
+    # ======================================================================
+    # UID HELPERS
+    # ======================================================================
+
+    @staticmethod
     def _mk_fill_uid(
-            *,
-            exchange_id: int,
-            account_id: int,
-            symbol_id: int,
-            order_id: str | None,
-            trade_id: str | None,
-            ts_ms: int | None,
-            price,
-            qty,
+        *,
+        exchange_id: int,
+        account_id: int,
+        symbol_id: int,
+        order_id: str | None,
+        trade_id: str | None,
+        ts_ms: int | None,
+        price: Any,
+        qty: Any,
     ) -> str:
         """
         Детерминированный UID для fill.
@@ -77,21 +159,61 @@ class PostgreSQLStorage:
             "price": str(price),
             "qty": str(qty),
         }
-
         raw = json.dumps(base, sort_keys=True, ensure_ascii=False).encode("utf-8")
         h = hashlib.sha1(raw).hexdigest()
         return f"h:{h}"
 
-    """
-    PostgreSQL storage — registry, market state, OMS helpers, retention, exchangeInfo,
-    positions, balances snapshots, orders, trades, stats.
-    """
 
-    def __init__(self, pool: ConnectionPool):
-        self.pool = pool
-        self.logger = logging.getLogger("storage.postgres")
+    def fetch_liquidations_window(
+        self,
+        *,
+        exchange_id: int,
+        symbol_id: int,
+        interval: str,
+        start_ts: datetime,
+        end_ts: datetime,
+    ) -> List[Dict[str, Any]]:
+        """
+        Возвращает серию ликвидаций, агрегированную в интервалы свечей.
+        long_usdt = +, short_usdt = +
+        (в plotting мы short сделаем отрицательным)
+        """
+        start_ts = _utc(start_ts)
+        end_ts = _utc(end_ts)
+
+        pg_int = _pg_interval(interval)
+
+        q = """
+        SELECT
+            date_bin(%s::interval, bucket_ts, '1970-01-01 00:00:00+00'::timestamptz) AS ts,
+            COALESCE(SUM(long_notional), 0)  AS long_usdt,
+            COALESCE(SUM(short_notional), 0) AS short_usdt
+        FROM liquidation_1m
+        WHERE exchange_id=%s
+          AND symbol_id=%s
+          AND bucket_ts >= %s
+          AND bucket_ts < %s
+        GROUP BY 1
+        ORDER BY 1 ASC
+        """
+
+        out: List[Dict[str, Any]] = []
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(q, (pg_int, int(exchange_id), int(symbol_id), start_ts, end_ts))
+                rows = cur.fetchall()
+
+        for r in rows:
+            out.append(
+                {
+                    "ts": _utc(r[0]),
+                    "long_usdt": float(r[1] or 0.0),
+                    "short_usdt": float(r[2] or 0.0),
+                }
+            )
+        return out
     # ======================================================================
-    # HELPERS
+    # DB EXEC HELPERS
     # ======================================================================
 
     def _exec_many(self, query: str, rows: list[dict], *, chunk_size: int = 500) -> int:
@@ -105,7 +227,6 @@ class PostgreSQLStorage:
         if not rows:
             return 0
 
-        # chunking to avoid huge packets and easier debugging
         total_attempted = 0
         total_affected: Optional[int] = 0
 
@@ -123,7 +244,6 @@ class PostgreSQLStorage:
                         total_attempted += len(part)
                         cur.executemany(query, part)
 
-                        # rowcount в executemany зависит от драйвера/режима
                         rc = getattr(cur, "rowcount", None)
                         if isinstance(rc, int) and rc >= 0:
                             total_affected = (total_affected or 0) + rc
@@ -138,7 +258,6 @@ class PostgreSQLStorage:
                 except Exception:
                     pass
 
-                # Логируем полезный контекст
                 sample = rows[0] if rows else None
                 sample_keys = sorted(list(sample.keys()))[:60] if isinstance(sample, dict) else None
 
@@ -148,7 +267,6 @@ class PostgreSQLStorage:
                 )
                 raise
 
-        # если rowcount неинформативен — вернём попытку
         return int(total_affected) if total_affected is not None else int(total_attempted)
 
     def _exec_one_fetchone(self, query: str, params: Any = None):
@@ -195,18 +313,16 @@ class PostgreSQLStorage:
         account: str,
         symbols: list[str],
     ) -> tuple[int, int, dict[str, int]]:
-
         r"""
         Ensures exchange/account/symbols exist in DB and returns ids mapping.
 
-        Real schema (confirmed by your \d):
+        Real schema:
           exchanges(exchange_id, name)
           accounts(account_id, exchange_id, account_name, role, is_active)
           symbols(symbol_id, exchange_id, symbol)
         """
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
-
                 # --- exchange ---
                 cur.execute(
                     """
@@ -252,13 +368,12 @@ class PostgreSQLStorage:
 
         return int(exchange_id), int(account_id), symbol_ids
 
-
     def ensure_exchange_account_symbol_map(
-            self,
-            *,
-            exchange: str,
-            account: str,
-            symbols: list[str],
+        self,
+        *,
+        exchange: str,
+        account: str,
+        symbols: list[str],
     ) -> dict:
         """
         Backward-compatible wrapper.
@@ -273,62 +388,51 @@ class PostgreSQLStorage:
         return out
 
     def upsert_symbols(
-            self,
-            *,
-            exchange_id: int,
-            symbols: list[str],
-            deactivate_missing: bool = True,
+        self,
+        *,
+        exchange_id: int,
+        symbols: list[str],
+        deactivate_missing: bool = True,
     ) -> dict[str, int]:
         symbols_norm = sorted({str(s).upper().strip() for s in (symbols or []) if str(s).strip()})
         if not symbols_norm:
             return {}
 
         sql_upsert = """
-                     WITH incoming AS (SELECT UNNEST(%(symbols)s::text[]) AS symbol)
-                     INSERT
-                     INTO symbols (exchange_id, symbol, is_active, status, last_seen_at)
-                     SELECT %(exchange_id)s, symbol, TRUE, 'TRADING', NOW()
-                     FROM incoming ON CONFLICT (exchange_id, symbol)
-                     DO \
-                     UPDATE SET
-                         is_active = TRUE, \
-                         status = EXCLUDED.status, \
-                         last_seen_at = EXCLUDED.last_seen_at \
-                         RETURNING symbol, symbol_id;
-                     """
+            WITH incoming AS (SELECT UNNEST(%(symbols)s::text[]) AS symbol)
+            INSERT INTO symbols (exchange_id, symbol, is_active, status, last_seen_at)
+            SELECT %(exchange_id)s, symbol, TRUE, 'TRADING', NOW()
+            FROM incoming
+            ON CONFLICT (exchange_id, symbol)
+            DO UPDATE SET
+                is_active = TRUE,
+                status = EXCLUDED.status,
+                last_seen_at = EXCLUDED.last_seen_at
+            RETURNING symbol, symbol_id;
+        """
 
-        # ✅ Деактивация отсутствующих в universe:
-        #   - is_active = FALSE
-        #   - status = 'DELISTED'
-        #   - last_seen_at гарантированно не NULL
         sql_deactivate_missing = """
-                                 UPDATE symbols
-                                 SET is_active    = FALSE,
-                                     status       = 'DELISTED',
-                                     last_seen_at = COALESCE(last_seen_at, NOW())
-                                 WHERE exchange_id = %(exchange_id)s
-                                   AND is_active = TRUE
-                                   AND NOT (symbol = ANY (%(symbols)s::text[])); \
-                                 """
+            UPDATE symbols
+            SET is_active    = FALSE,
+                status       = 'DELISTED',
+                last_seen_at = COALESCE(last_seen_at, NOW())
+            WHERE exchange_id = %(exchange_id)s
+              AND is_active = TRUE
+              AND NOT (symbol = ANY (%(symbols)s::text[]));
+        """
 
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     sql_upsert,
-                    {
-                        "exchange_id": int(exchange_id),
-                        "symbols": symbols_norm,
-                    },
+                    {"exchange_id": int(exchange_id), "symbols": symbols_norm},
                 )
                 rows = cur.fetchall() or []
 
                 if deactivate_missing:
                     cur.execute(
                         sql_deactivate_missing,
-                        {
-                            "exchange_id": int(exchange_id),
-                            "symbols": symbols_norm,
-                        },
+                        {"exchange_id": int(exchange_id), "symbols": symbols_norm},
                     )
 
             conn.commit()
@@ -349,6 +453,408 @@ class PostgreSQLStorage:
                 )
                 rows = cur.fetchall() or []
         return {str(sym).upper(): int(sid) for (sym, sid) in rows}
+
+    # ======================================================================
+    # SCREENERS REGISTRY / RUNS / SIGNALS
+    # ======================================================================
+
+    def next_signal_seq(
+            self,
+            *,
+            exchange_id: int,
+            symbol_id: int,
+            screener_id: int,
+            signal_day: date,
+    ) -> int:
+        # Проверка типа signal_day, чтобы убедиться, что это объект типа date
+        if not isinstance(signal_day, date):
+            raise TypeError(f"signal_day should be of type 'date', got {type(signal_day)}")
+
+        sql = """
+              INSERT INTO signals_day_seq (exchange_id, symbol_id, screener_id, signal_day, last_seq)
+              VALUES (%s, %s, %s, %s, 1) ON CONFLICT (exchange_id, symbol_id, screener_id, signal_day)
+        DO \
+              UPDATE SET last_seq = signals_day_seq.last_seq + 1 \
+                  RETURNING last_seq \
+              """
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (int(exchange_id), int(symbol_id), int(screener_id), signal_day))
+                r = cur.fetchone()
+            conn.commit()  # ✅ ОБЯЗАТЕЛЬНО
+        return int(r[0]) if r else 1
+
+    def insert_signals(self, rows: list[dict]) -> int:
+        """
+        Идемпотентная вставка.
+        Возвращает: сколько реально вставилось (без дублей).
+        """
+        if not rows:
+            return 0
+
+        import json
+        from datetime import datetime, date
+        from decimal import Decimal
+        from psycopg.types.json import Jsonb
+
+        def _json_default(o):
+            # ✅ datetime/date -> строка ISO
+            if isinstance(o, (datetime, date)):
+                return o.isoformat()
+            # ✅ Decimal -> float
+            if isinstance(o, Decimal):
+                return float(o)
+            # ✅ остальное -> строка
+            return str(o)
+
+        def _json_dumps(obj) -> str:
+            return json.dumps(obj, ensure_ascii=False, default=_json_default)
+
+        sql = """
+              INSERT INTO signals (exchange_id,
+                                   symbol_id,
+                                   symbol,
+                                   screener_id,
+                                   timeframe,
+                                   signal_ts,
+                                   signal_day,
+                                   day_seq,
+                                   side,
+                                   status,
+                                   entry_price,
+                                   exit_price,
+                                   stop_loss,
+                                   take_profit,
+                                   confidence,
+                                   score,
+                                   reason,
+                                   context,
+                                   source)
+              VALUES (%(exchange_id)s,
+                      %(symbol_id)s,
+                      %(symbol)s,
+                      %(screener_id)s,
+                      %(timeframe)s,
+                      %(signal_ts)s,
+                      %(signal_day)s,
+                      %(day_seq)s,
+                      %(side)s,
+                      %(status)s,
+                      %(entry_price)s,
+                      %(exit_price)s,
+                      %(stop_loss)s,
+                      %(take_profit)s,
+                      %(confidence)s,
+                      %(score)s,
+                      %(reason)s,
+                      %(context)s,
+                      %(source)s) ON CONFLICT (exchange_id, symbol_id, screener_id, timeframe, signal_ts)
+              DO NOTHING
+              RETURNING 1;
+              """
+
+        inserted = 0
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                for r in rows:
+                    rr = dict(r)
+
+                    # ✅ symbol всегда строка
+                    rr["symbol"] = str(rr.get("symbol") or "")
+
+                    # ✅ context -> Jsonb с кастомным dumps (datetime не ломается)
+                    ctx = rr.get("context") or {}
+                    if isinstance(ctx, (dict, list)):
+                        rr["context"] = Jsonb(ctx, dumps=_json_dumps)
+                    else:
+                        rr["context"] = Jsonb({}, dumps=_json_dumps)
+
+                    cur.execute(sql, rr)
+                    if cur.fetchone() is not None:
+                        inserted += 1
+
+        return inserted
+
+    def _ensure_screeners_schema(self) -> None:
+        """
+        Создаёт/чинит таблицы для скринеров (без падений, без потери данных).
+        """
+        if getattr(self, "_screeners_schema_ready", False):
+            return
+
+        ddl = r"""
+        -- 1) Базовая таблица screeners (если её нет)
+        CREATE TABLE IF NOT EXISTS public.screeners (
+            screener_id  BIGSERIAL PRIMARY KEY,
+            name         TEXT NOT NULL,
+            version      TEXT NOT NULL,
+            created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE(name, version)
+        );
+
+        -- 2) Если таблица уже существовала в другой форме — приводим к виду screener_id PK
+        DO $$
+        BEGIN
+            -- если нет колонки screener_id
+            IF NOT EXISTS (
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_schema='public'
+                  AND table_name='screeners'
+                  AND column_name='screener_id'
+            ) THEN
+
+                -- если есть колонка id -> переименуем её в screener_id
+                IF EXISTS (
+                    SELECT 1
+                    FROM information_schema.columns
+                    WHERE table_schema='public'
+                      AND table_name='screeners'
+                      AND column_name='id'
+                ) THEN
+                    EXECUTE 'ALTER TABLE public.screeners RENAME COLUMN id TO screener_id';
+                ELSE
+                    -- иначе добавим новую колонку
+                    EXECUTE 'ALTER TABLE public.screeners ADD COLUMN screener_id BIGSERIAL';
+                END IF;
+            END IF;
+
+            -- убедимся, что есть PRIMARY KEY
+            IF NOT EXISTS (
+                SELECT 1
+                FROM pg_constraint c
+                JOIN pg_class t ON t.oid = c.conrelid
+                JOIN pg_namespace n ON n.oid = t.relnamespace
+                WHERE n.nspname='public'
+                  AND t.relname='screeners'
+                  AND c.contype='p'
+            ) THEN
+                EXECUTE 'ALTER TABLE public.screeners ADD PRIMARY KEY (screener_id)';
+            END IF;
+
+            -- гарантируем UNIQUE(name, version)
+            IF NOT EXISTS (
+                SELECT 1
+                FROM pg_constraint c
+                JOIN pg_class t ON t.oid = c.conrelid
+                JOIN pg_namespace n ON n.oid = t.relnamespace
+                WHERE n.nspname='public'
+                  AND t.relname='screeners'
+                  AND c.contype='u'
+            ) THEN
+                -- На всякий случай (если unique не было)
+                BEGIN
+                    EXECUTE 'ALTER TABLE public.screeners ADD CONSTRAINT ux_screeners_name_version UNIQUE(name, version)';
+                EXCEPTION WHEN others THEN
+                    -- если конфликтует (уже существует) — игнор
+                END;
+            END IF;
+
+        END $$;
+
+        -- 3) Таблица запусков (runs)
+        CREATE TABLE IF NOT EXISTS public.screener_runs (
+            run_id       BIGSERIAL PRIMARY KEY,
+            screener_id  BIGINT NOT NULL REFERENCES public.screeners(screener_id) ON DELETE CASCADE,
+            interval     TEXT NULL,
+            started_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            finished_at  TIMESTAMPTZ NULL,
+            status       TEXT NOT NULL DEFAULT 'RUNNING',
+            error        TEXT NULL,
+            stats_json   JSONB NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS ix_screener_runs_screener_started
+            ON public.screener_runs(screener_id, started_at DESC);
+
+        -- 4) Таблица сигналов
+        CREATE TABLE IF NOT EXISTS public.screener_signals (
+            signal_id    BIGSERIAL PRIMARY KEY,
+            screener_id  BIGINT NOT NULL REFERENCES public.screeners(screener_id) ON DELETE CASCADE,
+            run_id       BIGINT NULL REFERENCES public.screener_runs(run_id) ON DELETE SET NULL,
+
+            exchange_id  INT NULL,
+            symbol_id    INT NULL,
+            timeframe    TEXT NULL,
+
+            signal_ts    TIMESTAMPTZ NULL,
+            side         TEXT NULL,
+
+            entry_price  DOUBLE PRECISION NULL,
+            up_level     DOUBLE PRECISION NULL,
+            down_level   DOUBLE PRECISION NULL,
+            score        DOUBLE PRECISION NULL,
+
+            plot_path    TEXT NULL,
+            payload_json JSONB NULL,
+
+            created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+
+        -- idempotency: можно вставлять повторно без дублей
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_screener_signals_idem
+            ON public.screener_signals(screener_id, exchange_id, symbol_id, timeframe, signal_ts, side);
+        """
+
+        self.exec_ddl(ddl)
+        self._screeners_schema_ready = True
+
+
+    def ensure_screener(self, *, name: str, version: str, description: str | None = None) -> int:
+        """
+        Ensure screener exists and return screener_id.
+
+        ВАЖНО:
+        В БД сейчас UNIQUE только на (name), поэтому ON CONFLICT тоже должен быть по (name).
+        Версию просто обновляем.
+        """
+        self._ensure_screeners_schema()
+
+        name = str(name or "").strip()
+        version = str(version or "").strip()
+
+        if not name:
+            raise ValueError("ensure_screener(): name is empty")
+
+        sql = """
+            INSERT INTO public.screeners (name, version, description, is_enabled, created_at, updated_at)
+            VALUES (%s, %s, %s, TRUE, NOW(), NOW())
+            ON CONFLICT (name)
+            DO UPDATE SET
+                version = EXCLUDED.version,
+                description = COALESCE(screeners.description, EXCLUDED.description),
+                is_enabled = TRUE,
+                updated_at = NOW()
+            RETURNING screener_id
+        """
+
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (name, version, description))
+                screener_id = cur.fetchone()[0]
+            conn.commit()
+
+        return int(screener_id)
+
+
+    def start_screener_run(self, *, screener_id: int, interval: str | None = None) -> int:
+        """
+        Создаёт запись о запуске скринера и возвращает run_id.
+        """
+        self._ensure_screeners_schema()
+
+        sql = """
+            INSERT INTO public.screener_runs (screener_id, interval, status, started_at)
+            VALUES (%s, %s, 'RUNNING', NOW())
+            RETURNING run_id
+        """
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (int(screener_id), str(interval) if interval else None))
+                run_id = cur.fetchone()[0]
+            conn.commit()
+        return int(run_id)
+
+    def finish_screener_run(self, *, run_id: int, status: str = "OK", error: str | None = None, stats: dict | None = None) -> int:
+        """
+        Закрывает run (OK/FAILED).
+        """
+        self._ensure_screeners_schema()
+
+        stats_json = None
+        if stats is not None:
+            try:
+                stats_json = Jsonb(stats)
+            except Exception:
+                stats_json = None
+
+        sql = """
+            UPDATE public.screener_runs
+            SET finished_at = NOW(),
+                status = %s,
+                error = %s,
+                stats_json = COALESCE(%s, stats_json)
+            WHERE run_id = %s
+        """
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (str(status), error, stats_json, int(run_id)))
+                n = cur.rowcount or 0
+            conn.commit()
+        return int(n)
+
+    def insert_screener_signals(self, rows: Sequence[dict]) -> int:
+        """
+        Сохраняет сигналы скринера (idempotent).
+        Ожидаемые ключи (минимум):
+          screener_id, run_id, exchange_id, symbol_id, timeframe, signal_ts, side
+          entry_price/up_level/down_level/score/plot_path/payload_json - опционально
+        """
+        self._ensure_screeners_schema()
+
+        rows = list(rows or [])
+        if not rows:
+            return 0
+
+        prepared: list[dict[str, Any]] = []
+        for r in rows:
+            d = dict(r or {})
+
+            d["screener_id"] = int(d.get("screener_id") or 0)
+            d["run_id"] = int(d.get("run_id") or 0) if d.get("run_id") is not None else None
+
+            d["exchange_id"] = int(d.get("exchange_id") or 0) if d.get("exchange_id") is not None else None
+            d["symbol_id"] = int(d.get("symbol_id") or 0) if d.get("symbol_id") is not None else None
+
+            d["timeframe"] = str(d.get("timeframe") or "") or None
+            d["side"] = str(d.get("side") or "") or None
+            d["signal_ts"] = d.get("signal_ts")
+
+            # числа
+            for k in ("entry_price", "up_level", "down_level", "score"):
+                if k in d and d[k] is not None:
+                    try:
+                        d[k] = float(d[k])
+                    except Exception:
+                        d[k] = None
+
+            # payload_json -> Jsonb
+            payload = d.get("payload_json")
+            if payload is not None:
+                try:
+                    if isinstance(payload, str):
+                        payload = json.loads(payload)
+                    d["payload_json"] = Jsonb(payload)
+                except Exception:
+                    d["payload_json"] = None
+            else:
+                d["payload_json"] = None
+
+            d["plot_path"] = str(d.get("plot_path")) if d.get("plot_path") is not None else None
+
+            prepared.append(d)
+
+        sql = """
+            INSERT INTO public.screener_signals (
+                screener_id, run_id,
+                exchange_id, symbol_id, timeframe,
+                signal_ts, side,
+                entry_price, up_level, down_level, score,
+                plot_path, payload_json
+            )
+            VALUES (
+                %(screener_id)s, %(run_id)s,
+                %(exchange_id)s, %(symbol_id)s, %(timeframe)s,
+                %(signal_ts)s, %(side)s,
+                %(entry_price)s, %(up_level)s, %(down_level)s, %(score)s,
+                %(plot_path)s, %(payload_json)s
+            )
+            ON CONFLICT (screener_id, exchange_id, symbol_id, timeframe, signal_ts, side)
+            DO NOTHING
+        """
+        return self._exec_many(sql, prepared)
+
 
     # ======================================================================
     # POSITIONS (FIXED)
@@ -389,21 +895,17 @@ class PostgreSQLStorage:
 
         now = _utcnow()
 
-        # обязательные идентификаторы
         row["exchange_id"] = int(row.get("exchange_id") or 0)
         row["account_id"] = int(row.get("account_id") or 0)
         row["symbol_id"] = int(row.get("symbol_id") or 0)
 
-        # стратегия
         row.setdefault("strategy_id", "unknown")
         row.setdefault("strategy_name", None)
 
-        # lifecycle keys (ключи должны быть)
         row.setdefault("pos_uid", "")
         row.setdefault("opened_at", None)
         row.setdefault("closed_at", None)
 
-        # торговые поля
         side = self._norm_side(row.get("side"))
         qty = abs(self._f(row.get("qty"), 0.0))
 
@@ -412,7 +914,6 @@ class PostgreSQLStorage:
             row["qty"] = 0.0
             row["status"] = "CLOSED"
 
-            # при CLOSED можно выставлять нули (так удобнее для аналитики)
             row.setdefault("entry_price", 0.0)
             row.setdefault("avg_price", 0.0)
             row.setdefault("exit_price", 0.0)
@@ -439,16 +940,14 @@ class PostgreSQLStorage:
         row.setdefault("last_trade_id", None)
         row.setdefault("last_ts", None)
 
-        # ✅ updated_at NOT NULL — гарантируем
         if row.get("updated_at") is None:
             row["updated_at"] = now
 
         row.setdefault("source", "position_aggregate")
-
-        # защита от None в NOT NULL side/status уже обеспечена выше
         return row
 
-    def upsert_positions(self, rows):
+    def upsert_positions(self, rows: Iterable[dict]) -> int:
+        rows = list(rows or [])
         if not rows:
             return 0
 
@@ -459,50 +958,52 @@ class PostgreSQLStorage:
             norm_rows.append(rr)
 
         sql = """
-              INSERT INTO positions (exchange_id, account_id, symbol_id, \
-                                     strategy_id, strategy_name, \
-                                     pos_uid, \
-                                     side, qty, \
-                                     entry_price, avg_price, exit_price, \
-                                     mark_price, unrealized_pnl, \
-                                     position_value_usdt, \
-                                     scale_in_count, \
-                                     realized_pnl, fees, \
-                                     last_trade_id, last_ts, \
-                                     status, \
-                                     opened_at, closed_at, \
-                                     updated_at, source)
-              VALUES (%(exchange_id)s, %(account_id)s, %(symbol_id)s, \
-                      %(strategy_id)s, %(strategy_name)s, \
-                      %(pos_uid)s, \
-                      %(side)s, %(qty)s, \
-                      %(entry_price)s, %(avg_price)s, %(exit_price)s, \
-                      %(mark_price)s, %(unrealized_pnl)s, \
-                      %(position_value_usdt)s, \
-                      %(scale_in_count)s, \
-                      %(realized_pnl)s, %(fees)s, \
-                      %(last_trade_id)s, %(last_ts)s, \
-                      %(status)s, \
-                      %(opened_at)s, %(closed_at)s, \
-                      %(updated_at)s, %(source)s) ON CONFLICT (exchange_id, account_id, symbol_id)
-            DO \
-              UPDATE SET
-                  -- стратегия: если в positions уже не unknown — не трогаем
-                  strategy_id = CASE \
-                  WHEN positions.strategy_id = 'unknown' AND EXCLUDED.strategy_id IS NOT NULL AND EXCLUDED.strategy_id <> 'unknown' \
-                  THEN EXCLUDED.strategy_id \
-                  ELSE positions.strategy_id
-              END \
-              ,
+            INSERT INTO positions (
+                exchange_id, account_id, symbol_id,
+                strategy_id, strategy_name,
+                pos_uid,
+                side, qty,
+                entry_price, avg_price, exit_price,
+                mark_price, unrealized_pnl,
+                position_value_usdt,
+                scale_in_count,
+                realized_pnl, fees,
+                last_trade_id, last_ts,
+                status,
+                opened_at, closed_at,
+                updated_at, source
+            )
+            VALUES (
+                %(exchange_id)s, %(account_id)s, %(symbol_id)s,
+                %(strategy_id)s, %(strategy_name)s,
+                %(pos_uid)s,
+                %(side)s, %(qty)s,
+                %(entry_price)s, %(avg_price)s, %(exit_price)s,
+                %(mark_price)s, %(unrealized_pnl)s,
+                %(position_value_usdt)s,
+                %(scale_in_count)s,
+                %(realized_pnl)s, %(fees)s,
+                %(last_trade_id)s, %(last_ts)s,
+                %(status)s,
+                %(opened_at)s, %(closed_at)s,
+                %(updated_at)s, %(source)s
+            )
+            ON CONFLICT (exchange_id, account_id, symbol_id)
+            DO UPDATE SET
+                strategy_id = CASE
+                    WHEN positions.strategy_id = 'unknown'
+                      AND EXCLUDED.strategy_id IS NOT NULL
+                      AND EXCLUDED.strategy_id <> 'unknown'
+                    THEN EXCLUDED.strategy_id
+                    ELSE positions.strategy_id
+                END,
                 strategy_name = COALESCE(positions.strategy_name, EXCLUDED.strategy_name),
 
-                -- lifecycle write-once
                 pos_uid = CASE
                     WHEN COALESCE(positions.pos_uid, '') <> '' THEN positions.pos_uid
                     WHEN COALESCE(EXCLUDED.pos_uid, '') <> '' THEN EXCLUDED.pos_uid
                     ELSE positions.pos_uid
-              END \
-              ,
+                END,
 
                 opened_at = COALESCE(positions.opened_at, EXCLUDED.opened_at),
 
@@ -510,15 +1011,12 @@ class PostgreSQLStorage:
                     WHEN positions.closed_at IS NOT NULL THEN positions.closed_at
                     WHEN EXCLUDED.closed_at IS NOT NULL THEN EXCLUDED.closed_at
                     ELSE positions.closed_at
-              END \
-              ,
+                END,
 
-                -- текущее состояние
                 side = EXCLUDED.side,
                 qty = EXCLUDED.qty,
                 status = EXCLUDED.status,
 
-                -- цены/поля
                 entry_price = EXCLUDED.entry_price,
                 avg_price = EXCLUDED.avg_price,
                 exit_price = EXCLUDED.exit_price,
@@ -535,16 +1033,16 @@ class PostgreSQLStorage:
                 last_ts = COALESCE(EXCLUDED.last_ts, positions.last_ts),
 
                 updated_at = EXCLUDED.updated_at,
-                source = EXCLUDED.source \
-              """
+                source = EXCLUDED.source
+        """
 
         return self._exec_many(sql, norm_rows)
 
     # ======================================================================
-    # POSITION SNAPSHOTS (OK + CLEAN SQL)
+    # POSITION SNAPSHOTS
     # ======================================================================
 
-    def upsert_position_snapshots(self, rows):
+    def upsert_position_snapshots(self, rows: Iterable[dict]) -> int:
         rows = list(rows or [])
         if not rows:
             return 0
@@ -577,7 +1075,6 @@ class PostgreSQLStorage:
             d["entry_price"] = float(entry)
             d["mark_price"] = float(mark)
 
-            # position_value должен быть числом (часто NOT NULL)
             pv = d.get("position_value", None)
             if pv is None:
                 pv = abs(qty) * float(mark)
@@ -594,35 +1091,39 @@ class PostgreSQLStorage:
             prepared.append(d)
 
         sql = """
-              INSERT INTO position_snapshots (exchange_id, account_id, symbol_id, \
-                                              side, qty, entry_price, mark_price, \
-                                              position_value, unrealized_pnl, realized_pnl, fees, \
-                                              last_ts, updated_at, source)
-              VALUES (%(exchange_id)s, %(account_id)s, %(symbol_id)s, \
-                      %(side)s, %(qty)s, %(entry_price)s, %(mark_price)s, \
-                      %(position_value)s, %(unrealized_pnl)s, %(realized_pnl)s, %(fees)s, \
-                      %(last_ts)s, %(updated_at)s, %(source)s) ON CONFLICT (exchange_id, account_id, symbol_id)
-            DO \
-              UPDATE SET
-                  side = EXCLUDED.side, \
-                  qty = EXCLUDED.qty, \
-                  entry_price = EXCLUDED.entry_price, \
-                  mark_price = EXCLUDED.mark_price, \
-                  position_value = EXCLUDED.position_value, \
-                  unrealized_pnl = EXCLUDED.unrealized_pnl, \
-                  realized_pnl = EXCLUDED.realized_pnl, \
-                  fees = EXCLUDED.fees, \
-                  last_ts = EXCLUDED.last_ts, \
-                  updated_at = EXCLUDED.updated_at, \
-                  source = EXCLUDED.source \
-              """
+            INSERT INTO position_snapshots (
+                exchange_id, account_id, symbol_id,
+                side, qty, entry_price, mark_price,
+                position_value, unrealized_pnl, realized_pnl, fees,
+                last_ts, updated_at, source
+            )
+            VALUES (
+                %(exchange_id)s, %(account_id)s, %(symbol_id)s,
+                %(side)s, %(qty)s, %(entry_price)s, %(mark_price)s,
+                %(position_value)s, %(unrealized_pnl)s, %(realized_pnl)s, %(fees)s,
+                %(last_ts)s, %(updated_at)s, %(source)s
+            )
+            ON CONFLICT (exchange_id, account_id, symbol_id)
+            DO UPDATE SET
+                side = EXCLUDED.side,
+                qty = EXCLUDED.qty,
+                entry_price = EXCLUDED.entry_price,
+                mark_price = EXCLUDED.mark_price,
+                position_value = EXCLUDED.position_value,
+                unrealized_pnl = EXCLUDED.unrealized_pnl,
+                realized_pnl = EXCLUDED.realized_pnl,
+                fees = EXCLUDED.fees,
+                last_ts = EXCLUDED.last_ts,
+                updated_at = EXCLUDED.updated_at,
+                source = EXCLUDED.source
+        """
         return self._exec_many(sql, prepared)
 
     # ======================================================================
-    # POSITION LEDGER (FIXED: closed_at write-once + strategy unknown protection)
+    # POSITION LEDGER
     # ======================================================================
 
-    def upsert_position_ledger(self, rows):
+    def upsert_position_ledger(self, rows: Iterable[dict]) -> int:
         rows = list(rows or [])
         if not rows:
             return 0
@@ -638,7 +1139,6 @@ class PostgreSQLStorage:
 
             d["pos_uid"] = str(d.get("pos_uid") or "").strip()
             if not d["pos_uid"]:
-                # pos_uid обязателен для PK, делаем детерминированный fallback
                 d["pos_uid"] = f"{d['exchange_id']}:{d['account_id']}:{d['symbol_id']}"
 
             d.setdefault("strategy_id", "unknown")
@@ -650,39 +1150,42 @@ class PostgreSQLStorage:
             prepared.append(d)
 
         sql = """
-              INSERT INTO position_ledger (exchange_id, account_id, pos_uid, symbol_id, \
-                                           strategy_id, strategy_name, \
-                                           side, status, \
-                                           opened_at, closed_at, \
-                                           entry_price, avg_price, exit_price, \
-                                           qty_opened, qty_current, qty_closed, \
-                                           position_value_usdt, scale_in_count, \
-                                           realized_pnl, fees, \
-                                           updated_at, source)
-              VALUES (%(exchange_id)s, %(account_id)s, %(pos_uid)s, %(symbol_id)s, \
-                      %(strategy_id)s, %(strategy_name)s, \
-                      %(side)s, %(status)s, \
-                      %(opened_at)s, %(closed_at)s, \
-                      %(entry_price)s, %(avg_price)s, %(exit_price)s, \
-                      %(qty_opened)s, %(qty_current)s, %(qty_closed)s, \
-                      %(position_value_usdt)s, %(scale_in_count)s, \
-                      %(realized_pnl)s, %(fees)s, \
-                      %(updated_at)s, %(source)s) ON CONFLICT (exchange_id, account_id, pos_uid, opened_at)
-            DO \
-              UPDATE SET
-                  closed_at = COALESCE (position_ledger.closed_at, EXCLUDED.closed_at), \
+            INSERT INTO position_ledger (
+                exchange_id, account_id, pos_uid, symbol_id,
+                strategy_id, strategy_name,
+                side, status,
+                opened_at, closed_at,
+                entry_price, avg_price, exit_price,
+                qty_opened, qty_current, qty_closed,
+                position_value_usdt, scale_in_count,
+                realized_pnl, fees,
+                updated_at, source
+            )
+            VALUES (
+                %(exchange_id)s, %(account_id)s, %(pos_uid)s, %(symbol_id)s,
+                %(strategy_id)s, %(strategy_name)s,
+                %(side)s, %(status)s,
+                %(opened_at)s, %(closed_at)s,
+                %(entry_price)s, %(avg_price)s, %(exit_price)s,
+                %(qty_opened)s, %(qty_current)s, %(qty_closed)s,
+                %(position_value_usdt)s, %(scale_in_count)s,
+                %(realized_pnl)s, %(fees)s,
+                %(updated_at)s, %(source)s
+            )
+            ON CONFLICT (exchange_id, account_id, pos_uid, opened_at)
+            DO UPDATE SET
+                closed_at = COALESCE(position_ledger.closed_at, EXCLUDED.closed_at),
 
-                  side = EXCLUDED.side, \
-                  status = EXCLUDED.status, \
+                side = EXCLUDED.side,
+                status = EXCLUDED.status,
 
-                  strategy_id = CASE \
-                  WHEN position_ledger.strategy_id = 'unknown' \
-                  AND EXCLUDED.strategy_id IS NOT NULL \
-                  AND EXCLUDED.strategy_id <> 'unknown' \
-                  THEN EXCLUDED.strategy_id \
-                  ELSE position_ledger.strategy_id
-              END \
-              ,
+                strategy_id = CASE
+                    WHEN position_ledger.strategy_id = 'unknown'
+                      AND EXCLUDED.strategy_id IS NOT NULL
+                      AND EXCLUDED.strategy_id <> 'unknown'
+                    THEN EXCLUDED.strategy_id
+                    ELSE position_ledger.strategy_id
+                END,
                 strategy_name = COALESCE(position_ledger.strategy_name, EXCLUDED.strategy_name),
 
                 entry_price = COALESCE(position_ledger.entry_price, EXCLUDED.entry_price),
@@ -699,8 +1202,8 @@ class PostgreSQLStorage:
                 fees = EXCLUDED.fees,
 
                 updated_at = EXCLUDED.updated_at,
-                source = EXCLUDED.source \
-              """
+                source = EXCLUDED.source
+        """
         return self._exec_many(sql, prepared)
 
     # ======================================================================
@@ -708,21 +1211,21 @@ class PostgreSQLStorage:
     # ======================================================================
 
     def insert_account_balance_snapshots(self, rows: Iterable[dict]) -> int:
-        rows = list(rows)
+        rows = list(rows or [])
         if not rows:
             return 0
 
         query = """
-        INSERT INTO account_balance_snapshots (
-            exchange_id, account_id, ts,
-            wallet_balance, equity, available_balance, margin_used,
-            unrealized_pnl, source
-        )
-        VALUES (
-            %(exchange_id)s, %(account_id)s, %(ts)s,
-            %(wallet_balance)s, %(equity)s, %(available_balance)s, %(margin_used)s,
-            %(unrealized_pnl)s, %(source)s
-        )
+            INSERT INTO account_balance_snapshots (
+                exchange_id, account_id, ts,
+                wallet_balance, equity, available_balance, margin_used,
+                unrealized_pnl, source
+            )
+            VALUES (
+                %(exchange_id)s, %(account_id)s, %(ts)s,
+                %(wallet_balance)s, %(equity)s, %(available_balance)s, %(margin_used)s,
+                %(unrealized_pnl)s, %(source)s
+            )
         """
         return self._exec_many(query, rows)
 
@@ -741,19 +1244,19 @@ class PostgreSQLStorage:
             return {}
 
         query = """
-                SELECT s.symbol, \
-                       p.symbol_id, \
-                       p.qty, \
-                       p.entry_price, \
-                       p.unrealized_pnl, \
-                       p.mark_price, \
-                       p.status, \
-                       p.updated_at
-                FROM positions p
-                         JOIN symbols s ON s.symbol_id = p.symbol_id
-                WHERE p.exchange_id = %s \
-                  AND p.account_id = %s \
-                """
+            SELECT s.symbol,
+                   p.symbol_id,
+                   p.qty,
+                   p.entry_price,
+                   p.unrealized_pnl,
+                   p.mark_price,
+                   p.status,
+                   p.updated_at
+            FROM positions p
+                JOIN symbols s ON s.symbol_id = p.symbol_id
+            WHERE p.exchange_id = %s
+              AND p.account_id = %s
+        """
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(query, (ex_id, acc_id))
@@ -774,12 +1277,13 @@ class PostgreSQLStorage:
             return {}
 
         query = """
-                SELECT wallet_balance, available_balance, margin_used, equity, unrealized_pnl
-                FROM account_balance_snapshots
-                WHERE exchange_id = %s \
-                  AND account_id = %s
-                ORDER BY ts DESC LIMIT 1 \
-                """
+            SELECT wallet_balance, available_balance, margin_used, equity, unrealized_pnl
+            FROM account_balance_snapshots
+            WHERE exchange_id = %s
+              AND account_id = %s
+            ORDER BY ts DESC
+            LIMIT 1
+        """
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(query, (ex_id, acc_id))
@@ -806,30 +1310,31 @@ class PostgreSQLStorage:
 
     def get_order(self, *, exchange_id: int, account_id: int, order_id: str) -> dict | None:
         query = """
-                SELECT exchange_id, \
-                       account_id, \
-                       order_id, \
-                       symbol_id, \
-                       strategy_id, \
-                       pos_uid, \
-                       client_order_id, \
-                       side, \
-                       type, \
-                       reduce_only, \
-                       price, \
-                       qty, \
-                       filled_qty, \
-                       status, \
-                       created_at, \
-                       updated_at, \
-                       source, \
-                       ts_ms, \
-                       raw_json
-                FROM orders
-                WHERE exchange_id = %s \
-                  AND account_id = %s \
-                  AND order_id = %s LIMIT 1 \
-                """
+            SELECT exchange_id,
+                   account_id,
+                   order_id,
+                   symbol_id,
+                   strategy_id,
+                   pos_uid,
+                   client_order_id,
+                   side,
+                   type,
+                   reduce_only,
+                   price,
+                   qty,
+                   filled_qty,
+                   status,
+                   created_at,
+                   updated_at,
+                   source,
+                   ts_ms,
+                   raw_json
+            FROM orders
+            WHERE exchange_id = %s
+              AND account_id = %s
+              AND order_id = %s
+            LIMIT 1
+        """
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(query, (int(exchange_id), int(account_id), str(order_id)))
@@ -839,24 +1344,17 @@ class PostgreSQLStorage:
                 cols = [d[0] for d in cur.description]
                 return dict(zip(cols, row))
 
-
-    def expire_stuck_pending(
-        self,
-        *,
-        exchange_id: int,
-        account_id: int,
-        timeout_sec: int = 60,
-    ) -> int:
+    def expire_stuck_pending(self, *, exchange_id: int, account_id: int, timeout_sec: int = 60) -> int:
         """
         Expire PENDING_SUBMIT / PENDING placeholders older than timeout_sec.
         """
         query = """
-        UPDATE orders
-        SET status = 'EXPIRED', updated_at = NOW()
-        WHERE exchange_id = %s
-          AND account_id = %s
-          AND status IN ('PENDING', 'PENDING_SUBMIT')
-          AND updated_at < NOW() - (INTERVAL '1 second' * %s)
+            UPDATE orders
+            SET status = 'EXPIRED', updated_at = NOW()
+            WHERE exchange_id = %s
+              AND account_id = %s
+              AND status IN ('PENDING', 'PENDING_SUBMIT')
+              AND updated_at < NOW() - (INTERVAL '1 second' * %s)
         """
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
@@ -864,46 +1362,38 @@ class PostgreSQLStorage:
                 n = cur.rowcount
             conn.commit()
         return int(n or 0)
+
     # ======================================================================
     # RETENTION
     # ======================================================================
-    def cleanup_candles(
-            self,
-            *,
-            exchange_id: int,
-            interval: str,
-            keep_days: int,
-    ) -> int:
+
+    def cleanup_candles(self, *, exchange_id: int, interval: str, keep_days: int) -> int:
         """
         Delete old candles from public.candles.
         """
         query = """
-                DELETE \
-                FROM candles
-                WHERE exchange_id = %s
-                  AND interval = %s
-                  AND open_time \
-                    < NOW() - (INTERVAL '1 day' * %s) \
-                """
-
+            DELETE
+            FROM candles
+            WHERE exchange_id = %s
+              AND interval = %s
+              AND open_time < NOW() - (INTERVAL '1 day' * %s)
+        """
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
-                cur.execute(query, (exchange_id, interval, int(keep_days)))
+                cur.execute(query, (int(exchange_id), str(interval), int(keep_days)))
                 n = cur.rowcount
             conn.commit()
-
         return int(n or 0)
 
     # ======================================================================
     # EXCHANGE INFO (filters)
     # ======================================================================
 
-
     def upsert_symbol_filters(self, rows: Sequence[Mapping[str, Any]]) -> int:
         """
         Upsert symbol trading filters.
 
-        Expected keys in each row dict:
+        Expected keys:
           exchange_id, symbol_id,
           price_tick, qty_step,
           min_qty, max_qty,
@@ -916,40 +1406,43 @@ class PostgreSQLStorage:
             return 0
 
         sql = """
-              INSERT INTO symbol_filters (exchange_id, \
-                                          symbol_id, \
-                                          price_tick, \
-                                          qty_step, \
-                                          min_qty, \
-                                          max_qty, \
-                                          min_notional, \
-                                          max_leverage, \
-                                          margin_type, \
-                                          updated_at)
-              VALUES (%(exchange_id)s, \
-                      %(symbol_id)s, \
-                      %(price_tick)s, \
-                      %(qty_step)s, \
-                      %(min_qty)s, \
-                      %(max_qty)s, \
-                      %(min_notional)s, \
-                      %(max_leverage)s, \
-                      %(margin_type)s, \
-                      %(updated_at)s) ON CONFLICT (exchange_id, symbol_id)
-            DO \
-              UPDATE SET
-                  price_tick = EXCLUDED.price_tick, \
-                  qty_step = EXCLUDED.qty_step, \
-                  min_qty = EXCLUDED.min_qty, \
-                  max_qty = EXCLUDED.max_qty, \
-                  min_notional = EXCLUDED.min_notional, \
-                  max_leverage = EXCLUDED.max_leverage, \
-                  margin_type = EXCLUDED.margin_type, \
-                  updated_at = EXCLUDED.updated_at \
-              """
+            INSERT INTO symbol_filters (
+                exchange_id,
+                symbol_id,
+                price_tick,
+                qty_step,
+                min_qty,
+                max_qty,
+                min_notional,
+                max_leverage,
+                margin_type,
+                updated_at
+            )
+            VALUES (
+                %(exchange_id)s,
+                %(symbol_id)s,
+                %(price_tick)s,
+                %(qty_step)s,
+                %(min_qty)s,
+                %(max_qty)s,
+                %(min_notional)s,
+                %(max_leverage)s,
+                %(margin_type)s,
+                %(updated_at)s
+            )
+            ON CONFLICT (exchange_id, symbol_id)
+            DO UPDATE SET
+                price_tick = EXCLUDED.price_tick,
+                qty_step = EXCLUDED.qty_step,
+                min_qty = EXCLUDED.min_qty,
+                max_qty = EXCLUDED.max_qty,
+                min_notional = EXCLUDED.min_notional,
+                max_leverage = EXCLUDED.max_leverage,
+                margin_type = EXCLUDED.margin_type,
+                updated_at = EXCLUDED.updated_at
+        """
 
-        # гарантируем наличие updated_at, и приводим типы аккуратно
-        now = datetime.now(timezone.utc)
+        now = _utcnow()
         prepared: list[dict[str, Any]] = []
 
         for r in rows:
@@ -961,12 +1454,10 @@ class PostgreSQLStorage:
             d["exchange_id"] = int(d["exchange_id"])
             d["symbol_id"] = int(d["symbol_id"])
 
-            # float columns
             for k in ("price_tick", "qty_step", "min_qty", "max_qty", "min_notional"):
                 if k in d and d[k] is not None:
                     d[k] = float(d[k])
 
-            # int / str columns
             if d.get("max_leverage") is not None:
                 d["max_leverage"] = int(d["max_leverage"])
             if d.get("margin_type") is not None:
@@ -974,135 +1465,115 @@ class PostgreSQLStorage:
 
             prepared.append(d)
 
-        with self.pool.connection() as conn:
-            with conn.cursor() as cur:
-                cur.executemany(sql, prepared)
-            conn.commit()
-
-        return len(prepared)
+        return self._exec_many(sql, prepared)
 
     # ======================================================================
-    # ORDERS / TRADES (optional: keep if used elsewhere)
+    # ORDERS / TRADES
     # ======================================================================
 
     def upsert_orders(self, orders: list[dict]) -> None:
         """
         Upsert order snapshots.
         Status, qty, filled_qty are already resolved by OrderAggregate (FSM).
-        DB does NOT compute lifecycle logic.
         """
         if not orders:
             return
 
         query = """
-                INSERT INTO orders (exchange_id, \
-                                    account_id, \
-                                    order_id, \
-                                    client_order_id, \
-                                    symbol_id, \
-                                    side, \
-                                    type, \
-                                    reduce_only, \
-                                    price, \
-                                    qty, \
-                                    filled_qty, \
-                                    status, \
-                                    strategy_id, \
-                                    pos_uid, \
-                                    ts_ms, \
-                                    raw_json, \
-                                    updated_at)
-                VALUES (%(exchange_id)s, \
-                        %(account_id)s, \
-                        %(order_id)s, \
-                        %(client_order_id)s, \
-                        %(symbol_id)s, \
-                        %(side)s, \
-                        %(type)s, \
-                        %(reduce_only)s, \
-                        %(price)s, \
-                        %(qty)s, \
-                        %(filled_qty)s, \
-                        %(status)s, \
-                        %(strategy_id)s, \
-                        %(pos_uid)s, \
-                        %(ts_ms)s, \
-                        %(raw_json)s, \
-                        NOW()) ON CONFLICT (exchange_id, account_id, order_id)
-        DO \
-                UPDATE SET
-                    client_order_id = COALESCE (EXCLUDED.client_order_id, orders.client_order_id), \
-                    symbol_id = EXCLUDED.symbol_id, \
-
-                    side = EXCLUDED.side, \
-                    type = EXCLUDED.type, \
-                    reduce_only = EXCLUDED.reduce_only, \
-
-                    price = EXCLUDED.price, \
-                    qty = EXCLUDED.qty, \
-                    filled_qty = EXCLUDED.filled_qty, \
-
-                    status = EXCLUDED.status, \
-
-                    strategy_id = COALESCE (orders.strategy_id, EXCLUDED.strategy_id), \
-                    pos_uid = COALESCE (orders.pos_uid, EXCLUDED.pos_uid), \
-
-                    ts_ms = GREATEST(COALESCE (orders.ts_ms, 0), COALESCE (EXCLUDED.ts_ms, 0)), \
-                    raw_json = COALESCE (EXCLUDED.raw_json, orders.raw_json), \
-                    updated_at = NOW() \
-                """
+            INSERT INTO orders (
+                exchange_id,
+                account_id,
+                order_id,
+                client_order_id,
+                symbol_id,
+                side,
+                type,
+                reduce_only,
+                price,
+                qty,
+                filled_qty,
+                status,
+                strategy_id,
+                pos_uid,
+                ts_ms,
+                raw_json,
+                updated_at
+            )
+            VALUES (
+                %(exchange_id)s,
+                %(account_id)s,
+                %(order_id)s,
+                %(client_order_id)s,
+                %(symbol_id)s,
+                %(side)s,
+                %(type)s,
+                %(reduce_only)s,
+                %(price)s,
+                %(qty)s,
+                %(filled_qty)s,
+                %(status)s,
+                %(strategy_id)s,
+                %(pos_uid)s,
+                %(ts_ms)s,
+                %(raw_json)s,
+                NOW()
+            )
+            ON CONFLICT (exchange_id, account_id, order_id)
+            DO UPDATE SET
+                client_order_id = COALESCE(EXCLUDED.client_order_id, orders.client_order_id),
+                symbol_id = EXCLUDED.symbol_id,
+                side = EXCLUDED.side,
+                type = EXCLUDED.type,
+                reduce_only = EXCLUDED.reduce_only,
+                price = EXCLUDED.price,
+                qty = EXCLUDED.qty,
+                filled_qty = EXCLUDED.filled_qty,
+                status = EXCLUDED.status,
+                strategy_id = COALESCE(orders.strategy_id, EXCLUDED.strategy_id),
+                pos_uid = COALESCE(orders.pos_uid, EXCLUDED.pos_uid),
+                ts_ms = GREATEST(COALESCE(orders.ts_ms, 0), COALESCE(EXCLUDED.ts_ms, 0)),
+                raw_json = COALESCE(EXCLUDED.raw_json, orders.raw_json),
+                updated_at = NOW()
+        """
 
         rows: list[dict] = []
         for o in orders:
-            rows.append({
-                "exchange_id": int(o["exchange_id"]),
-                "account_id": int(o["account_id"]),
-                "symbol_id": int(o["symbol_id"]),
+            rows.append(
+                {
+                    "exchange_id": int(o["exchange_id"]),
+                    "account_id": int(o["account_id"]),
+                    "symbol_id": int(o["symbol_id"]),
+                    "order_id": str(o["order_id"]),
+                    "client_order_id": o.get("client_order_id"),
+                    "side": str(o.get("side") or ""),
+                    "type": str(o.get("type") or ""),
+                    "reduce_only": bool(o.get("reduce_only") or False),
+                    "price": o.get("price"),
+                    "qty": float(o.get("qty") or 0.0),
+                    "filled_qty": float(o.get("filled_qty") or 0.0),
+                    "status": str(o.get("status") or "NEW"),
+                    "strategy_id": o.get("strategy_id"),
+                    "pos_uid": o.get("pos_uid"),
+                    "ts_ms": int(o.get("ts_ms") or 0),
+                    "raw_json": self._to_jsonb(o.get("raw") or o.get("raw_json") or {}),
 
-                "order_id": str(o["order_id"]),
-                "client_order_id": o.get("client_order_id"),
-
-                "side": str(o.get("side") or ""),
-                "type": str(o.get("type") or ""),
-                "reduce_only": bool(o.get("reduce_only") or False),
-
-                "price": o.get("price"),
-                "qty": float(o.get("qty") or 0.0),
-                "filled_qty": float(o.get("filled_qty") or 0.0),
-
-                "status": str(o.get("status") or "NEW"),
-
-                "strategy_id": o.get("strategy_id"),
-                "pos_uid": o.get("pos_uid"),
-
-                "ts_ms": int(o.get("ts_ms") or 0),
-                "raw_json": json.dumps(
-                    o.get("raw") or o.get("raw_json") or {},
-                    ensure_ascii=False,
-                ),
-            })
+                }
+            )
 
         self._exec_many(query, rows)
 
-    def set_order_status(
-            self,
-            *,
-            exchange_id: int,
-            account_id: int,
-            order_id: str,
-            status: str,
-    ) -> int:
+    def set_order_status(self, *, exchange_id: int, account_id: int, order_id: str, status: str) -> int:
         query = """
-                UPDATE orders
-                SET status     = %s,
-                    updated_at = NOW()
-                WHERE exchange_id = %s
-                  AND account_id = %s
-                  AND order_id = %s \
-                """
+            UPDATE orders
+            SET status = %s,
+                updated_at = NOW()
+            WHERE exchange_id = %s
+              AND account_id = %s
+              AND order_id = %s
+        """
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
-                cur.execute(query, (status, int(exchange_id), int(account_id), str(order_id)))
+                cur.execute(query, (str(status), int(exchange_id), int(account_id), str(order_id)))
                 n = cur.rowcount
             conn.commit()
         return int(n or 0)
@@ -1112,64 +1583,67 @@ class PostgreSQLStorage:
             return
 
         query = """
-                INSERT INTO trades (exchange_id, account_id, trade_id, order_id, symbol_id, \
-                                    strategy_id, pos_uid, side, price, qty, fee, fee_asset, \
-                                    realized_pnl, ts, source, raw_json)
-                VALUES (%(exchange_id)s, %(account_id)s, %(trade_id)s, %(order_id)s, %(symbol_id)s, \
-                        %(strategy_id)s, %(pos_uid)s, %(side)s, %(price)s, %(qty)s, %(fee)s, %(fee_asset)s, \
-                        %(realized_pnl)s, %(ts)s, %(source)s, %(raw_json)s) ON CONFLICT (exchange_id, account_id, trade_id)
-        DO \
-                UPDATE SET
-                    fee = EXCLUDED.fee, \
-                    fee_asset = EXCLUDED.fee_asset, \
-                    realized_pnl = EXCLUDED.realized_pnl, \
-                    ts = EXCLUDED.ts, \
-                    raw_json = EXCLUDED.raw_json; \
-                """
+            INSERT INTO trades (
+                exchange_id, account_id, trade_id, order_id, symbol_id,
+                strategy_id, pos_uid, side, price, qty, fee, fee_asset,
+                realized_pnl, ts, source, raw_json
+            )
+            VALUES (
+                %(exchange_id)s, %(account_id)s, %(trade_id)s, %(order_id)s, %(symbol_id)s,
+                %(strategy_id)s, %(pos_uid)s, %(side)s, %(price)s, %(qty)s, %(fee)s, %(fee_asset)s,
+                %(realized_pnl)s, %(ts)s, %(source)s, %(raw_json)s
+            )
+            ON CONFLICT (exchange_id, account_id, trade_id)
+            DO UPDATE SET
+                fee = EXCLUDED.fee,
+                fee_asset = EXCLUDED.fee_asset,
+                realized_pnl = EXCLUDED.realized_pnl,
+                ts = EXCLUDED.ts,
+                raw_json = EXCLUDED.raw_json
+        """
 
         rows = []
         for t in trades:
-            rows.append({
-                "exchange_id": int(t["exchange_id"]),
-                "account_id": int(t["account_id"]),
-                "trade_id": str(t.get("trade_id") or ""),
-                "order_id": str(t.get("order_id") or ""),
-                "symbol_id": int(t["symbol_id"]),
-                "strategy_id": str(t.get("strategy_id") or "unknown"),
-                "pos_uid": str(t.get("pos_uid") or ""),
-                "side": str(t.get("side") or ""),
-                "price": float(t.get("price") or 0.0),
-                "qty": float(t.get("qty") or 0.0),
-                "fee": float(t.get("fee") or 0.0),
-                "fee_asset": str(t.get("fee_asset") or ""),
-                "realized_pnl": float(t.get("realized_pnl") or 0.0),
+            rows.append(
+                {
+                    "exchange_id": int(t["exchange_id"]),
+                    "account_id": int(t["account_id"]),
+                    "trade_id": str(t.get("trade_id") or ""),
+                    "order_id": str(t.get("order_id") or ""),
+                    "symbol_id": int(t["symbol_id"]),
+                    "strategy_id": str(t.get("strategy_id") or "unknown"),
+                    "pos_uid": str(t.get("pos_uid") or ""),
+                    "side": str(t.get("side") or ""),
+                    "price": float(t.get("price") or 0.0),
+                    "qty": float(t.get("qty") or 0.0),
+                    "fee": float(t.get("fee") or 0.0),
+                    "fee_asset": str(t.get("fee_asset") or ""),
+                    "realized_pnl": float(t.get("realized_pnl") or 0.0),
+                    "ts": t["ts"],
+                    "source": str(t.get("source") or "ws"),
+                    "raw_json": self._to_jsonb(t),
 
-                # ✔ datetime остаётся datetime (для PostgreSQL)
-                "ts": t["ts"],
-
-                "source": str(t.get("source") or "ws"),
-
-                # ✔ datetime внутри raw_json → безопасно сериализуется
-                "raw_json": json.dumps(t, ensure_ascii=False, default=str),
-            })
+                }
+            )
 
         self._exec_many(query, rows)
 
     def get_today_realized_pnl(self, exchange_id: int, account_id: int) -> float:
         query = """
-        SELECT COALESCE(SUM(realized_pnl), 0)
-        FROM trades
-        WHERE exchange_id = %s
-          AND account_id = %s
-          AND ts >= date_trunc('day', now())
+            SELECT COALESCE(SUM(realized_pnl), 0)
+            FROM trades
+            WHERE exchange_id = %s
+              AND account_id = %s
+              AND ts >= date_trunc('day', now())
         """
-        row = self._exec_one(query, (exchange_id, account_id))
+        row = self._exec_one(query, (int(exchange_id), int(account_id)))
         return float(row[0] or 0.0)
 
     # ======================================================================
     # ID RESOLVERS
     # ======================================================================
-    def _resolve_exchange_id(self, exchange, exchange_id):
+
+    def _resolve_exchange_id(self, exchange: Any, exchange_id: Any):
         if exchange_id is not None:
             return int(exchange_id)
         if isinstance(exchange, int):
@@ -1179,7 +1653,7 @@ class PostgreSQLStorage:
             return int(row[0]) if row else None
         return None
 
-    def _resolve_account_id(self, exchange_id: int, account, account_id):
+    def _resolve_account_id(self, exchange_id: int, account: Any, account_id: Any):
         if account_id is not None:
             return int(account_id)
         if isinstance(account, int):
@@ -1187,11 +1661,14 @@ class PostgreSQLStorage:
         if isinstance(account, str) and exchange_id is not None:
             row = self._exec_one(
                 "SELECT account_id FROM accounts WHERE exchange_id=%s AND account_name=%s",
-                (exchange_id, account),
+                (int(exchange_id), account),
             )
             return int(row[0]) if row else None
         return None
 
+    # ======================================================================
+    # PLACEHOLDER ORDERS + ORDER EVENTS
+    # ======================================================================
 
     def upsert_order_placeholder(self, row: dict) -> None:
         """
@@ -1223,53 +1700,57 @@ class PostgreSQLStorage:
         raw_json = row.get("raw_json")
 
         query = """
-                INSERT INTO orders (exchange_id, \
-                                    account_id, \
-                                    order_id, \
-                                    symbol_id, \
-                                    strategy_id, \
-                                    pos_uid, \
-                                    client_order_id, \
-                                    side, \
-                                    type, \
-                                    reduce_only, \
-                                    price, \
-                                    qty, \
-                                    filled_qty, \
-                                    status, \
-                                    source, \
-                                    ts_ms, \
-                                    created_at, \
-                                    updated_at, \
-                                    raw_json)
-                VALUES (%s, %s, %s, %s, \
-                        %s, %s, %s, \
-                        %s, %s, %s, \
-                        %s, %s, %s, \
-                        %s, \
-                        %s, \
-                        %s, \
-                        COALESCE(%s, NOW()), \
-                        COALESCE(%s, NOW()), \
-                        %s) ON CONFLICT (exchange_id, account_id, order_id)
-        DO \
-                UPDATE SET
-                    symbol_id = EXCLUDED.symbol_id, \
-                    strategy_id = EXCLUDED.strategy_id, \
-                    pos_uid = EXCLUDED.pos_uid, \
-                    client_order_id = EXCLUDED.client_order_id, \
-                    side = EXCLUDED.side, \
-                    type = EXCLUDED.type, \
-                    reduce_only = EXCLUDED.reduce_only, \
-                    price = EXCLUDED.price, \
-                    qty = EXCLUDED.qty, \
-                    filled_qty = EXCLUDED.filled_qty, \
-                    status = EXCLUDED.status, \
-                    source = EXCLUDED.source, \
-                    ts_ms = EXCLUDED.ts_ms, \
-                    updated_at = NOW(), \
-                    raw_json = COALESCE (EXCLUDED.raw_json, orders.raw_json) \
-                """
+            INSERT INTO orders (
+                exchange_id,
+                account_id,
+                order_id,
+                symbol_id,
+                strategy_id,
+                pos_uid,
+                client_order_id,
+                side,
+                type,
+                reduce_only,
+                price,
+                qty,
+                filled_qty,
+                status,
+                source,
+                ts_ms,
+                created_at,
+                updated_at,
+                raw_json
+            )
+            VALUES (
+                %s, %s, %s, %s,
+                %s, %s, %s,
+                %s, %s, %s,
+                %s, %s, %s,
+                %s,
+                %s,
+                %s,
+                COALESCE(%s, NOW()),
+                COALESCE(%s, NOW()),
+                %s
+            )
+            ON CONFLICT (exchange_id, account_id, order_id)
+            DO UPDATE SET
+                symbol_id = EXCLUDED.symbol_id,
+                strategy_id = EXCLUDED.strategy_id,
+                pos_uid = EXCLUDED.pos_uid,
+                client_order_id = EXCLUDED.client_order_id,
+                side = EXCLUDED.side,
+                type = EXCLUDED.type,
+                reduce_only = EXCLUDED.reduce_only,
+                price = EXCLUDED.price,
+                qty = EXCLUDED.qty,
+                filled_qty = EXCLUDED.filled_qty,
+                status = EXCLUDED.status,
+                source = EXCLUDED.source,
+                ts_ms = EXCLUDED.ts_ms,
+                updated_at = NOW(),
+                raw_json = COALESCE(EXCLUDED.raw_json, orders.raw_json)
+        """
 
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
@@ -1299,7 +1780,6 @@ class PostgreSQLStorage:
                 )
             conn.commit()
 
-
     def append_order_events(self, rows: Iterable[dict]) -> None:
         """Append immutable order events (idempotent)."""
         rows = list(rows or [])
@@ -1328,43 +1808,40 @@ class PostgreSQLStorage:
             conn.commit()
 
     def fetch_order_events(
-            self,
-            *,
-            exchange_id: int,
-            account_id: int,
-            since_ts_ms: int | None = None,
-            limit: int | None = None,
+        self,
+        *,
+        exchange_id: int,
+        account_id: int,
+        since_ts_ms: int | None = None,
+        limit: int | None = None,
     ) -> list[dict]:
         """
         Fetch order_events ordered by ts_ms ASC.
         Used for OMS rebuild.
         """
         sql = """
-              SELECT exchange_id, \
-                     account_id, \
-                     order_id, \
-                     symbol_id, \
-                     client_order_id, \
-                     status, \
-                     side, \
-                     type, \
-                     reduce_only, \
-                     price, \
-                     qty, \
-                     filled_qty, \
-                     source, \
-                     ts_ms, \
-                     recv_ts, \
-                     raw_json
-              FROM order_events
-              WHERE exchange_id = %(exchange_id)s
-                AND account_id = %(account_id)s \
-              """
+            SELECT exchange_id,
+                   account_id,
+                   order_id,
+                   symbol_id,
+                   client_order_id,
+                   status,
+                   side,
+                   type,
+                   reduce_only,
+                   price,
+                   qty,
+                   filled_qty,
+                   source,
+                   ts_ms,
+                   recv_ts,
+                   raw_json
+            FROM order_events
+            WHERE exchange_id = %(exchange_id)s
+              AND account_id = %(account_id)s
+        """
 
-        params = {
-            "exchange_id": int(exchange_id),
-            "account_id": int(account_id),
-        }
+        params = {"exchange_id": int(exchange_id), "account_id": int(account_id)}
 
         if since_ts_ms is not None:
             sql += " AND ts_ms >= %(since_ts_ms)s"
@@ -1384,13 +1861,15 @@ class PostgreSQLStorage:
 
         return [dict(zip(cols, r)) for r in rows]
 
-
+    # ======================================================================
+    # CANDLES
+    # ======================================================================
 
     def upsert_candles(self, rows: list[dict]) -> int:
         if not rows:
             return 0
 
-        now = datetime.now(timezone.utc)
+        now = _utcnow()
         for r in rows:
             r.setdefault("quote_volume", None)
             r.setdefault("trades", None)
@@ -1405,42 +1884,46 @@ class PostgreSQLStorage:
             r.setdefault("updated_at", now)
 
         sql = """
-              INSERT INTO candles (exchange_id, symbol_id, interval, open_time, \
-                                   open, high, low, close, volume, \
-                                   quote_volume, trades, \
-                                   taker_buy_base, taker_buy_quote, \
-                                   taker_sell_base, taker_sell_quote, \
-                                   delta_quote, delta_base, \
-                                   cvd_quote, \
-                                   source, updated_at)
-              VALUES (%(exchange_id)s, %(symbol_id)s, %(interval)s, %(open_time)s, \
-                      %(open)s, %(high)s, %(low)s, %(close)s, %(volume)s, \
-                      %(quote_volume)s, %(trades)s, \
-                      %(taker_buy_base)s, %(taker_buy_quote)s, \
-                      %(taker_sell_base)s, %(taker_sell_quote)s, \
-                      %(delta_quote)s, %(delta_base)s, \
-                      %(cvd_quote)s, \
-                      %(source)s, %(updated_at)s) ON CONFLICT (exchange_id, symbol_id, interval, open_time)
-        DO \
-              UPDATE SET \
-                  open = EXCLUDED.open, \
-                  high = EXCLUDED.high, \
-                  low = EXCLUDED.low, \
-                  close = EXCLUDED.close, \
-                  volume = EXCLUDED.volume, \
+            INSERT INTO candles (
+                exchange_id, symbol_id, interval, open_time,
+                open, high, low, close, volume,
+                quote_volume, trades,
+                taker_buy_base, taker_buy_quote,
+                taker_sell_base, taker_sell_quote,
+                delta_quote, delta_base,
+                cvd_quote,
+                source, updated_at
+            )
+            VALUES (
+                %(exchange_id)s, %(symbol_id)s, %(interval)s, %(open_time)s,
+                %(open)s, %(high)s, %(low)s, %(close)s, %(volume)s,
+                %(quote_volume)s, %(trades)s,
+                %(taker_buy_base)s, %(taker_buy_quote)s,
+                %(taker_sell_base)s, %(taker_sell_quote)s,
+                %(delta_quote)s, %(delta_base)s,
+                %(cvd_quote)s,
+                %(source)s, %(updated_at)s
+            )
+            ON CONFLICT (exchange_id, symbol_id, interval, open_time)
+            DO UPDATE SET
+                open = EXCLUDED.open,
+                high = EXCLUDED.high,
+                low = EXCLUDED.low,
+                close = EXCLUDED.close,
+                volume = EXCLUDED.volume,
 
-                  quote_volume = COALESCE (EXCLUDED.quote_volume, candles.quote_volume), \
-                  trades = COALESCE (EXCLUDED.trades, candles.trades), \
-                  taker_buy_base = COALESCE (EXCLUDED.taker_buy_base, candles.taker_buy_base), \
-                  taker_buy_quote = COALESCE (EXCLUDED.taker_buy_quote, candles.taker_buy_quote), \
-                  taker_sell_base = COALESCE (EXCLUDED.taker_sell_base, candles.taker_sell_base), \
-                  taker_sell_quote = COALESCE (EXCLUDED.taker_sell_quote, candles.taker_sell_quote), \
-                  delta_quote = COALESCE (EXCLUDED.delta_quote, candles.delta_quote), \
-                  delta_base = COALESCE (EXCLUDED.delta_base, candles.delta_base), \
-                  cvd_quote = COALESCE (EXCLUDED.cvd_quote, candles.cvd_quote), \
-                  source = EXCLUDED.source, \
-                  updated_at = GREATEST(candles.updated_at, EXCLUDED.updated_at) \
-              """
+                quote_volume = COALESCE(EXCLUDED.quote_volume, candles.quote_volume),
+                trades = COALESCE(EXCLUDED.trades, candles.trades),
+                taker_buy_base = COALESCE(EXCLUDED.taker_buy_base, candles.taker_buy_base),
+                taker_buy_quote = COALESCE(EXCLUDED.taker_buy_quote, candles.taker_buy_quote),
+                taker_sell_base = COALESCE(EXCLUDED.taker_sell_base, candles.taker_sell_base),
+                taker_sell_quote = COALESCE(EXCLUDED.taker_sell_quote, candles.taker_sell_quote),
+                delta_quote = COALESCE(EXCLUDED.delta_quote, candles.delta_quote),
+                delta_base = COALESCE(EXCLUDED.delta_base, candles.delta_base),
+                cvd_quote = COALESCE(EXCLUDED.cvd_quote, candles.cvd_quote),
+                source = EXCLUDED.source,
+                updated_at = GREATEST(candles.updated_at, EXCLUDED.updated_at)
+        """
 
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
@@ -1453,8 +1936,6 @@ class PostgreSQLStorage:
         """
         Возвращает watermarks для candles:
           (symbol_id, interval) -> MAX(open_time)
-
-        Нужно для collector_candles.py чтобы продолжать догрузку после рестарта.
         """
         wm: Dict[Tuple[int, str], datetime] = {}
         intervals = [str(x).strip() for x in (intervals or []) if str(x).strip()]
@@ -1462,12 +1943,12 @@ class PostgreSQLStorage:
             return wm
 
         sql = """
-              SELECT symbol_id, MAX(open_time) AS last_open_time
-              FROM candles
-              WHERE exchange_id = %s \
-                AND interval = %s
-              GROUP BY symbol_id \
-              """
+            SELECT symbol_id, MAX(open_time) AS last_open_time
+            FROM candles
+            WHERE exchange_id = %s
+              AND interval = %s
+            GROUP BY symbol_id
+        """
 
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
@@ -1480,32 +1961,36 @@ class PostgreSQLStorage:
 
         return wm
 
+    # ======================================================================
+    # ORDERS QUERIES
+    # ======================================================================
+
     def list_non_terminal_orders(self, *, exchange_id: int, account_id: int, symbol_ids=None) -> list[dict]:
         base = """
-               SELECT exchange_id, \
-                      account_id, \
-                      order_id, \
-                      symbol_id, \
-                      strategy_id, \
-                      pos_uid, \
-                      client_order_id, \
-                      side, \
-                      type, \
-                      reduce_only, \
-                      price, \
-                      qty, \
-                      filled_qty, \
-                      status, \
-                      created_at, \
-                      updated_at, \
-                      source, \
-                      ts_ms, \
-                      raw_json
-               FROM orders
-               WHERE exchange_id = %s \
-                 AND account_id = %s
-                 AND status NOT IN ('FILLED', 'CANCELED', 'REJECTED', 'EXPIRED') \
-               """
+            SELECT exchange_id,
+                   account_id,
+                   order_id,
+                   symbol_id,
+                   strategy_id,
+                   pos_uid,
+                   client_order_id,
+                   side,
+                   type,
+                   reduce_only,
+                   price,
+                   qty,
+                   filled_qty,
+                   status,
+                   created_at,
+                   updated_at,
+                   source,
+                   ts_ms,
+                   raw_json
+            FROM orders
+            WHERE exchange_id = %s
+              AND account_id = %s
+              AND status NOT IN ('FILLED', 'CANCELED', 'REJECTED', 'EXPIRED')
+        """
         params = [int(exchange_id), int(account_id)]
         if symbol_ids:
             base += " AND symbol_id = ANY(%s)"
@@ -1520,33 +2005,36 @@ class PostgreSQLStorage:
                 return [dict(zip(cols, r)) for r in rows]
 
     def get_order_by_client_order_id(
-            self,
-            *,
-            exchange_id: int,
-            account_id: int,
-            client_order_id: str,
-            prefer_placeholder: bool = True,
+        self,
+        *,
+        exchange_id: int,
+        account_id: int,
+        client_order_id: str,
+        prefer_placeholder: bool = True,
     ) -> dict | None:
         if not client_order_id:
             return None
 
         q_ph = """
-               SELECT *
-               FROM orders
-               WHERE exchange_id = %s \
-                 AND account_id = %s \
-                 AND client_order_id = %s
-                 AND order_id LIKE 'PH::%%'
-               ORDER BY updated_at DESC LIMIT 1 \
-               """
+            SELECT *
+            FROM orders
+            WHERE exchange_id = %s
+              AND account_id = %s
+              AND client_order_id = %s
+              AND order_id LIKE 'PH::%%'
+            ORDER BY updated_at DESC
+            LIMIT 1
+        """
+
         q_any = """
-                SELECT *
-                FROM orders
-                WHERE exchange_id = %s \
-                  AND account_id = %s \
-                  AND client_order_id = %s
-                ORDER BY updated_at DESC LIMIT 1 \
-                """
+            SELECT *
+            FROM orders
+            WHERE exchange_id = %s
+              AND account_id = %s
+              AND client_order_id = %s
+            ORDER BY updated_at DESC
+            LIMIT 1
+        """
 
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
@@ -1556,6 +2044,7 @@ class PostgreSQLStorage:
                     if row:
                         cols = [d[0] for d in cur.description]
                         return dict(zip(cols, row))
+
                 cur.execute(q_any, (int(exchange_id), int(account_id), str(client_order_id)))
                 row = cur.fetchone()
                 if not row:
@@ -1563,33 +2052,23 @@ class PostgreSQLStorage:
                 cols = [d[0] for d in cur.description]
                 return dict(zip(cols, row))
 
+    # ======================================================================
+    # FILTERS LOADER
+    # ======================================================================
 
-    def get_symbol_filters(
-            self,
-            *,
-            exchange_id: int,
-            symbol_id: int,
-    ) -> dict | None:
-        """
-        Load trading filters for symbol.
-
-        Used by OMS to normalize qty/price before submit.
-        Returns None if filters not found.
-        """
-
+    def get_symbol_filters(self, *, exchange_id: int, symbol_id: int) -> dict | None:
         query = """
-                SELECT price_tick, \
-                       qty_step, \
-                       min_qty, \
-                       max_qty, \
-                       min_notional, \
-                       max_leverage, \
-                       margin_type
-                FROM symbol_filters
-                WHERE exchange_id = %s
-                  AND symbol_id = %s \
-                """
-
+            SELECT price_tick,
+                   qty_step,
+                   min_qty,
+                   max_qty,
+                   min_notional,
+                   max_leverage,
+                   margin_type
+            FROM symbol_filters
+            WHERE exchange_id = %s
+              AND symbol_id = %s
+        """
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(query, (int(exchange_id), int(symbol_id)))
@@ -1611,21 +2090,20 @@ class PostgreSQLStorage:
             "margin_type": row[6],
         }
 
-    def fetch_orders_metrics_window(self, *, exchange_id: int, account_id: int, since_ts_ms: int) -> list[dict]:
-        """
-        STEP 7: get orders rows for lifecycle metrics inside time window.
-        We only need: client_order_id, order_id, status, source, ts_ms.
-        """
-        query = """
-                SELECT client_order_id, order_id, status, source, ts_ms
-                FROM orders
-                WHERE exchange_id = %s
-                  AND account_id = %s
-                  AND ts_ms >= %s
-                  AND client_order_id IS NOT NULL
-                ORDER BY ts_ms ASC \
-                """
+    # ======================================================================
+    # METRICS WINDOW
+    # ======================================================================
 
+    def fetch_orders_metrics_window(self, *, exchange_id: int, account_id: int, since_ts_ms: int) -> list[dict]:
+        query = """
+            SELECT client_order_id, order_id, status, source, ts_ms
+            FROM orders
+            WHERE exchange_id = %s
+              AND account_id = %s
+              AND ts_ms >= %s
+              AND client_order_id IS NOT NULL
+            ORDER BY ts_ms ASC
+        """
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(query, (int(exchange_id), int(account_id), int(since_ts_ms)))
@@ -1644,23 +2122,23 @@ class PostgreSQLStorage:
             )
         return out
 
-    def upsert_account_state(
-            self,
-            *,
-            exchange_id: int,
-            account_id: int,
-            state: dict,
-    ) -> None:
+    # ======================================================================
+    # ACCOUNT STATE
+    # ======================================================================
+
+    def upsert_account_state(self, *, exchange_id: int, account_id: int, state: dict) -> None:
         sql = """
-              INSERT INTO account_state (exchange_id, \
-                                         account_id, \
-                                         ts, \
-                                         wallet_balance, \
-                                         equity, \
-                                         available_balance, \
-                                         unrealized_pnl)
-              VALUES (%s, %s, NOW(), %s, %s, %s, %s) \
-              """
+            INSERT INTO account_state (
+                exchange_id,
+                account_id,
+                ts,
+                wallet_balance,
+                equity,
+                available_balance,
+                unrealized_pnl
+            )
+            VALUES (%s, %s, NOW(), %s, %s, %s, %s)
+        """
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -1676,8 +2154,13 @@ class PostgreSQLStorage:
                 )
             conn.commit()
 
+    # ======================================================================
+    # DDL EXECUTOR
+    # ======================================================================
+
     def exec_ddl(self, sql: str) -> None:
-        """Execute DDL SQL that may contain multiple statements.
+        """
+        Execute DDL SQL that may contain multiple statements.
 
         Supports:
           - multiple statements separated by ';'
@@ -1697,11 +2180,11 @@ class PostgreSQLStorage:
             i = 0
             n = len(s)
 
-            in_squote = False  # '...'
-            in_dquote = False  # "..."
-            in_line_comment = False  # -- ....
-            in_block_comment = False  # /* ... */
-            dollar_tag: str | None = None  # '$$' or '$tag$'
+            in_squote = False
+            in_dquote = False
+            in_line_comment = False
+            in_block_comment = False
+            dollar_tag: str | None = None  # $$ or $tag$
 
             def startswith_at(prefix: str) -> bool:
                 return s.startswith(prefix, i)
@@ -1715,7 +2198,7 @@ class PostgreSQLStorage:
             while i < n:
                 ch = s[i]
 
-                # -------- comments handling --------
+                # line comment
                 if in_line_comment:
                     buf.append(ch)
                     if ch == "\n":
@@ -1723,22 +2206,18 @@ class PostgreSQLStorage:
                     i += 1
                     continue
 
+                # block comment
                 if in_block_comment:
-                    buf.append(ch)
                     if startswith_at("*/"):
-                        buf.append("*")  # we already added current char; add '*'? (we'll handle properly below)
-                    # simpler: detect end and consume both chars
-                    if startswith_at("*/"):
-                        # we already appended ch ('*' maybe not), so do exact consume:
-                        buf.pop()  # remove current ch, we will append full "*/"
                         buf.append("*/")
                         i += 2
                         in_block_comment = False
                         continue
+                    buf.append(ch)
                     i += 1
                     continue
 
-                # start of comments (only if not inside quotes/dollar)
+                # start comment
                 if not in_squote and not in_dquote and dollar_tag is None:
                     if startswith_at("--"):
                         buf.append("--")
@@ -1751,43 +2230,35 @@ class PostgreSQLStorage:
                         in_block_comment = True
                         continue
 
-                # -------- dollar-quoted blocks --------
+                # dollar block
                 if not in_squote and not in_dquote:
                     if dollar_tag is not None:
-                        # check if we are closing the tag
                         if s.startswith(dollar_tag, i):
                             buf.append(dollar_tag)
                             i += len(dollar_tag)
                             dollar_tag = None
                             continue
-                        # otherwise just consume
                         buf.append(ch)
                         i += 1
                         continue
                     else:
-                        # detect opening dollar tag: $...$
                         if ch == "$":
                             j = i + 1
-                            # find next '$' to close tag header
                             while j < n and s[j] != "$":
-                                # allowed tag chars: letters/digits/underscore (but we can be permissive)
                                 j += 1
                             if j < n and s[j] == "$":
-                                tag = s[i: j + 1]  # includes both '$'
-                                # start dollar mode
+                                tag = s[i: j + 1]
                                 dollar_tag = tag
                                 buf.append(tag)
                                 i = j + 1
                                 continue
 
-                # -------- string quotes --------
+                # string quotes
                 if dollar_tag is None:
                     if not in_dquote and ch == "'":
                         buf.append(ch)
                         if in_squote:
-                            # handle escaped '' inside single-quote
                             if i + 1 < n and s[i + 1] == "'":
-                                # stays inside string, consume both
                                 buf.append("'")
                                 i += 2
                                 continue
@@ -1799,7 +2270,6 @@ class PostgreSQLStorage:
 
                     if not in_squote and ch == '"':
                         buf.append(ch)
-                        # double quotes escape by "" (rare, but handle)
                         if in_dquote:
                             if i + 1 < n and s[i + 1] == '"':
                                 buf.append('"')
@@ -1811,7 +2281,7 @@ class PostgreSQLStorage:
                         i += 1
                         continue
 
-                # -------- statement boundary --------
+                # boundary
                 if ch == ";" and not in_squote and not in_dquote and dollar_tag is None:
                     flush()
                     i += 1
@@ -1831,37 +2301,41 @@ class PostgreSQLStorage:
                     cur.execute(stmt)
             conn.commit()
 
-    def fetch_trades(
-            self,
-            *,
-            exchange_id: int,
-            account_id: int,
-            since_ts_ms: int = 0,
-            limit: int = 200_000,
-    ) -> list[dict]:
+    # ======================================================================
+    # TRADES FETCH
+    # ======================================================================
 
+    def fetch_trades(
+        self,
+        *,
+        exchange_id: int,
+        account_id: int,
+        since_ts_ms: int = 0,
+        limit: int = 200_000,
+    ) -> list[dict]:
         query = """
-                SELECT exchange_id, \
-                       account_id, \
-                       symbol_id, \
-                       trade_id, \
-                       order_id, \
-                       side, \
-                       qty, \
-                       price, \
-                       realized_pnl, \
-                       fee, \
-                       (EXTRACT(EPOCH FROM ts) * 1000)::BIGINT AS ts_ms, raw_json
-                FROM trades
-                WHERE exchange_id = %(exchange_id)s
-                  AND account_id = %(account_id)s
-                  AND (
+            SELECT exchange_id,
+                   account_id,
+                   symbol_id,
+                   trade_id,
+                   order_id,
+                   side,
+                   qty,
+                   price,
+                   realized_pnl,
+                   fee,
+                   (EXTRACT(EPOCH FROM ts) * 1000)::BIGINT AS ts_ms,
+                   raw_json
+            FROM trades
+            WHERE exchange_id = %(exchange_id)s
+              AND account_id = %(account_id)s
+              AND (
                     %(since_ts_ms)s = 0
-                        OR ts >= to_timestamp(%(since_ts_ms)s / 1000.0)
-                    )
-                ORDER BY ts ASC
-                    LIMIT %(limit)s \
-                """
+                    OR ts >= to_timestamp(%(since_ts_ms)s / 1000.0)
+                  )
+            ORDER BY ts ASC
+            LIMIT %(limit)s
+        """
 
         params = {
             "exchange_id": int(exchange_id),
@@ -1875,13 +2349,14 @@ class PostgreSQLStorage:
                 cur.execute(query, params)
                 rows = cur.fetchall()
                 cols = [c.name for c in cur.description]
-            conn.commit()
 
         return [dict(zip(cols, r)) for r in rows]
 
+    # ======================================================================
+    # RAW SQL
+    # ======================================================================
 
-    # ------------------------------------------------------------
-    def execute_raw(self, query: str, *, log: bool = False) -> None:
+    def execute_raw(self, query: str, *, log_sql: bool = False) -> None:
         """
         Execute raw SQL (DDL / maintenance / cleanup).
         SAFE: uses connection pool.
@@ -1889,7 +2364,7 @@ class PostgreSQLStorage:
         if not query:
             return
 
-        if log:
+        if log_sql:
             logger.info("[DB][RAW] %s", query)
 
         with self.pool.connection() as conn:
@@ -1897,36 +2372,40 @@ class PostgreSQLStorage:
                 cur.execute(_sql.SQL(query))
             conn.commit()
 
+    # ======================================================================
+    # ACTIVE SYMBOLS
+    # ======================================================================
 
     def list_active_symbols(self, *, exchange_id: int, active_ttl_sec: int = 1800) -> List[str]:
         """
         Active symbols = symbols with OPEN positions OR NEW orders recently updated.
-        Returns list of SYMBOL strings (e.g. 'LTCUSDT').
         """
         exchange_id = int(exchange_id)
         ttl = int(active_ttl_sec)
 
         sql = """
-              WITH active_symbol_ids AS (SELECT p.symbol_id \
-                                         FROM positions p \
-                                         WHERE p.exchange_id = %s \
-                                           AND abs(p.qty) > 0 \
-                                           AND p.status = 'OPEN' \
-                                           AND p.closed_at IS NULL \
+            WITH active_symbol_ids AS (
+                SELECT p.symbol_id
+                FROM positions p
+                WHERE p.exchange_id = %s
+                  AND abs(p.qty) > 0
+                  AND p.status = 'OPEN'
+                  AND p.closed_at IS NULL
 
-                                         UNION ALL \
+                UNION ALL
 
-                                         SELECT o.symbol_id \
-                                         FROM orders o \
-                                         WHERE o.exchange_id = %s \
-                                           AND o.status = 'NEW' \
-                                           AND o.updated_at >= (now() - (%s || ' seconds')::interval))
-              SELECT DISTINCT s.symbol
-              FROM symbols s
-                       JOIN active_symbol_ids a ON a.symbol_id = s.symbol_id
-              WHERE s.exchange_id = %s
-              ORDER BY s.symbol; \
-              """
+                SELECT o.symbol_id
+                FROM orders o
+                WHERE o.exchange_id = %s
+                  AND o.status = 'NEW'
+                  AND o.updated_at >= (now() - (%s || ' seconds')::interval)
+            )
+            SELECT DISTINCT s.symbol
+            FROM symbols s
+            JOIN active_symbol_ids a ON a.symbol_id = s.symbol_id
+            WHERE s.exchange_id = %s
+            ORDER BY s.symbol;
+        """
 
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
@@ -1934,10 +2413,6 @@ class PostgreSQLStorage:
                 return [str(r[0]) for r in (cur.fetchall() or []) if r and r[0]]
 
     def get_symbol_id(self, *, exchange_id: int, symbol: str) -> int | None:
-        """
-        Resolve symbol_id for (exchange_id, symbol).
-        Returns None if symbol not found.
-        """
         symbol = str(symbol).upper().strip()
         if not symbol:
             return None
@@ -1961,7 +2436,6 @@ class PostgreSQLStorage:
             {where}
             ORDER BY symbol
         """
-
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(sql, params)
@@ -1970,30 +2444,27 @@ class PostgreSQLStorage:
         return {str(sym).upper(): int(sid) for (sym, sid) in rows}
 
     def deactivate_missing_symbols(self, *, exchange_id: int, active_symbols: Iterable[str]) -> int:
-        """
-        Marks symbols NOT in active_symbols as inactive.
-        Returns number of rows updated.
-        """
         active = [str(s).upper() for s in (active_symbols or [])]
         if not active:
             return 0
 
         sql = """
-        UPDATE symbols
-        SET is_active = FALSE
-        WHERE exchange_id = %s
-          AND is_active = TRUE
-          AND NOT (symbol = ANY(%s))
+            UPDATE symbols
+            SET is_active = FALSE
+            WHERE exchange_id = %s
+              AND is_active = TRUE
+              AND NOT (symbol = ANY(%s))
         """
-
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(sql, (int(exchange_id), active))
                 n = cur.rowcount
             conn.commit()
-
         return int(n or 0)
 
+    # ======================================================================
+    # FUNDING / OPEN INTEREST / TICKER_24H
+    # ======================================================================
 
     def upsert_funding(self, rows: list[dict]) -> int:
         if not rows:
@@ -2026,23 +2497,26 @@ class PostgreSQLStorage:
             return 0
 
         query = """
-                INSERT INTO open_interest (exchange_id, symbol_id, interval, ts, \
-                                           open_interest, open_interest_value, source)
-                VALUES (%(exchange_id)s, %(symbol_id)s, %(interval)s, %(ts)s, \
-                        %(open_interest)s, %(open_interest_value)s, %(source)s) ON CONFLICT (exchange_id, symbol_id, interval, ts)
-            DO \
-                UPDATE SET
-                    open_interest = EXCLUDED.open_interest, \
-                    open_interest_value = EXCLUDED.open_interest_value, \
-                    source = EXCLUDED.source \
-                """
+            INSERT INTO open_interest (
+                exchange_id, symbol_id, interval, ts,
+                open_interest, open_interest_value, source
+            )
+            VALUES (
+                %(exchange_id)s, %(symbol_id)s, %(interval)s, %(ts)s,
+                %(open_interest)s, %(open_interest_value)s, %(source)s
+            )
+            ON CONFLICT (exchange_id, symbol_id, interval, ts)
+            DO UPDATE SET
+                open_interest = EXCLUDED.open_interest,
+                open_interest_value = EXCLUDED.open_interest_value,
+                source = EXCLUDED.source
+        """
 
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.executemany(query, rows)
             conn.commit()
 
-        # ВАЖНО: rowcount может врать -> возвращаем len(rows)
         return len(rows)
 
     def cleanup_funding(self, *, exchange_id: int, keep_days: int) -> int:
@@ -2080,41 +2554,43 @@ class PostgreSQLStorage:
             conn.commit()
         return int(n or 0)
 
-
     def upsert_ticker_24h(self, rows: Iterable[dict]) -> int:
-        rows = list(rows)
+        rows = list(rows or [])
         if not rows:
             return 0
 
         query = """
-                INSERT INTO ticker_24h (exchange_id, symbol_id, \
-                                        open_time, close_time, \
-                                        open_price, high_price, low_price, last_price, \
-                                        volume, quote_volume, \
-                                        price_change, price_change_percent, weighted_avg_price, \
-                                        trades, source)
-                VALUES (%(exchange_id)s, %(symbol_id)s, \
-                        %(open_time)s, %(close_time)s, \
-                        %(open_price)s, %(high_price)s, %(low_price)s, %(last_price)s, \
-                        %(volume)s, %(quote_volume)s, \
-                        %(price_change)s, %(price_change_percent)s, %(weighted_avg_price)s, \
-                        %(trades)s, %(source)s) ON CONFLICT (exchange_id, symbol_id, close_time)
-            DO \
-                UPDATE SET
-                    open_time = EXCLUDED.open_time, \
-                    open_price = EXCLUDED.open_price, \
-                    high_price = EXCLUDED.high_price, \
-                    low_price = EXCLUDED.low_price, \
-                    last_price = EXCLUDED.last_price, \
-                    volume = EXCLUDED.volume, \
-                    quote_volume = EXCLUDED.quote_volume, \
-                    price_change = EXCLUDED.price_change, \
-                    price_change_percent = EXCLUDED.price_change_percent, \
-                    weighted_avg_price = EXCLUDED.weighted_avg_price, \
-                    trades = EXCLUDED.trades, \
-                    source = EXCLUDED.source
-                ; \
-                """
+            INSERT INTO ticker_24h (
+                exchange_id, symbol_id,
+                open_time, close_time,
+                open_price, high_price, low_price, last_price,
+                volume, quote_volume,
+                price_change, price_change_percent, weighted_avg_price,
+                trades, source
+            )
+            VALUES (
+                %(exchange_id)s, %(symbol_id)s,
+                %(open_time)s, %(close_time)s,
+                %(open_price)s, %(high_price)s, %(low_price)s, %(last_price)s,
+                %(volume)s, %(quote_volume)s,
+                %(price_change)s, %(price_change_percent)s, %(weighted_avg_price)s,
+                %(trades)s, %(source)s
+            )
+            ON CONFLICT (exchange_id, symbol_id, close_time)
+            DO UPDATE SET
+                open_time = EXCLUDED.open_time,
+                open_price = EXCLUDED.open_price,
+                high_price = EXCLUDED.high_price,
+                low_price = EXCLUDED.low_price,
+                last_price = EXCLUDED.last_price,
+                volume = EXCLUDED.volume,
+                quote_volume = EXCLUDED.quote_volume,
+                price_change = EXCLUDED.price_change,
+                price_change_percent = EXCLUDED.price_change_percent,
+                weighted_avg_price = EXCLUDED.weighted_avg_price,
+                trades = EXCLUDED.trades,
+                source = EXCLUDED.source
+        """
 
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
@@ -2127,22 +2603,20 @@ class PostgreSQLStorage:
     def cleanup_ticker_24h(self, exchange_id: int, keep_days: int) -> int:
         """
         Удаляет записи ticker_24h старше keep_days (по close_time).
-        Возвращает количество удалённых строк.
         """
         exchange_id = int(exchange_id)
         keep_days = int(keep_days)
-
         if keep_days <= 0:
             return 0
 
-        cutoff = datetime.now(timezone.utc) - timedelta(days=keep_days)
+        cutoff = _utcnow() - timedelta(days=keep_days)
 
         sql = """
-              DELETE \
-              FROM public.ticker_24h
-              WHERE exchange_id = %s
-                AND close_time < %s \
-              """
+            DELETE
+            FROM public.ticker_24h
+            WHERE exchange_id = %s
+              AND close_time < %s
+        """
 
         try:
             with self.pool.connection() as conn:
@@ -2161,6 +2635,9 @@ class PostgreSQLStorage:
             logger.exception("cleanup_ticker_24h failed exchange_id=%s keep_days=%s", exchange_id, keep_days)
             return 0
 
+    # ======================================================================
+    # ORDER FILLS (OMS invariant)
+    # ======================================================================
 
     def insert_order_fill(self, fill: Any) -> int:
         return self.insert_order_fills([fill])
@@ -2180,32 +2657,37 @@ class PostgreSQLStorage:
             return 0
 
         sql = """
-              INSERT INTO order_fills (exchange_id, \
-                                       account_id, \
-                                       fill_uid, \
-                                       symbol_id, \
-                                       order_id, \
-                                       trade_id, \
-                                       client_order_id, \
-                                       price, \
-                                       qty, \
-                                       realized_pnl, \
-                                       ts, \
-                                       source)
-              VALUES (%(exchange_id)s, \
-                      %(account_id)s, \
-                      %(fill_uid)s, \
-                      %(symbol_id)s, \
-                      %(order_id)s, \
-                      %(trade_id)s, \
-                      %(client_order_id)s, \
-                      %(price)s, \
-                      %(qty)s, \
-                      %(realized_pnl)s, \
-                      %(ts)s, \
-                      %(source)s) ON CONFLICT (exchange_id, account_id, fill_uid)
-            DO NOTHING; \
-              """
+            INSERT INTO order_fills (
+                exchange_id,
+                account_id,
+                fill_uid,
+                symbol_id,
+                order_id,
+                trade_id,
+                client_order_id,
+                price,
+                qty,
+                realized_pnl,
+                ts,
+                source
+            )
+            VALUES (
+                %(exchange_id)s,
+                %(account_id)s,
+                %(fill_uid)s,
+                %(symbol_id)s,
+                %(order_id)s,
+                %(trade_id)s,
+                %(client_order_id)s,
+                %(price)s,
+                %(qty)s,
+                %(realized_pnl)s,
+                %(ts)s,
+                %(source)s
+            )
+            ON CONFLICT (exchange_id, account_id, fill_uid)
+            DO NOTHING
+        """
 
         now = _utcnow()
 
@@ -2215,71 +2697,60 @@ class PostgreSQLStorage:
         rows: list[dict[str, Any]] = []
 
         for f in fills:
-            # ---------------------------
-            # обязательные идентификаторы
             ex_id = get(f, "exchange_id")
             acc_id = get(f, "account_id")
             sym_id = get(f, "symbol_id")
-
             if ex_id is None or acc_id is None or sym_id is None:
                 continue
 
             trade_id = get(f, "trade_id")
             if trade_id is None:
-                # ❌ без trade_id — это не fill
                 continue
 
-            # ---------------------------
-            # 🔒 ЖЁСТКИЙ OMS-инвариант
             fill_uid = str(trade_id)
 
-            # ---------------------------
-            # price / qty обязательны
             price = get(f, "price")
             qty = get(f, "qty")
-
             if price is None or qty is None:
                 continue
 
-            # ---------------------------
-            # ts нормализация
             ts = get(f, "ts")
             if isinstance(ts, (int, float)):
-                # если прилетело в ms
                 ts = datetime.fromtimestamp(ts / 1000, tz=timezone.utc)
             elif ts is None:
                 ts = now
 
-            rows.append({
-                "exchange_id": int(ex_id),
-                "account_id": int(acc_id),
-                "fill_uid": fill_uid,  # ✅ ВСЕГДА = trade_id
-                "symbol_id": int(sym_id),
-
-                "order_id": str(get(f, "order_id")) if get(f, "order_id") is not None else None,
-                "trade_id": str(trade_id),
-                "client_order_id": (
-                    str(get(f, "client_order_id"))
-                    if get(f, "client_order_id") is not None
-                    else None
-                ),
-
-                "price": price,
-                "qty": qty,
-                "realized_pnl": get(f, "realized_pnl") or 0,
-
-                "ts": ts,
-                "source": get(f, "source") or "ws_user",
-            })
+            rows.append(
+                {
+                    "exchange_id": int(ex_id),
+                    "account_id": int(acc_id),
+                    "fill_uid": fill_uid,
+                    "symbol_id": int(sym_id),
+                    "order_id": str(get(f, "order_id")) if get(f, "order_id") is not None else None,
+                    "trade_id": str(trade_id),
+                    "client_order_id": (
+                        str(get(f, "client_order_id"))
+                        if get(f, "client_order_id") is not None
+                        else None
+                    ),
+                    "price": price,
+                    "qty": qty,
+                    "realized_pnl": get(f, "realized_pnl") or 0,
+                    "ts": ts,
+                    "source": get(f, "source") or "ws_user",
+                }
+            )
 
         if not rows:
             return 0
 
         return self._exec_many(sql, rows)
 
+    # ======================================================================
+    # ORDER EVENT UPSERT (single)
+    # ======================================================================
 
     def upsert_order_event(self, ev: Any) -> None:
-        # ---------------------------
         # side normalization
         side = ev.side
         if hasattr(side, "name"):
@@ -2289,13 +2760,9 @@ class PostgreSQLStorage:
         else:
             side = None
 
-        # ---------------------------
-        # status / type normalization
         status = ev.status.name if hasattr(ev.status, "name") else ev.status
         otype = ev.type.name if hasattr(ev.type, "name") else ev.type
 
-        # ---------------------------
-        # raw_json (NOT NULL-ish)
         raw = getattr(ev, "raw_json", None) or getattr(ev, "payload", None)
         if raw is None:
             raw = {}
@@ -2308,26 +2775,21 @@ class PostgreSQLStorage:
             except Exception:
                 raw_json = "{}"
 
-        # ---------------------------
-        # recv_ts (NOT NULL)
         recv_ts = getattr(ev, "recv_ts", None)
         if isinstance(recv_ts, (int, float)):
             recv_ts = datetime.fromtimestamp(recv_ts, tz=timezone.utc)
         elif recv_ts is None:
-            recv_ts = datetime.now(timezone.utc)
+            recv_ts = _utcnow()
 
-        # ---------------------------
-        # обязательные поля
         if (
-                ev.exchange_id is None
-                or ev.account_id is None
-                or ev.symbol_id is None
-                or ev.order_id is None
-                or ev.ts_ms is None
+            ev.exchange_id is None
+            or ev.account_id is None
+            or ev.symbol_id is None
+            or ev.order_id is None
+            or ev.ts_ms is None
         ):
-            return  # не роняем WS
+            return
 
-        # стратегия / pos_uid
         strategy_id = getattr(ev, "strategy_id", None) or "unknown"
         pos_uid = getattr(ev, "pos_uid", None)
 
@@ -2357,43 +2819,41 @@ class PostgreSQLStorage:
         }
 
         query = """
-                INSERT INTO order_events (exchange_id, account_id, order_id, symbol_id, \
-                                          client_order_id, status, side, type, \
-                                          reduce_only, price, qty, filled_qty, \
-                                          strategy_id, pos_uid, \
-                                          source, ts_ms, recv_ts, raw_json)
-                VALUES (%(exchange_id)s, %(account_id)s, %(order_id)s, %(symbol_id)s, \
-                        %(client_order_id)s, %(status)s, %(side)s, %(type)s, \
-                        %(reduce_only)s, %(price)s, %(qty)s, %(filled_qty)s, \
-                        %(strategy_id)s, %(pos_uid)s, \
-                        %(source)s, %(ts_ms)s, %(recv_ts)s, %(raw_json)s) ON CONFLICT (exchange_id, account_id, order_id, ts_ms, status, filled_qty)
-            DO NOTHING; \
-                """
+            INSERT INTO order_events (
+                exchange_id, account_id, order_id, symbol_id,
+                client_order_id, status, side, type,
+                reduce_only, price, qty, filled_qty,
+                strategy_id, pos_uid,
+                source, ts_ms, recv_ts, raw_json
+            )
+            VALUES (
+                %(exchange_id)s, %(account_id)s, %(order_id)s, %(symbol_id)s,
+                %(client_order_id)s, %(status)s, %(side)s, %(type)s,
+                %(reduce_only)s, %(price)s, %(qty)s, %(filled_qty)s,
+                %(strategy_id)s, %(pos_uid)s,
+                %(source)s, %(ts_ms)s, %(recv_ts)s, %(raw_json)s
+            )
+            ON CONFLICT (exchange_id, account_id, order_id, ts_ms, status, filled_qty)
+            DO NOTHING
+        """
         self._exec_many(query, [row])
 
-    def exists_order_event(self, *, exchange_id, account_id, order_id, status) -> bool:
+    def exists_order_event(self, *, exchange_id: int, account_id: int, order_id: str, status: str) -> bool:
         sql = """
-              SELECT 1
-              FROM order_events
-              WHERE exchange_id = %s
-                AND account_id = %s
-                AND order_id = %s
-                AND status = %s LIMIT 1; \
-              """
+            SELECT 1
+            FROM order_events
+            WHERE exchange_id = %s
+              AND account_id = %s
+              AND order_id = %s
+              AND status = %s
+            LIMIT 1
+        """
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
-                cur.execute(sql, (exchange_id, account_id, order_id, status))
+                cur.execute(sql, (int(exchange_id), int(account_id), str(order_id), str(status)))
                 return cur.fetchone() is not None
 
-
-    def get_order_by_id(
-            self,
-            *,
-            exchange_id: int,
-            account_id: int,
-            order_id: str,
-        ) -> dict | None:
-        # SQL запрос для поиска ордера по order_id
+    def get_order_by_id(self, *, exchange_id: int, account_id: int, order_id: str) -> dict | None:
         query = """
             SELECT *
             FROM orders
@@ -2402,42 +2862,42 @@ class PostgreSQLStorage:
               AND order_id = %s
             LIMIT 1
         """
-
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
-                # Выполняем запрос с параметрами
                 cur.execute(query, (int(exchange_id), int(account_id), str(order_id)))
                 row = cur.fetchone()
-
-                # Если ордер найден, возвращаем его как словарь
                 if row:
                     cols = [d[0] for d in cur.description]
                     return dict(zip(cols, row))
-
-        # Если ордер не найден
         return None
+
+    # ======================================================================
+    # LIQUIDATIONS
+    # ======================================================================
 
     def insert_liquidation_events(self, rows: list[dict]) -> int:
         if not rows:
             return 0
 
-        from psycopg.types.json import Jsonb  # локально, чтобы точно работало
-
         sql = """
-              INSERT INTO liquidation_events (exchange_id, symbol_id, ts, event_ms, \
-                                              side, price, qty, filled_qty, avg_price, \
-                                              status, order_type, time_in_force, \
-                                              notional, is_long_liq, raw_json)
-              VALUES (%(exchange_id)s, %(symbol_id)s, %(ts)s, %(event_ms)s, \
-                      %(side)s, %(price)s, %(qty)s, %(filled_qty)s, %(avg_price)s, \
-                      %(status)s, %(order_type)s, %(time_in_force)s, \
-                      %(notional)s, %(is_long_liq)s, %(raw_json)s) ON CONFLICT DO NOTHING \
-              """
+            INSERT INTO liquidation_events (
+                exchange_id, symbol_id, ts, event_ms,
+                side, price, qty, filled_qty, avg_price,
+                status, order_type, time_in_force,
+                notional, is_long_liq, raw_json
+            )
+            VALUES (
+                %(exchange_id)s, %(symbol_id)s, %(ts)s, %(event_ms)s,
+                %(side)s, %(price)s, %(qty)s, %(filled_qty)s, %(avg_price)s,
+                %(status)s, %(order_type)s, %(time_in_force)s,
+                %(notional)s, %(is_long_liq)s, %(raw_json)s
+            )
+            ON CONFLICT DO NOTHING
+        """
 
         fixed = []
         for r in rows:
             rr = dict(r)
-            # raw_json может быть dict/list -> оборачиваем в Jsonb
             rr["raw_json"] = Jsonb(rr.get("raw_json"))
             fixed.append(rr)
 
@@ -2447,47 +2907,49 @@ class PostgreSQLStorage:
             conn.commit()
         return len(fixed)
 
-
     def upsert_liquidation_1m(self, rows: list[dict]) -> int:
         if not rows:
             return 0
 
         sql = """
-              INSERT INTO liquidation_1m (exchange_id, symbol_id, bucket_ts, \
-                                          long_notional, short_notional, long_qty, short_qty, events, updated_at)
-              VALUES (%(exchange_id)s, %(symbol_id)s, %(bucket_ts)s, \
-                      %(long_notional)s, %(short_notional)s, %(long_qty)s, %(short_qty)s, %(events)s, %(updated_at)s) ON CONFLICT (exchange_id, symbol_id, bucket_ts)
-        DO \
-              UPDATE SET
-                  long_notional = liquidation_1m.long_notional + EXCLUDED.long_notional, \
-                  short_notional = liquidation_1m.short_notional + EXCLUDED.short_notional, \
-                  long_qty = liquidation_1m.long_qty + EXCLUDED.long_qty, \
-                  short_qty = liquidation_1m.short_qty + EXCLUDED.short_qty, \
-                  events = liquidation_1m.events + EXCLUDED.events, \
-                  updated_at = EXCLUDED.updated_at \
-              """
+            INSERT INTO liquidation_1m (
+                exchange_id, symbol_id, bucket_ts,
+                long_notional, short_notional, long_qty, short_qty, events, updated_at
+            )
+            VALUES (
+                %(exchange_id)s, %(symbol_id)s, %(bucket_ts)s,
+                %(long_notional)s, %(short_notional)s, %(long_qty)s, %(short_qty)s, %(events)s, %(updated_at)s
+            )
+            ON CONFLICT (exchange_id, symbol_id, bucket_ts)
+            DO UPDATE SET
+                long_notional = liquidation_1m.long_notional + EXCLUDED.long_notional,
+                short_notional = liquidation_1m.short_notional + EXCLUDED.short_notional,
+                long_qty = liquidation_1m.long_qty + EXCLUDED.long_qty,
+                short_qty = liquidation_1m.short_qty + EXCLUDED.short_qty,
+                events = liquidation_1m.events + EXCLUDED.events,
+                updated_at = EXCLUDED.updated_at
+        """
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.executemany(sql, rows)
             conn.commit()
         return len(rows)
 
+    # ======================================================================
+    # MARKET STATE RETENTION
+    # ======================================================================
 
     def cleanup_market_state_5m(self, *, exchange_id: int, keep_days: int) -> int:
-        """
-        Удаляет старые записи из market_state_5m.
-        keep_days: сколько дней хранить.
-        """
         keep_days = int(keep_days)
         if keep_days <= 0:
             return 0
 
         sql = """
-              DELETE \
-              FROM market_state_5m
-              WHERE exchange_id = %(exchange_id)s
-                AND open_time < now() - (%(keep_days)s || ' days')::interval \
-              """
+            DELETE
+            FROM market_state_5m
+            WHERE exchange_id = %(exchange_id)s
+              AND open_time < now() - (%(keep_days)s || ' days')::interval
+        """
 
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
@@ -2497,11 +2959,9 @@ class PostgreSQLStorage:
 
         return int(deleted)
 
-    def get_open_interest_watermarks_bulk(self, exchange_id: int, intervals: list[str]) -> dict[
-        str, dict[int, datetime]]:
+    def get_open_interest_watermarks_bulk(self, exchange_id: int, intervals: list[str]) -> dict[str, dict[int, datetime]]:
         """
-        Возвращает watermarks (MAX ts) по каждому symbol_id и interval одним SQL запросом.
-        out: { "5m": {symbol_id: ts, ...}, "15m": {...}, ... }
+        out: { "5m": {symbol_id: ts, ...}, ... }
         """
         exchange_id = int(exchange_id)
         intervals = list(intervals or [])
@@ -2509,12 +2969,12 @@ class PostgreSQLStorage:
             return {}
 
         sql = """
-              SELECT interval, symbol_id, MAX (ts) AS last_ts
-              FROM open_interest
-              WHERE exchange_id = %s
-                AND interval = ANY (%s)
-              GROUP BY interval, symbol_id \
-              """
+            SELECT interval, symbol_id, MAX(ts) AS last_ts
+            FROM open_interest
+            WHERE exchange_id = %s
+              AND interval = ANY (%s)
+            GROUP BY interval, symbol_id
+        """
 
         out: dict[str, dict[int, datetime]] = {iv: {} for iv in intervals}
 
@@ -2528,20 +2988,16 @@ class PostgreSQLStorage:
 
         return out
 
-    # ============================================================
+    # ======================================================================
     # SYMBOL HELPERS (for collectors)
-    # ============================================================
+    # ======================================================================
 
     def list_active_symbol_ids(self, exchange_id: int) -> list[int]:
-        """
-        Быстрый список активных symbol_id для exchange.
-        Используется collectors (OI/MarketState/etc).
-        """
         sql = """
-        SELECT symbol_id
-        FROM symbols
-        WHERE exchange_id = %s AND is_active = true
-        ORDER BY symbol_id
+            SELECT symbol_id
+            FROM symbols
+            WHERE exchange_id = %s AND is_active = true
+            ORDER BY symbol_id
         """
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
@@ -2550,14 +3006,11 @@ class PostgreSQLStorage:
         return [int(r[0]) for r in rows]
 
     def list_active_symbols_map(self, exchange_id: int) -> dict[str, int]:
-        """
-        {SYMBOL: symbol_id} только активные.
-        """
         sql = """
-        SELECT symbol, symbol_id
-        FROM symbols
-        WHERE exchange_id = %s AND is_active = true
-        ORDER BY symbol
+            SELECT symbol, symbol_id
+            FROM symbols
+            WHERE exchange_id = %s AND is_active = true
+            ORDER BY symbol
         """
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
@@ -2566,10 +3019,6 @@ class PostgreSQLStorage:
         return {str(sym).upper(): int(sid) for sym, sid in rows}
 
     def get_symbol_name(self, symbol_id: int) -> str | None:
-        """
-        Возвращает "BTCUSDT" по symbol_id.
-        Нужно для OpenInterest collector и любых REST коллекоров.
-        """
         sql = "SELECT symbol FROM symbols WHERE symbol_id = %s"
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
@@ -2579,24 +3028,19 @@ class PostgreSQLStorage:
             return None
         return str(row[0]).upper()
 
+    # ======================================================================
+    # CLEANUP BATCHED TABLES
+    # ======================================================================
 
     def cleanup_market_trades(
-            self,
-            *,
-            exchange_id: int,
-            keep_days: int,
-            batch_size: int = 50_000,
-            sleep_sec: float = 0.05,
-            max_batches: int = 0,
+        self,
+        *,
+        exchange_id: int,
+        keep_days: int,
+        batch_size: int = 50_000,
+        sleep_sec: float = 0.05,
+        max_batches: int = 0,
     ) -> int:
-        """
-        ✅ Batched cleanup для market_trades по ts.
-
-        - keep_days <= 0 => skip
-        - batch_size: сколько строк удаляем за раз
-        - sleep_sec: пауза между батчами
-        - max_batches: 0 = без лимита, иначе ограничим число батчей за 1 запуск (полезно для safety)
-        """
         keep_days = int(keep_days)
         if keep_days <= 0:
             return 0
@@ -2609,16 +3053,16 @@ class PostgreSQLStorage:
         batches = 0
 
         sql = """
-              WITH del AS (SELECT ctid \
-                           FROM market_trades \
-                           WHERE exchange_id = %(exchange_id)s \
-                             AND ts < now() - (%(keep_days)s || ' days'):: interval
-                  LIMIT %(batch_size)s
-                  )
-              DELETE \
-              FROM market_trades
-              WHERE ctid IN (SELECT ctid FROM del); \
-              """
+            WITH del AS (
+                SELECT ctid
+                FROM market_trades
+                WHERE exchange_id = %(exchange_id)s
+                  AND ts < now() - (%(keep_days)s || ' days')::interval
+                LIMIT %(batch_size)s
+            )
+            DELETE FROM market_trades
+            WHERE ctid IN (SELECT ctid FROM del)
+        """
 
         while True:
             with self.pool.connection() as conn:
@@ -2649,17 +3093,14 @@ class PostgreSQLStorage:
         return total_deleted
 
     def cleanup_candles_trades_agg(
-            self,
-            *,
-            exchange_id: int,
-            keep_days: int,
-            batch_size: int = 50_000,
-            sleep_sec: float = 0.05,
-            max_batches: int = 0,
+        self,
+        *,
+        exchange_id: int,
+        keep_days: int,
+        batch_size: int = 50_000,
+        sleep_sec: float = 0.05,
+        max_batches: int = 0,
     ) -> int:
-        """
-        ✅ Batched cleanup для candles_trades_agg по open_time.
-        """
         keep_days = int(keep_days)
         if keep_days <= 0:
             return 0
@@ -2672,16 +3113,16 @@ class PostgreSQLStorage:
         batches = 0
 
         sql = """
-              WITH del AS (SELECT ctid \
-                           FROM candles_trades_agg \
-                           WHERE exchange_id = %(exchange_id)s \
-                             AND open_time < now() - (%(keep_days)s || ' days'):: interval
-                  LIMIT %(batch_size)s
-                  )
-              DELETE \
-              FROM candles_trades_agg
-              WHERE ctid IN (SELECT ctid FROM del); \
-              """
+            WITH del AS (
+                SELECT ctid
+                FROM candles_trades_agg
+                WHERE exchange_id = %(exchange_id)s
+                  AND open_time < now() - (%(keep_days)s || ' days')::interval
+                LIMIT %(batch_size)s
+            )
+            DELETE FROM candles_trades_agg
+            WHERE ctid IN (SELECT ctid FROM del)
+        """
 
         while True:
             with self.pool.connection() as conn:
@@ -2710,3 +3151,122 @@ class PostgreSQLStorage:
                 time.sleep(sleep_sec)
 
         return total_deleted
+
+    def fetch_candles_window(
+        self,
+        *,
+        exchange_id: int,
+        symbol_id: int,
+        interval: str,
+        center_ts: datetime,
+        lookback: int,
+        lookforward: int,
+    ) -> list[dict]:
+        delta = _interval_to_timedelta(interval)
+        start_ts = center_ts - (delta * int(lookback))
+        end_ts = center_ts + (delta * int(lookforward))
+
+        q = """
+            SELECT open_time AS ts, open, high, low, close, volume, quote_volume
+            FROM candles
+            WHERE exchange_id = %s
+              AND symbol_id = %s
+              AND interval = %s
+              AND open_time >= %s
+              AND open_time <= %s
+            ORDER BY open_time
+        """
+        with self.pool.connection() as con:
+            with con.cursor() as cur:
+                cur.execute(q, (int(exchange_id), int(symbol_id), str(interval), start_ts, end_ts))
+                cols = [d[0] for d in cur.description]
+                return [dict(zip(cols, r)) for r in (cur.fetchall() or [])]
+
+    def fetch_open_interest_window(
+        self,
+        *,
+        exchange_id: int,
+        symbol_id: int,
+        interval: str,
+        center_ts: datetime,
+        lookback: int,
+        lookforward: int,
+    ) -> list[dict]:
+        delta = _interval_to_timedelta(interval)
+        start_ts = center_ts - (delta * int(lookback))
+        end_ts = center_ts + (delta * int(lookforward))
+
+        q = """
+            SELECT ts, open_interest
+            FROM open_interest
+            WHERE exchange_id = %s
+              AND symbol_id = %s
+              AND interval = %s
+              AND ts >= %s
+              AND ts <= %s
+            ORDER BY ts
+        """
+        with self.pool.connection() as con:
+            with con.cursor() as cur:
+                cur.execute(q, (int(exchange_id), int(symbol_id), str(interval), start_ts, end_ts))
+                cols = [d[0] for d in cur.description]
+                return [dict(zip(cols, r)) for r in (cur.fetchall() or [])]
+
+    def fetch_cvd_window(
+        self,
+        *,
+        exchange_id: int,
+        symbol_id: int,
+        interval: str,
+        center_ts: datetime,
+        lookback: int,
+        lookforward: int,
+    ) -> list[dict]:
+        delta = _interval_to_timedelta(interval)
+        start_ts = center_ts - (delta * int(lookback))
+        end_ts = center_ts + (delta * int(lookforward))
+
+        q = """
+            SELECT open_time AS ts, cvd_quote
+            FROM candles
+            WHERE exchange_id = %s
+              AND symbol_id = %s
+              AND interval = %s
+              AND open_time >= %s
+              AND open_time <= %s
+            ORDER BY open_time
+        """
+        with self.pool.connection() as con:
+            with con.cursor() as cur:
+                cur.execute(q, (int(exchange_id), int(symbol_id), str(interval), start_ts, end_ts))
+                cols = [d[0] for d in cur.description]
+                return [dict(zip(cols, r)) for r in (cur.fetchall() or [])]
+
+    def fetch_funding_window(
+        self,
+        *,
+        exchange_id: int,
+        symbol_id: int,
+        center_ts: datetime,
+        lookback: int,
+        lookforward: int,
+        interval: str = "1h",
+    ) -> list[dict]:
+        delta = _interval_to_timedelta(interval)
+        start_ts = center_ts - (delta * int(lookback))
+        end_ts = center_ts + (delta * int(lookforward))
+
+        q = """
+            SELECT funding_time AS ts, funding_rate
+            FROM funding
+            WHERE exchange_id = %s
+              AND symbol_id = %s
+              AND funding_time >= %s
+              AND funding_time <= %s
+            ORDER BY funding_time
+        """
+        with self.pool.connection() as con:
+            with con.cursor() as cur:
+                cur.execute(q, (int(exchange_id), int(symbol_id), start_ts, end_ts))
+                cols = [d[0] for d in cur.description]
+                return [dict(zip(cols, r)) for r in (cur.fetchall() or [])]

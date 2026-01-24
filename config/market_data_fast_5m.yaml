@@ -47,7 +47,7 @@ market_data:
   # ✅ WS for continuous updates
   use_ws: true
   ws_max_streams_per_conn: 60
-  update_open_candle: false
+  update_open_candle: true
 
   lookback_days_if_empty: 2
   refresh_symbols_sec: 300

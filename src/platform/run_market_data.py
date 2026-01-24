@@ -9,7 +9,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional
-
+import math
 import yaml
 
 from src.platform.data.retention.retention_worker import RetentionWorker
@@ -135,6 +135,33 @@ def _load_cfg() -> dict:
 def _has_method(obj: Any, name: str) -> bool:
     return callable(getattr(obj, name, None))
 
+
+def _has_any_method(obj: Any, names: list[str]) -> bool:
+    return any(callable(getattr(obj, n, None)) for n in names)
+
+
+def _estimate_seed_pages(seed_days: int, interval: str, limit: int) -> int:
+    """
+    Прикидываем сколько страниц REST нужно для интервала за seed_days.
+    Binance limit максимум ~1500.
+    """
+    seed_days = max(1, int(seed_days))
+    limit = max(50, min(int(limit), 1500))
+    itv = str(interval).strip().lower()
+
+    # seconds per candle
+    if itv.endswith("m"):
+        sec = int(itv[:-1]) * 60
+    elif itv.endswith("h"):
+        sec = int(itv[:-1]) * 3600
+    elif itv.endswith("d"):
+        sec = int(itv[:-1]) * 86400
+    else:
+        sec = 3600
+
+    bars = int((seed_days * 86400) / max(1, sec))
+    pages = max(1, math.ceil(bars / limit))
+    return int(pages)
 
 # ============================================================
 # REST LIMITS / REST CLIENT
@@ -1037,7 +1064,7 @@ def main() -> None:
     # Candles Gap Repair
     # --------------------------------------------------------
     gpr_cfg = cfg.get("candles_gap_repair") or {}
-    if gpr_cfg.get("enabled", False):
+    if gpr_cfg.get("enabled", True):
         _safe_start_async(
             "CandlesGapRepair collector",
             start_candles_gap_repair_collector,

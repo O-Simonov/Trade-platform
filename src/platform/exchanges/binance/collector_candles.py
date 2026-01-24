@@ -5,6 +5,7 @@ import json
 import logging
 import threading
 import time
+import websocket  # websocket-client
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
@@ -55,7 +56,7 @@ def _safe_int(x: Any, default: int = 0) -> int:
 
 def _chunk(items: List[str], n: int) -> List[List[str]]:
     n = max(1, int(n))
-    return [items[i : i + n] for i in range(0, len(items), n)]
+    return [items[i: i + n] for i in range(0, len(items), n)]
 
 
 def _make_streams(symbols: List[str], interval: str) -> List[str]:
@@ -69,6 +70,38 @@ def _combined_ws_url(streams: List[str]) -> str:
     """
     joined = "/".join(streams)
     return f"{WS_STREAM_BASE}{joined}"
+
+
+def _parse_interval_td(interval: str) -> timedelta:
+    s = str(interval).strip().lower()
+    if s.endswith("m"):
+        return timedelta(minutes=int(s[:-1]))
+    if s.endswith("h"):
+        return timedelta(hours=int(s[:-1]))
+    if s.endswith("d"):
+        return timedelta(days=int(s[:-1]))
+    return timedelta(hours=1)
+
+
+def _estimate_pages_for_seed(*, interval: str, seed_days: int, limit: int) -> int:
+    """
+    Автоматически считаем сколько страниц нужно,
+    чтобы покрыть seed_days полностью (без дыр).
+    """
+    limit = max(50, min(int(limit), 1500))
+    dt = _parse_interval_td(interval)
+    if dt.total_seconds() <= 0:
+        return 2
+
+    candles_needed = int((seed_days * 86400) // dt.total_seconds()) + 5
+    pages = int((candles_needed + (limit - 1)) // limit)
+
+    # небольшой запас чтобы точно не обрезать край
+    pages = pages + 2
+
+    # safety cap, чтобы случайно не уйти в бесконечность
+    return max(2, min(pages, 250))
+
 
 # -------------------------
 # REST seed (klines)
@@ -84,8 +117,7 @@ def _rest_klines_call(
     limit: int,
 ) -> List[list]:
     """
-    Вызываем REST klines через разные имена методов (на случай отличий в rest.py).
-    Ожидаем Binance /fapi/v1/klines формат: list of lists.
+    Вызываем REST klines через разные имена методов.
     """
     limit = max(1, min(int(limit), 1500))
 
@@ -101,7 +133,7 @@ def _rest_klines_call(
     if callable(fn):
         return fn(symbol=symbol, interval=interval, start_time_ms=start_ms, end_time_ms=end_ms, limit=limit) or []
 
-    raise RuntimeError("REST klines method not found on rest client (expected klines/get_klines/fapi_klines)")
+    raise RuntimeError("REST klines method not found (expected klines/get_klines/fapi_klines)")
 
 
 def _parse_rest_kline_rows(
@@ -178,11 +210,6 @@ def _parse_klines_payload(
     payload: list,
     source: str = "gap_repair",
 ) -> list[dict]:
-    """
-    Совместимость со старым GapRepair:
-      - он импортирует _parse_klines_payload из collector_candles.py
-      - и передаёт source="gap_repair"
-    """
     return _parse_rest_kline_rows(
         exchange_id=int(exchange_id),
         symbol_id=int(symbol_id),
@@ -199,10 +226,6 @@ def _load_last_candle_time_from_db(
     symbol_id: int,
     interval: str,
 ) -> Optional[datetime]:
-    """
-    Watermark из БД: MAX(open_time) по (exchange_id, symbol_id, interval)
-    Используем только для seed.
-    """
     pool = getattr(storage, "pool", None)
     if pool is None:
         return None
@@ -236,21 +259,21 @@ def _seed_symbol_interval_forward(
     limit: int,
     max_pages: int,
     per_request_sleep_sec: float,
+    overlap_minutes: int,
     stop_event: threading.Event,
+    source: str,
 ) -> int:
     """
     SEED "вперёд" (pagination-safe), чтобы не было дыр:
-      - определяем start_dt (либо now-seed_days, либо last_open_time-overlap)
-      - делаем запрос [start_dt..now], limit
+      - start_dt = max(now-seed_days, last_dt-overlap)
+      - fetch [start_dt now] pages
       - upsert
-      - двигаем start_dt = max_open_time + 1ms
-      - если пришло < limit -> конец
-      - ограничиваемся max_pages
+      - move start_dt = best_open_time + 1ms
     """
     seed_days = max(1, int(seed_days))
     limit = max(50, min(int(limit), 1500))
-    max_pages = max(1, int(max_pages))
     per_request_sleep_sec = max(0.0, float(per_request_sleep_sec))
+    overlap_minutes = max(0, int(overlap_minutes))
 
     now = _utc_now()
     seed_from = now - timedelta(days=seed_days)
@@ -261,9 +284,9 @@ def _seed_symbol_interval_forward(
         symbol_id=symbol_id,
         interval=interval,
     )
+
     if last_dt is not None:
-        # небольшой overlap для восстановления края
-        start_dt = max(seed_from, last_dt - timedelta(minutes=30))
+        start_dt = max(seed_from, last_dt - timedelta(minutes=overlap_minutes))
     else:
         start_dt = seed_from
 
@@ -271,7 +294,11 @@ def _seed_symbol_interval_forward(
     total_upserts = 0
     last_progress: Optional[datetime] = None
 
-    for _ in range(max_pages):
+    # если max_pages <= 0 -> авто расчёт
+    if int(max_pages) <= 0:
+        max_pages = _estimate_pages_for_seed(interval=interval, seed_days=seed_days, limit=limit)
+
+    for _ in range(int(max_pages)):
         if stop_event.is_set():
             break
 
@@ -291,7 +318,7 @@ def _seed_symbol_interval_forward(
             symbol_id=symbol_id,
             interval=interval,
             payload=payload,
-            source="rest_seed",
+            source=source,
         )
         if not rows:
             break
@@ -340,6 +367,7 @@ class _WSKlineWorker(threading.Thread):
         *,
         name: str,
         storage: Any,
+        rest: Any,
         exchange_id: int,
         symbol_ids: Dict[str, int],
         interval: str,
@@ -348,10 +376,17 @@ class _WSKlineWorker(threading.Thread):
         update_open_candle: bool,
         flush_sec: float = 1.0,
         max_buffer: int = 2000,
+        # ✅ catch-up after reconnect
+        rest_catchup_on_connect: bool = True,
+        rest_catchup_overlap_minutes: int = 120,
+        rest_catchup_limit: int = 1500,
+        rest_catchup_max_pages: int = 2,
+        per_request_sleep_sec: float = 0.15,
     ) -> None:
         super().__init__(daemon=True, name=name)
 
         self.storage = storage
+        self.rest = rest
         self.exchange_id = int(exchange_id)
         self.symbol_ids = {str(k).upper(): int(v) for k, v in (symbol_ids or {}).items()}
 
@@ -362,6 +397,12 @@ class _WSKlineWorker(threading.Thread):
 
         self.flush_sec = max(0.2, float(flush_sec))
         self.max_buffer = max(100, int(max_buffer))
+
+        self.rest_catchup_on_connect = bool(rest_catchup_on_connect)
+        self.rest_catchup_overlap_minutes = int(rest_catchup_overlap_minutes)
+        self.rest_catchup_limit = int(rest_catchup_limit)
+        self.rest_catchup_max_pages = int(rest_catchup_max_pages)
+        self.per_request_sleep_sec = float(per_request_sleep_sec)
 
         self._buf: List[dict] = []
         self._last_flush = time.time()
@@ -406,8 +447,42 @@ class _WSKlineWorker(threading.Thread):
         if (time.time() - self._last_flush) >= self.flush_sec:
             self._flush()
 
+    def _catchup_rest_tail(self) -> None:
+        """
+        ✅ Критично: закрывает дырки, если WS выпадал.
+        Догружаем хвост по каждому символу (last_dt -> now)
+        """
+        if not self.rest_catchup_on_connect:
+            return
+
+        for sym in self.symbols:
+            if self.stop_event.is_set():
+                return
+
+            sid = self.symbol_ids.get(sym)
+            if not sid:
+                continue
+
+            try:
+                _seed_symbol_interval_forward(
+                    storage=self.storage,
+                    rest=self.rest,
+                    exchange_id=self.exchange_id,
+                    symbol=sym,
+                    symbol_id=sid,
+                    interval=self.interval,
+                    seed_days=2,  # хвост всегда маленький
+                    limit=self.rest_catchup_limit,
+                    max_pages=self.rest_catchup_max_pages,
+                    per_request_sleep_sec=self.per_request_sleep_sec,
+                    overlap_minutes=self.rest_catchup_overlap_minutes,
+                    stop_event=self.stop_event,
+                    source="rest_tail_catchup",
+                )
+            except Exception:
+                logger.exception("[CandlesWS][%s] REST tail catchup failed sym=%s itv=%s", self.name, sym, self.interval)
+
     def run(self) -> None:
-        import websocket  # websocket-client
 
         streams = _make_streams(self.symbols, self.interval)
         url = _combined_ws_url(streams)
@@ -434,6 +509,11 @@ class _WSKlineWorker(threading.Thread):
 
                 def on_open(_ws) -> None:
                     logger.info("[CandlesWS][%s] connected", self.name)
+                    try:
+                        # ✅ сразу закрываем потенциальные дырки "до подключения"
+                        self._catchup_rest_tail()
+                    except Exception:
+                        pass
 
                 def on_error(_ws, err) -> None:
                     logger.warning("[CandlesWS][%s] error: %s", self.name, err)
@@ -480,38 +560,39 @@ def start_candles_collector(
 
     # --- NEW seed+ws mode ---
     seed_on_start: bool = True,
-    seed_days: int = 2,
+
+    # ✅ ВАЖНО: теперь 30 дней по умолчанию
+    seed_days: int = 30,
+
     seed_limit: int = 1500,
-    seed_max_pages_per_symbol: int = 2,
-    seed_symbols_per_cycle: int = 5,
+
+    # ✅ если 0 => авто расчёт под интервал
+    seed_max_pages_per_symbol: int = 0,
+
+    seed_symbols_per_cycle: int = 4,
     per_request_sleep_sec: float = 0.20,
+    seed_overlap_minutes: int = 60,
 
     use_ws: bool = True,
     ws_max_streams_per_conn: int = 120,
     update_open_candle: bool = True,
 
-    stop_event: threading.Event | None = None,
+    # ✅ догрузка хвоста при каждом подключении WS (закрывает дырки)
+    rest_catchup_on_connect: bool = True,
+    rest_catchup_overlap_minutes: int = 120,
+    rest_catchup_limit: int = 1500,
+    rest_catchup_max_pages: int = 2,
 
-    # --- OLD params (backward compat) ---
-    poll_sec: float = 30.0,
-    symbols_per_cycle: int = 40,
-    seed_chunk_limit: int = 1500,
-    loop_limit: int = 0,
-    overlap_points: int = 1,
-    lookback_days_if_empty: int = 2,
-    refresh_symbols_sec: int = 300,
+    stop_event: threading.Event | None = None,
 
     # allow extra kwargs from config
     **_kwargs,
 ) -> List[threading.Thread]:
     """
-    Режим под твой кейс (много символов):
-      1) SEED (REST): на старте догружаем историю батчами.
-      2) LIVE (WS): дальше свечи пополняются по kline websocket.
-
-    ВАЖНО:
-      - Старые параметры оставлены для совместимости, но в новом режиме почти не нужны.
-      - stop_event обязателен: если None — создадим локальный (но лучше передавать из run_market_data).
+    Новый правильный режим:
+      1) SEED REST: 30 дней истории (полностью закрывает дырки)
+      2) LIVE WS: подписка на kline streams
+      3) REST tail catchup on reconnect: чинит дырки при падениях WS
     """
     if stop_event is None:
         stop_event = threading.Event()
@@ -529,45 +610,38 @@ def start_candles_collector(
         logger.warning("[Candles] no symbols -> nothing to start")
         return []
 
-    # "backward" compat fallback:
-    # - если в коде/конфиге не передали новые seed_* поля,
-    #   можно использовать старые seed_chunk_limit/loop_limit как суррогаты.
-    # (но мы предпочитаем новые параметры)
-    if not seed_max_pages_per_symbol or int(seed_max_pages_per_symbol) <= 0:
-        seed_max_pages_per_symbol = max(1, int(loop_limit or 2))
-    if not seed_symbols_per_cycle or int(seed_symbols_per_cycle) <= 0:
-        # старый seed_chunk_limit у тебя раньше означал "батч символов"
-        seed_symbols_per_cycle = max(1, int(seed_chunk_limit or 5))
-
     # -------------------------
-    # SEED: REST history
+    # SEED: REST 30 days
     # -------------------------
     if bool(seed_on_start) and int(seed_days) > 0:
         batch_size = max(1, int(seed_symbols_per_cycle))
-        max_pages = max(1, int(seed_max_pages_per_symbol))
         limit = max(50, min(int(seed_limit), 1500))
         sleep_s = max(0.0, float(per_request_sleep_sec))
 
         logger.info(
-            "[CandlesSeed] start seed_days=%d intervals=%s symbols=%d rest_limit=%d max_pages_per_symbol=%d batch=%d sleep=%.2fs",
+            "[CandlesSeed] start seed_days=%d intervals=%s symbols=%d rest_limit=%d batch=%d sleep=%.2fs pages=auto(%s)",
             int(seed_days),
             ",".join(intervals),
             len(symbols),
             int(limit),
-            int(max_pages),
             int(batch_size),
             float(sleep_s),
+            "ON" if int(seed_max_pages_per_symbol) <= 0 else str(seed_max_pages_per_symbol),
         )
 
         for itv in intervals:
             if stop_event.is_set():
                 break
 
+            max_pages = int(seed_max_pages_per_symbol)
+            if max_pages <= 0:
+                max_pages = _estimate_pages_for_seed(interval=itv, seed_days=int(seed_days), limit=int(limit))
+
             for i in range(0, len(pairs), batch_size):
                 if stop_event.is_set():
                     break
 
-                batch = pairs[i : i + batch_size]
+                batch = pairs[i: i + batch_size]
                 up_total = 0
 
                 for sym, sid in batch:
@@ -585,7 +659,9 @@ def start_candles_collector(
                             limit=int(limit),
                             max_pages=int(max_pages),
                             per_request_sleep_sec=float(sleep_s),
+                            overlap_minutes=int(seed_overlap_minutes),
                             stop_event=stop_event,
+                            source="rest_seed_30d",
                         )
                         up_total += int(n or 0)
                     except Exception:
@@ -597,7 +673,7 @@ def start_candles_collector(
     # LIVE: websocket klines
     # -------------------------
     if not bool(use_ws):
-        logger.warning("[Candles] use_ws=false -> LIVE WS disabled; with many symbols REST live polling will hit 429. Enable use_ws.")
+        logger.warning("[Candles] use_ws=false -> LIVE WS disabled")
         return []
 
     max_streams = max(20, int(ws_max_streams_per_conn))
@@ -609,6 +685,7 @@ def start_candles_collector(
             t = _WSKlineWorker(
                 name=f"BinanceCandlesWS-{itv}-{idx + 1}",
                 storage=storage,
+                rest=rest,
                 exchange_id=int(exchange_id),
                 symbol_ids=dict(symbol_ids or {}),
                 interval=str(itv),
@@ -617,6 +694,11 @@ def start_candles_collector(
                 update_open_candle=bool(update_open_candle),
                 flush_sec=1.0,
                 max_buffer=2000,
+                rest_catchup_on_connect=bool(rest_catchup_on_connect),
+                rest_catchup_overlap_minutes=int(rest_catchup_overlap_minutes),
+                rest_catchup_limit=int(rest_catchup_limit),
+                rest_catchup_max_pages=int(rest_catchup_max_pages),
+                per_request_sleep_sec=float(per_request_sleep_sec),
             )
             t.start()
             threads.append(t)

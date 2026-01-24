@@ -114,6 +114,51 @@ def _prioritize_symbols(
     return pri + other
 
 
+def _align_dt_to_interval_floor(dt: datetime, itv: str) -> datetime:
+    """
+    Выравниваем время к границе интервала (по epoch).
+    Это делает REST pagination стабильнее и исключает "кривые" start_time.
+    """
+    td = _itv_to_timedelta(itv)
+    sec = int(td.total_seconds())
+    if sec <= 0:
+        return dt
+
+    ts = int(dt.timestamp())
+    floored = (ts // sec) * sec
+    return datetime.fromtimestamp(floored, tz=timezone.utc)
+
+
+def _rest_klines_call_safe(
+    rest: Any,
+    *,
+    symbol: str,
+    interval: str,
+    start_ms: int,
+    end_ms: int,
+    limit: int,
+) -> List[list]:
+
+    """
+    Универсальный REST klines call, чтобы gap_repair работал с любым rest.py.
+    """
+    limit = max(1, min(int(limit), 1500))
+
+    fn = getattr(rest, "klines", None)
+    if callable(fn):
+        return fn(symbol=symbol, interval=interval, start_time_ms=start_ms, end_time_ms=end_ms, limit=limit) or []
+
+    fn = getattr(rest, "fapi_klines", None)
+    if callable(fn):
+        return fn(symbol=symbol, interval=interval, start_time_ms=start_ms, end_time_ms=end_ms, limit=limit) or []
+
+    fn = getattr(rest, "get_klines", None)
+    if callable(fn):
+        return fn(symbol=symbol, interval=interval, start_time_ms=start_ms, end_time_ms=end_ms, limit=limit) or []
+
+    raise RuntimeError("REST klines method not found (expected klines/get_klines/fapi_klines)")
+
+
 # =========================
 # Gap scan
 # =========================
@@ -133,7 +178,7 @@ def _find_gaps(
 
     Возвращаем:
       from_ts = prev + interval
-      to_ts   = open_time  (первая существующая свеча после дыры)
+      to_ts   = open_time (первая существующая свеча после дыры)
 
     Фильтры:
       - max_gap_days: если >0, берём только дыры, где to_ts не старше (NOW() - max_gap_days).
@@ -145,7 +190,7 @@ def _find_gaps(
     min_gap_points = max(1, int(min_gap_points))
     max_gap_days = max(0, int(max_gap_days))
 
-    mult = int(min_gap_points) + 1  # gap >= (min_gap_points+1)*interval
+    mult = int(min_gap_points) + 1
 
     sql = """
     WITH t AS (
@@ -240,10 +285,12 @@ def _backfill_range(
         if dt_from < span_limit:
             dt_from = span_limit
 
-    total = 0
-    cur = dt_from
+    # ✅ выравниваем старт по границе интервала
+    cur = _align_dt_to_interval_floor(dt_from, interval)
 
-    # endTime inclusive -> делаем dt_to-1ms
+    total = 0
+
+    # endTime inclusive -> dt_to-1ms
     dt_to_exclusive = dt_to - timedelta(milliseconds=1)
     end_ms = _to_ms(dt_to_exclusive)
 
@@ -256,21 +303,21 @@ def _backfill_range(
             log.warning("[GapRepair] safety break (too many iters) %s %s", symbol, interval)
             break
 
-        payload = rest.klines(
+        payload = _rest_klines_call_safe(
+            rest,
             symbol=symbol,
             interval=interval,
-            start_time_ms=_to_ms(cur),
-            end_time_ms=end_ms,
+            start_ms=_to_ms(cur),
+            end_ms=end_ms,
             limit=limit,
         )
 
-        # ВАЖНО: _parse_klines_payload НЕ принимает source=... (backward compat),
-        # поэтому source проставляем вручную ниже.
         rows = _parse_klines_payload(
             exchange_id=int(exchange_id),
             symbol_id=int(symbol_id),
             interval=str(interval),
             payload=payload,
+            source="gap_repair",
         )
 
         if not rows:
@@ -314,7 +361,6 @@ def _backfill_range(
         if stop_event.wait(sleep_sec):
             break
 
-        # маленький guard, чтобы не упереться в dt_to
         if cur > dt_to - itv_td:
             break
 
@@ -354,11 +400,10 @@ def run_candles_gap_repair(
 
     priority_symbols = _norm_symbols_list(gcfg.get("priority_symbols"))
 
-    max_gap_days = int(gcfg.get("max_gap_days", 0) or 0)
+    max_gap_days = int(gcfg.get("max_gap_days", 30) or 30)  # ✅ лучше по умолчанию 30
     max_backfill_span_days = int(gcfg.get("max_backfill_span_days", 0) or 0)
     min_gap_points = int(gcfg.get("min_gap_points", 1) or 1)
 
-    # priority: 0=агрессивно, 1=норм, 2=медленно
     prio_mode = int(gcfg.get("priority", 1) or 1)
     prio_mode = max(0, min(2, prio_mode))
 
@@ -448,13 +493,6 @@ def run_candles_gap_repair(
                 for dt_from, dt_to in gaps:
                     if gaps_fixed >= max_gaps_per_cycle or stop_event.is_set():
                         break
-
-                    try:
-                        itv_td = _itv_to_timedelta(itv)
-                        if dt_to <= dt_from + itv_td:
-                            continue
-                    except Exception:
-                        pass
 
                     log.info("[GapRepair] gap %s %s %s -> %s", symbol, itv, dt_from.isoformat(), dt_to.isoformat())
                     try:

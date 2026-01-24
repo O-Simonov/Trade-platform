@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -19,10 +19,6 @@ def _utc(dt: Any) -> datetime:
             return dt.replace(tzinfo=timezone.utc)
         return dt.astimezone(timezone.utc)
     raise TypeError(f"Expected datetime, got {type(dt)}")
-
-
-def _utc_now() -> datetime:
-    return datetime.now(timezone.utc)
 
 
 def _to_float(x: Any, default: float = 0.0) -> float:
@@ -51,32 +47,32 @@ def _parse_interval(interval: str) -> timedelta:
 
 @dataclass
 class ScrParams:
-    # price filter
-    min_price: float = 0.000001
-    max_price: float = 10.0
+    min_price: float = 0.00000001
+    max_price: float = 100000.0
 
-    # main interval
     interval: str = "1h"
 
-    # liquidation per candle (USDT)
-    volume_liquid_limit: float = 20_000.0
+    volume_liquid_limit: float = 5_000.0
 
-    # levels & volume spike
     period_levels: int = 60
     windows: int = 20
-    kof_Volume: float = 20.0
+    kof_Volume: float = 10.0
 
-    # confirmations
     # kof_fund трактуем как % (0.5 = 0.5% = 0.005)
     kof_fund: float = 0.5
     enable_funding: bool = True
     enable_oi: bool = True
     enable_cvd: bool = True
 
-    # level touch tolerance (%)
-    level_tol_pct: float = 0.0015  # 0.15%
+    level_tol_pct: float = 0.01
 
-    # debug
+    pivot_left: int = 2
+    pivot_right: int = 2
+    level_cluster_tol_pct: float = 0.003
+    max_level_candidates: int = 14
+
+    confirm_lookforward: int = 5
+
     debug: bool = False
     debug_top: int = 20
 
@@ -87,7 +83,7 @@ class ScreenerSignal:
     symbol: str
     timeframe: str
     signal_ts: datetime
-    side: str  # "Buy" / "Sell"
+    side: str  # "BUY" / "SELL"
 
     entry_price: float
     exit_price: Optional[float] = None
@@ -97,7 +93,7 @@ class ScreenerSignal:
     confidence: float = 0.0
     score: float = 0.0
     reason: str = ""
-    context: Dict[str, Any] = None
+    context: Dict[str, Any] = field(default_factory=dict)
 
 
 # -------------------------
@@ -108,15 +104,25 @@ class ScrLiquidationBinance:
     """
     scr_liquidation_binance
 
-    Логика (за 1 свечу):
-      - строим уровни UP/DOWN по history (period_levels)
-      - текущая свеча касается уровня
-      - ликвидации за эту свечу >= лимита
-      - объем свечи >= kof_Volume * avg(volume over windows)
-      - подтверждение на 1 свечу (prev -> cur):
-          * OI падает
-          * CVD падает (для SHORT) / растет (для LONG)
-          * funding: + для SHORT, - для LONG (порог в %)
+    SELL (SHORT):
+      - touch UP
+      - short_liq >= limit
+      - vol spike >= kof_Volume * avg_vol
+      - в одной из след. N свечей:
+          цена падает (close < anchor_close)
+          OI падает (oi_confirm < oi_anchor) [если enable_oi]
+          CVD падает (cvd_confirm < cvd_anchor) [если enable_cvd]
+          funding положительный и >= threshold [если enable_funding]
+
+    BUY (LONG):
+      - touch DOWN
+      - long_liq >= limit
+      - vol spike >= kof_Volume * avg_vol
+      - в одной из след. N свечей:
+          цена растет (close > anchor_close)
+          OI падает (oi_confirm < oi_anchor) [если enable_oi]
+          CVD растет (cvd_confirm > cvd_anchor) [если enable_cvd]
+          funding отрицательный и <= -threshold [если enable_funding]
     """
 
     def run(
@@ -138,95 +144,86 @@ class ScrLiquidationBinance:
         out: List[ScreenerSignal] = []
         debug_rows: List[Dict[str, Any]] = []
 
+        need = max(260, p.period_levels + p.windows + p.confirm_lookforward + 40)
+
         for sym in symbols:
             symbol_id = int(sym["symbol_id"])
             symbol = str(sym["symbol"])
 
-            # --- last close (price filter) ---
             last_close = self._fetch_last_close(storage, exchange_id, symbol_id, p.interval)
             if last_close is None:
                 continue
-
             if not (p.min_price <= last_close <= p.max_price):
                 continue
 
-            # --- candles ---
-            need = max(220, p.period_levels + p.windows + 20)
             candles = self._fetch_last_candles(storage, exchange_id, symbol_id, p.interval, limit=need)
-            if len(candles) < max(p.period_levels + 5, p.windows + 5):
+            if len(candles) < max(p.period_levels + p.windows + p.confirm_lookforward + 10, 120):
                 continue
 
-            cur_c = candles[-1]
-            prev_c = candles[-2]
+            lf = max(0, int(p.confirm_lookforward))
+            anchor_idx = len(candles) - 1 - lf
+            if anchor_idx <= 10 or anchor_idx >= len(candles):
+                continue
 
-            cur_ts = _utc(cur_c["ts"])
-            prev_ts = _utc(prev_c["ts"])
+            anchor = candles[anchor_idx]
+            anchor_ts = _utc(anchor["ts"])
+            anchor_close = _to_float(anchor["close"])
+            anchor_high = _to_float(anchor["high"])
+            anchor_low = _to_float(anchor["low"])
 
-            cur_close = _to_float(cur_c["close"])
-            cur_high = _to_float(cur_c["high"])
-            cur_low = _to_float(cur_c["low"])
+            confirm_window = candles[anchor_idx + 1: anchor_idx + 1 + lf] if lf > 0 else []
 
-            # --- levels from history (exclude current candle) ---
-            lvl_slice = candles[-(p.period_levels + 1):-1]
-            up_level = max(_to_float(c["high"]) for c in lvl_slice)
-            down_level = min(_to_float(c["low"]) for c in lvl_slice)
+            lvl_hist = candles[max(0, anchor_idx - (p.period_levels + 20)): anchor_idx]
+            up_level, down_level, lvl_meta = self._build_levels(
+                candles=lvl_hist,
+                ref_price=anchor_close,
+                p=p,
+            )
+            if up_level <= 0 or down_level <= 0:
+                continue
 
-            # --- volume spike ---
-            vol_cur = _to_float(cur_c.get("quote_volume") or cur_c.get("volume"))
-            avg_vol = self._avg_volume(candles=candles, windows=p.windows)
+            vol_anchor = _to_float(anchor.get("quote_volume") or anchor.get("volume"))
+            avg_vol = self._avg_volume_before(candles=candles, idx=anchor_idx, windows=p.windows)
             if avg_vol <= 0:
                 continue
+            vol_ratio = vol_anchor / avg_vol
 
-            vol_ratio = vol_cur / avg_vol
-
-            # --- liquidations for candle (USDT) ---
             liq_long_usdt, liq_short_usdt = self._fetch_liquidations_for_candle(
                 storage=storage,
                 exchange_id=exchange_id,
                 symbol_id=symbol_id,
-                candle_open_ts=cur_ts,
+                candle_open_ts=anchor_ts,
                 interval=p.interval,
             )
 
-            # --- touch logic ---
-            touch_up = self._touch_up(high=cur_high, level=up_level, tol_pct=p.level_tol_pct)
-            touch_down = self._touch_down(low=cur_low, level=down_level, tol_pct=p.level_tol_pct)
+            touch_up = self._touch_up(high=anchor_high, level=up_level, tol_pct=p.level_tol_pct)
+            touch_down = self._touch_down(low=anchor_low, level=down_level, tol_pct=p.level_tol_pct)
 
-            # --- confirmations (prev -> cur) ---
-            oi_prev = oi_cur = None
-            cvd_prev = cvd_cur = None
-            fund_cur = None
-
+            oi_anchor = cvd_anchor = fund_anchor = None
             if p.enable_oi:
-                oi_prev = self._fetch_oi_at(storage, exchange_id, symbol_id, p.interval, prev_ts)
-                oi_cur = self._fetch_oi_at(storage, exchange_id, symbol_id, p.interval, cur_ts)
-
+                oi_anchor = self._fetch_oi_at(storage, exchange_id, symbol_id, p.interval, anchor_ts)
             if p.enable_cvd:
-                # cvd_quote stored in candles
-                cvd_prev = self._fetch_cvd_at(storage, exchange_id, symbol_id, p.interval, prev_ts)
-                cvd_cur = self._fetch_cvd_at(storage, exchange_id, symbol_id, p.interval, cur_ts)
-
+                cvd_anchor = self._fetch_cvd_at(storage, exchange_id, symbol_id, p.interval, anchor_ts)
             if p.enable_funding:
-                fund_cur = self._fetch_funding_at(storage, exchange_id, symbol_id, cur_ts)
+                fund_anchor = self._fetch_funding_at(storage, exchange_id, symbol_id, anchor_ts)
 
-            # --- debug accumulate ---
             if p.debug:
                 debug_rows.append(
                     {
                         "symbol": symbol,
                         "close": float(last_close),
+                        "up": float(up_level),
+                        "down": float(down_level),
+                        "touch_up": bool(touch_up),
+                        "touch_down": bool(touch_down),
                         "liq_short": float(liq_short_usdt),
                         "liq_long": float(liq_long_usdt),
                         "vol_ratio": float(vol_ratio),
-                        "touch_up": bool(touch_up),
-                        "touch_down": bool(touch_down),
-                        "up": float(up_level),
-                        "down": float(down_level),
-                        "oi_prev": _to_float(oi_prev) if oi_prev is not None else None,
-                        "oi_cur": _to_float(oi_cur) if oi_cur is not None else None,
-                        "cvd_prev": _to_float(cvd_prev) if cvd_prev is not None else None,
-                        "cvd_cur": _to_float(cvd_cur) if cvd_cur is not None else None,
-                        "fund": _to_float(fund_cur) if fund_cur is not None else None,
+                        "oi_anchor": _to_float(oi_anchor) if oi_anchor is not None else None,
+                        "cvd_anchor": _to_float(cvd_anchor) if cvd_anchor is not None else None,
+                        "fund_anchor": _to_float(fund_anchor) if fund_anchor is not None else None,
+                        "lvl_strength_up": lvl_meta.get("up_strength"),
+                        "lvl_strength_down": lvl_meta.get("down_strength"),
                     }
                 )
 
@@ -234,37 +231,54 @@ class ScrLiquidationBinance:
             # SELL (SHORT)
             # =========================================================
             if touch_up and (liq_short_usdt >= p.volume_liquid_limit) and (vol_ratio >= p.kof_Volume):
-                if self._confirm_short(p, oi_prev, oi_cur, cvd_prev, cvd_cur, fund_cur):
-                    entry = cur_close
-                    sl = up_level * (1.0 + 0.003)  # +0.3%
-                    tp = entry - (sl - entry) * 2.0 if entry < sl else None
+                hit = self._find_confirmation_short(
+                    storage=storage,
+                    exchange_id=exchange_id,
+                    symbol_id=symbol_id,
+                    interval=p.interval,
+                    p=p,
+                    anchor_ts=anchor_ts,
+                    anchor_close=anchor_close,
+                    oi_anchor=oi_anchor,
+                    cvd_anchor=cvd_anchor,
+                    confirm_window=confirm_window,
+                )
+
+                if hit is not None:
+                    confirm_ts, entry_price, oi_c, cvd_c, fund_c, why = hit
+
+                    sl = up_level * (1.0 + 0.003)
+                    tp = entry_price - (sl - entry_price) * 2.0 if entry_price < sl else None
 
                     out.append(
                         ScreenerSignal(
                             symbol_id=symbol_id,
                             symbol=symbol,
                             timeframe=p.interval,
-                            signal_ts=cur_ts,
-                            side="Sell",
-                            entry_price=float(entry),
+                            signal_ts=confirm_ts,
+                            side="SELL",
+                            entry_price=float(entry_price),
                             stop_loss=float(sl),
                             take_profit=float(tp) if tp else None,
-                            confidence=0.80,
-                            score=min(100.0, 40.0 + (liq_short_usdt / p.volume_liquid_limit) * 20.0 + vol_ratio),
-                            reason="UP touch + short_liq + vol spike + confirm(OI↓/CVD↓/fund+)",
+                            confidence=0.82,
+                            score=min(100.0, 40.0 + (liq_short_usdt / p.volume_liquid_limit) * 25.0 + vol_ratio),
+                            reason=why,
                             context={
+                                "touch_ts": anchor_ts,
+                                "confirm_ts": confirm_ts,
                                 "up_level": float(up_level),
                                 "down_level": float(down_level),
                                 "liq_short_usdt": float(liq_short_usdt),
                                 "liq_long_usdt": float(liq_long_usdt),
                                 "vol_ratio": float(vol_ratio),
                                 "avg_vol": float(avg_vol),
-                                "volume": float(vol_cur),
-                                "oi_prev": _to_float(oi_prev) if oi_prev is not None else None,
-                                "oi_cur": _to_float(oi_cur) if oi_cur is not None else None,
-                                "cvd_prev": _to_float(cvd_prev) if cvd_prev is not None else None,
-                                "cvd_cur": _to_float(cvd_cur) if cvd_cur is not None else None,
-                                "funding": _to_float(fund_cur) if fund_cur is not None else None,
+                                "volume": float(vol_anchor),
+                                "oi_anchor": _to_float(oi_anchor) if oi_anchor is not None else None,
+                                "oi_confirm": _to_float(oi_c) if oi_c is not None else None,
+                                "cvd_anchor": _to_float(cvd_anchor) if cvd_anchor is not None else None,
+                                "cvd_confirm": _to_float(cvd_c) if cvd_c is not None else None,
+                                "funding_confirm": _to_float(fund_c) if fund_c is not None else None,
+                                "levels_meta": lvl_meta,
                             },
                         )
                     )
@@ -273,81 +287,79 @@ class ScrLiquidationBinance:
             # BUY (LONG)
             # =========================================================
             if touch_down and (liq_long_usdt >= p.volume_liquid_limit) and (vol_ratio >= p.kof_Volume):
-                if self._confirm_long(p, oi_prev, oi_cur, cvd_prev, cvd_cur, fund_cur):
-                    entry = cur_close
-                    sl = down_level * (1.0 - 0.003)  # -0.3%
-                    tp = entry + (entry - sl) * 2.0 if entry > sl else None
+                hit = self._find_confirmation_long(
+                    storage=storage,
+                    exchange_id=exchange_id,
+                    symbol_id=symbol_id,
+                    interval=p.interval,
+                    p=p,
+                    anchor_ts=anchor_ts,
+                    anchor_close=anchor_close,
+                    oi_anchor=oi_anchor,
+                    cvd_anchor=cvd_anchor,
+                    confirm_window=confirm_window,
+                )
+
+                if hit is not None:
+                    confirm_ts, entry_price, oi_c, cvd_c, fund_c, why = hit
+
+                    sl = down_level * (1.0 - 0.003)
+                    tp = entry_price + (entry_price - sl) * 2.0 if entry_price > sl else None
 
                     out.append(
                         ScreenerSignal(
                             symbol_id=symbol_id,
                             symbol=symbol,
                             timeframe=p.interval,
-                            signal_ts=cur_ts,
-                            side="Buy",
-                            entry_price=float(entry),
+                            signal_ts=confirm_ts,
+                            side="BUY",
+                            entry_price=float(entry_price),
                             stop_loss=float(sl),
                             take_profit=float(tp) if tp else None,
-                            confidence=0.80,
-                            score=min(100.0, 40.0 + (liq_long_usdt / p.volume_liquid_limit) * 20.0 + vol_ratio),
-                            reason="DOWN touch + long_liq + vol spike + confirm(OI↓/CVD↑/fund-)",
+                            confidence=0.82,
+                            score=min(100.0, 40.0 + (liq_long_usdt / p.volume_liquid_limit) * 25.0 + vol_ratio),
+                            reason=why,
                             context={
+                                "touch_ts": anchor_ts,
+                                "confirm_ts": confirm_ts,
                                 "up_level": float(up_level),
                                 "down_level": float(down_level),
                                 "liq_short_usdt": float(liq_short_usdt),
                                 "liq_long_usdt": float(liq_long_usdt),
                                 "vol_ratio": float(vol_ratio),
                                 "avg_vol": float(avg_vol),
-                                "volume": float(vol_cur),
-                                "oi_prev": _to_float(oi_prev) if oi_prev is not None else None,
-                                "oi_cur": _to_float(oi_cur) if oi_cur is not None else None,
-                                "cvd_prev": _to_float(cvd_prev) if cvd_prev is not None else None,
-                                "cvd_cur": _to_float(cvd_cur) if cvd_cur is not None else None,
-                                "funding": _to_float(fund_cur) if fund_cur is not None else None,
+                                "volume": float(vol_anchor),
+                                "oi_anchor": _to_float(oi_anchor) if oi_anchor is not None else None,
+                                "oi_confirm": _to_float(oi_c) if oi_c is not None else None,
+                                "cvd_anchor": _to_float(cvd_anchor) if cvd_anchor is not None else None,
+                                "cvd_confirm": _to_float(cvd_c) if cvd_c is not None else None,
+                                "funding_confirm": _to_float(fund_c) if fund_c is not None else None,
+                                "levels_meta": lvl_meta,
                             },
                         )
                     )
 
-        # --- DEBUG OUTPUT ---
         if p.debug and debug_rows:
-            # top by total liquidation
             debug_rows.sort(key=lambda r: (r["liq_short"] + r["liq_long"]), reverse=True)
             log.info("=== DEBUG TOP %d BY (liq_short+liq_long) interval=%s ===", p.debug_top, p.interval)
             for r in debug_rows[: max(1, p.debug_top)]:
                 log.info(
-                    "%s close=%.6f liqS=%.0f liqL=%.0f volR=%.2f touchUP=%s touchDN=%s fund=%s",
-                    r["symbol"],
-                    r["close"],
-                    r["liq_short"],
-                    r["liq_long"],
-                    r["vol_ratio"],
-                    r["touch_up"],
-                    r["touch_down"],
-                    r["fund"],
-                )
-
-            # top by volume ratio
-            debug_rows.sort(key=lambda r: r["vol_ratio"], reverse=True)
-            log.info("=== DEBUG TOP %d BY VOL_RATIO interval=%s ===", p.debug_top, p.interval)
-            for r in debug_rows[: max(1, p.debug_top)]:
-                log.info(
-                    "%s volR=%.2f liqS=%.0f liqL=%.0f close=%.6f",
-                    r["symbol"],
-                    r["vol_ratio"],
-                    r["liq_short"],
-                    r["liq_long"],
-                    r["close"],
+                    "%s close=%.6f up=%.6f down=%.6f liqS=%.0f liqL=%.0f volR=%.2f touchUP=%s touchDN=%s fund=%s lvlU=%s lvlD=%s",
+                    r["symbol"], r["close"], r["up"], r["down"],
+                    r["liq_short"], r["liq_long"], r["vol_ratio"],
+                    r["touch_up"], r["touch_down"],
+                    r["fund_anchor"],
+                    r["lvl_strength_up"], r["lvl_strength_down"]
                 )
 
         return out
 
     # -------------------------
-    # params / confirms
+    # params
     # -------------------------
 
     def _parse_params(self, *, interval: str, params: Dict[str, Any]) -> ScrParams:
         p = ScrParams()
-
         p.interval = str(params.get("interval", interval))
 
         p.min_price = float(params.get("min_price", p.min_price))
@@ -367,90 +379,323 @@ class ScrLiquidationBinance:
 
         p.level_tol_pct = float(params.get("level_tol_pct", p.level_tol_pct))
 
+        p.pivot_left = int(params.get("pivot_left", p.pivot_left))
+        p.pivot_right = int(params.get("pivot_right", p.pivot_right))
+        p.level_cluster_tol_pct = float(params.get("level_cluster_tol_pct", p.level_cluster_tol_pct))
+        p.max_level_candidates = int(params.get("max_level_candidates", p.max_level_candidates))
+
+        p.confirm_lookforward = int(params.get("confirm_lookforward", p.confirm_lookforward))
+
         p.debug = bool(params.get("debug", False))
         p.debug_top = int(params.get("debug_top", 20))
-
         return p
 
     def _fund_threshold(self, p: ScrParams) -> float:
-        # kof_fund задаем в процентах: 0.5 => 0.5% => 0.005
         return abs(float(p.kof_fund)) / 100.0
 
-    def _confirm_short(
+    # -------------------------
+    # confirmation: next N candles
+    # -------------------------
+
+    def _find_confirmation_short(
         self,
+        *,
+        storage: Any,
+        exchange_id: int,
+        symbol_id: int,
+        interval: str,
         p: ScrParams,
-        oi_prev: Any,
-        oi_cur: Any,
-        cvd_prev: Any,
-        cvd_cur: Any,
-        fund_cur: Any,
-    ) -> bool:
-        # OI must drop
-        if p.enable_oi:
-            if oi_prev is None or oi_cur is None:
-                return False
-            if _to_float(oi_cur) >= _to_float(oi_prev):
-                return False
+        anchor_ts: datetime,
+        anchor_close: float,
+        oi_anchor: Any,
+        cvd_anchor: Any,
+        confirm_window: Sequence[Dict[str, Any]],
+    ) -> Optional[Tuple[datetime, float, Any, Any, Any, str]]:
+        if not confirm_window:
+            return None
 
-        # CVD must drop
-        if p.enable_cvd:
-            if cvd_prev is None or cvd_cur is None:
-                return False
-            if _to_float(cvd_cur) >= _to_float(cvd_prev):
-                return False
+        thr = self._fund_threshold(p)
 
-        # funding must be positive and above threshold
-        if p.enable_funding:
-            if fund_cur is None:
-                return False
-            thr = self._fund_threshold(p)
-            if _to_float(fund_cur) < thr:
-                return False
+        for c in confirm_window:
+            ts = _utc(c["ts"])
+            close = _to_float(c["close"])
 
-        return True
+            if close >= anchor_close:
+                continue
 
-    def _confirm_long(
+            oi_c = cvd_c = fund_c = None
+
+            if p.enable_oi:
+                oi_c = self._fetch_oi_at(storage, exchange_id, symbol_id, interval, ts)
+                if oi_anchor is None or oi_c is None:
+                    continue
+                if _to_float(oi_c) >= _to_float(oi_anchor):
+                    continue
+
+            if p.enable_cvd:
+                cvd_c = self._fetch_cvd_at(storage, exchange_id, symbol_id, interval, ts)
+                if cvd_anchor is None or cvd_c is None:
+                    continue
+                if _to_float(cvd_c) >= _to_float(cvd_anchor):
+                    continue
+
+            if p.enable_funding:
+                fund_c = self._fetch_funding_at(storage, exchange_id, symbol_id, ts)
+                if fund_c is None:
+                    continue
+                if _to_float(fund_c) < thr:
+                    continue
+
+            why = "CONFIRM SHORT: price↓ within next candles + OI↓/CVD↓ + funding+"
+            return ts, close, oi_c, cvd_c, fund_c, why
+
+        return None
+
+    def _find_confirmation_long(
         self,
+        *,
+        storage: Any,
+        exchange_id: int,
+        symbol_id: int,
+        interval: str,
         p: ScrParams,
-        oi_prev: Any,
-        oi_cur: Any,
-        cvd_prev: Any,
-        cvd_cur: Any,
-        fund_cur: Any,
-    ) -> bool:
-        # OI must drop
-        if p.enable_oi:
-            if oi_prev is None or oi_cur is None:
-                return False
-            if _to_float(oi_cur) >= _to_float(oi_prev):
-                return False
+        anchor_ts: datetime,
+        anchor_close: float,
+        oi_anchor: Any,
+        cvd_anchor: Any,
+        confirm_window: Sequence[Dict[str, Any]],
+    ) -> Optional[Tuple[datetime, float, Any, Any, Any, str]]:
+        if not confirm_window:
+            return None
 
-        # CVD must rise
-        if p.enable_cvd:
-            if cvd_prev is None or cvd_cur is None:
-                return False
-            if _to_float(cvd_cur) <= _to_float(cvd_prev):
-                return False
+        thr = self._fund_threshold(p)
 
-        # funding must be negative and below -threshold
-        if p.enable_funding:
-            if fund_cur is None:
-                return False
-            thr = self._fund_threshold(p)
-            if _to_float(fund_cur) > -thr:
-                return False
+        for c in confirm_window:
+            ts = _utc(c["ts"])
+            close = _to_float(c["close"])
 
-        return True
+            if close <= anchor_close:
+                continue
+
+            oi_c = cvd_c = fund_c = None
+
+            if p.enable_oi:
+                oi_c = self._fetch_oi_at(storage, exchange_id, symbol_id, interval, ts)
+                if oi_anchor is None or oi_c is None:
+                    continue
+                if _to_float(oi_c) >= _to_float(oi_anchor):
+                    continue
+
+            if p.enable_cvd:
+                cvd_c = self._fetch_cvd_at(storage, exchange_id, symbol_id, interval, ts)
+                if cvd_anchor is None or cvd_c is None:
+                    continue
+                if _to_float(cvd_c) <= _to_float(cvd_anchor):
+                    continue
+
+            if p.enable_funding:
+                fund_c = self._fetch_funding_at(storage, exchange_id, symbol_id, ts)
+                if fund_c is None:
+                    continue
+                if _to_float(fund_c) > -thr:
+                    continue
+
+            why = "CONFIRM LONG: price↑ within next candles + OI↓/CVD↑ + funding-"
+            return ts, close, oi_c, cvd_c, fund_c, why
+
+        return None
+
+    # -------------------------
+    # smarter levels: pivots + clustering
+    # -------------------------
+
+    def _build_levels(
+        self,
+        *,
+        candles: Sequence[Dict[str, Any]],
+        ref_price: float,
+        p: ScrParams,
+    ) -> Tuple[float, float, Dict[str, Any]]:
+        """
+        FIX: гарантируем корректную геометрию уровней:
+          DOWN <= ref_price <= UP
+        иначе fallback:
+          DOWN = min_low, UP = max_high
+        """
+        meta: Dict[str, Any] = {
+            "pivot_highs": 0,
+            "pivot_lows": 0,
+            "up_strength": 0,
+            "down_strength": 0,
+            "clusters_up": [],
+            "clusters_down": [],
+            "fallback": False,
+        }
+
+        highs_all = [_to_float(c.get("high")) for c in candles if c.get("high") is not None]
+        lows_all = [_to_float(c.get("low")) for c in candles if c.get("low") is not None]
+        max_high = max(highs_all) if highs_all else 0.0
+        min_low = min(lows_all) if lows_all else 0.0
+
+        if len(candles) < max(20, p.pivot_left + p.pivot_right + 5):
+            meta["fallback"] = True
+            return (max_high, min_low, meta)
+
+        piv_h, piv_l = self._find_pivots(candles=candles, left=p.pivot_left, right=p.pivot_right)
+        meta["pivot_highs"] = len(piv_h)
+        meta["pivot_lows"] = len(piv_l)
+
+        if len(piv_h) < 2 or len(piv_l) < 2:
+            meta["fallback"] = True
+            return (max_high, min_low, meta)
+
+        cl_up = self._cluster_levels(piv_h, tol_pct=p.level_cluster_tol_pct, max_candidates=p.max_level_candidates)
+        cl_dn = self._cluster_levels(piv_l, tol_pct=p.level_cluster_tol_pct, max_candidates=p.max_level_candidates)
+
+        meta["clusters_up"] = cl_up
+        meta["clusters_down"] = cl_dn
+
+        up = self._pick_level_above(ref_price, cl_up)
+        down = self._pick_level_below(ref_price, cl_dn)
+
+        # --- FIX: если не найден нормальный уровень, берём реальные экстремумы ---
+        if up <= 0.0:
+            up = max_high
+        if down <= 0.0:
+            down = min_low
+
+        # --- FIX: если уровни оказались "по неправильную сторону" цены ---
+        # Например ref_price ниже всех pivot low -> down получится выше цены -> это ломает логику BUY.
+        ref = float(ref_price)
+        if down > ref:
+            down = min_low
+            meta["fallback"] = True
+            meta["fallback_down"] = "min_low"
+        if up < ref:
+            up = max_high
+            meta["fallback"] = True
+            meta["fallback_up"] = "max_high"
+
+        # если вдруг всё ещё криво
+        if up <= 0 or down <= 0 or up <= down:
+            meta["fallback"] = True
+            return (max_high, min_low, meta)
+
+        meta["up_strength"] = self._cluster_strength(up, cl_up)
+        meta["down_strength"] = self._cluster_strength(down, cl_dn)
+
+        return float(up), float(down), meta
+
+    def _find_pivots(
+        self,
+        *,
+        candles: Sequence[Dict[str, Any]],
+        left: int,
+        right: int,
+    ) -> Tuple[List[float], List[float]]:
+        highs = [_to_float(c.get("high")) for c in candles]
+        lows = [_to_float(c.get("low")) for c in candles]
+
+        n = len(candles)
+        L = max(1, int(left))
+        R = max(1, int(right))
+
+        piv_h: List[float] = []
+        piv_l: List[float] = []
+
+        for i in range(L, n - R):
+            h = highs[i]
+            l = lows[i]
+
+            left_h = highs[i - L:i]
+            right_h = highs[i + 1:i + 1 + R]
+
+            left_l = lows[i - L:i]
+            right_l = lows[i + 1:i + 1 + R]
+
+            if h > max(left_h) and h > max(right_h):
+                piv_h.append(h)
+
+            if l < min(left_l) and l < min(right_l):
+                piv_l.append(l)
+
+        return piv_h, piv_l
+
+    def _cluster_levels(
+        self,
+        values: Sequence[float],
+        *,
+        tol_pct: float,
+        max_candidates: int,
+    ) -> List[Tuple[float, int]]:
+        vals = [float(v) for v in values if v and v > 0]
+        if not vals:
+            return []
+
+        vals.sort()
+        tol_pct = abs(float(tol_pct))
+
+        clusters: List[List[float]] = []
+        cur: List[float] = [vals[0]]
+
+        for v in vals[1:]:
+            base = cur[-1]
+            tol = base * tol_pct
+            if abs(v - base) <= tol:
+                cur.append(v)
+            else:
+                clusters.append(cur)
+                cur = [v]
+
+        clusters.append(cur)
+
+        out: List[Tuple[float, int]] = []
+        for c in clusters:
+            price = sum(c) / float(len(c))
+            out.append((float(price), int(len(c))))
+
+        out.sort(key=lambda x: x[1], reverse=True)
+
+        if max_candidates and len(out) > int(max_candidates):
+            out = out[: int(max_candidates)]
+
+        out.sort(key=lambda x: x[0])
+        return out
+
+    def _pick_level_above(self, ref_price: float, clusters: Sequence[Tuple[float, int]]) -> float:
+        ref = float(ref_price)
+        above = [(price, cnt) for (price, cnt) in clusters if price >= ref]
+        if not above:
+            return 0.0
+        above.sort(key=lambda x: (x[0] - ref, -x[1]))
+        return float(above[0][0])
+
+    def _pick_level_below(self, ref_price: float, clusters: Sequence[Tuple[float, int]]) -> float:
+        ref = float(ref_price)
+        below = [(price, cnt) for (price, cnt) in clusters if price <= ref]
+        if not below:
+            return 0.0
+        below.sort(key=lambda x: (ref - x[0], -x[1]))
+        return float(below[0][0])
+
+    def _cluster_strength(self, level: float, clusters: Sequence[Tuple[float, int]]) -> int:
+        for (price, cnt) in clusters:
+            if abs(price - level) <= max(1e-12, level * 1e-6):
+                return int(cnt)
+        return 0
 
     # -------------------------
     # math helpers
     # -------------------------
 
-    def _avg_volume(self, *, candles: Sequence[Dict[str, Any]], windows: int) -> float:
-        if len(candles) < windows + 2:
+    def _avg_volume_before(self, *, candles: Sequence[Dict[str, Any]], idx: int, windows: int) -> float:
+        windows = int(windows)
+        if windows <= 1:
             return 0.0
-        # exclude current candle
-        part = candles[-(windows + 1):-1]
+        if idx <= windows + 1:
+            return 0.0
+
+        part = candles[idx - windows: idx]
         vals = [_to_float(c.get("quote_volume") or c.get("volume")) for c in part]
         vals = [v for v in vals if v > 0]
         if not vals:
@@ -460,17 +705,17 @@ class ScrLiquidationBinance:
     def _touch_up(self, *, high: float, level: float, tol_pct: float) -> bool:
         if level <= 0:
             return False
-        tol = level * tol_pct
-        return high >= (level - tol)
+        tol = level * float(tol_pct)
+        return float(high) >= (float(level) - tol)
 
     def _touch_down(self, *, low: float, level: float, tol_pct: float) -> bool:
         if level <= 0:
             return False
-        tol = level * tol_pct
-        return low <= (level + tol)
+        tol = level * float(tol_pct)
+        return float(low) <= (float(level) + tol)
 
     # -------------------------
-    # DB fetchers (schema-safe)
+    # DB fetchers
     # -------------------------
 
     def _fetch_symbols(self, *, storage: Any, exchange_id: int) -> List[Dict[str, Any]]:
@@ -493,7 +738,6 @@ class ScrLiquidationBinance:
         symbol_id: int,
         interval: str,
     ) -> Optional[float]:
-        # ✅ candles: open_time
         q = """
         SELECT close
         FROM candles
@@ -515,7 +759,6 @@ class ScrLiquidationBinance:
         interval: str,
         limit: int,
     ) -> List[Dict[str, Any]]:
-        # ✅ open_time AS ts (для унификации)
         q = """
         SELECT
             open_time AS ts,
@@ -525,13 +768,15 @@ class ScrLiquidationBinance:
             cvd_quote
         FROM candles
         WHERE exchange_id=%s AND symbol_id=%s AND interval=%s
-        ORDER BY open_time ASC
+        ORDER BY open_time DESC
         LIMIT %s
         """
         with storage.pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(q, (int(exchange_id), int(symbol_id), str(interval), int(limit)))
                 rows = cur.fetchall()
+
+        rows = list(rows)[::-1]
 
         out: List[Dict[str, Any]] = []
         for r in rows:
@@ -578,7 +823,6 @@ class ScrLiquidationBinance:
         interval: str,
         ts: datetime,
     ) -> Optional[float]:
-        # cvd_quote in candles
         q = """
         SELECT cvd_quote
         FROM candles
@@ -599,7 +843,6 @@ class ScrLiquidationBinance:
         symbol_id: int,
         ts: datetime,
     ) -> Optional[float]:
-        # ✅ funding_time
         q = """
         SELECT funding_rate
         FROM funding
@@ -621,13 +864,6 @@ class ScrLiquidationBinance:
         candle_open_ts: datetime,
         interval: str,
     ) -> Tuple[float, float]:
-        """
-        liquidation_1m:
-          long_notional  = ликвидации LONG
-          short_notional = ликвидации SHORT
-
-        Возвращаем: (liq_long_usdt, liq_short_usdt)
-        """
         start_ts = _utc(candle_open_ts)
         end_ts = start_ts + _parse_interval(interval)
 

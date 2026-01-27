@@ -6,12 +6,12 @@ import logging
 import threading
 import time
 import hashlib
+import websocket  # websocket-client
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-import websocket  # websocket-client
-
 from src.platform.exchanges.binance.ws import WS_STREAM_BASE
+from src.platform.exchanges.binance.normalize import norm_kline_event
 
 logger = logging.getLogger("src.platform.exchanges.binance.collector_candles")
 
@@ -232,24 +232,6 @@ def _stop_wait(outer: threading.Event, inner: threading.Event, timeout: float) -
             return True
         time.sleep(step)
     return outer.is_set() or inner.is_set()
-
-
-def _ensure_text_message(message: Any) -> Optional[str]:
-    """
-    websocket-client может отдавать message как str или bytes.
-    Приводим к str безопасно.
-    """
-    try:
-        if message is None:
-            return None
-        if isinstance(message, (bytes, bytearray, memoryview)):
-            return bytes(message).decode("utf-8", errors="ignore")
-        if isinstance(message, str):
-            return message
-        # fallback
-        return str(message)
-    except Exception:
-        return None
 
 
 # -------------------------
@@ -479,95 +461,13 @@ def _seed_symbol_interval_forward(
 
 
 # -------------------------
-# WS normalize (no external dependency)
-# -------------------------
-
-def _norm_ws_kline_event(exchange_id: int, symbol_ids: Dict[str, int], data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    Нормализуем kline event Binance Futures в формат candles row.
-    Работает 1:1 для combined stream:
-      {"stream":"btcusdt@kline_1m","data":{...}}
-
-    Важно: не используем norm_kline_event чтобы избежать bytes/str конфликтов.
-    """
-    try:
-        if not isinstance(data, dict):
-            return None
-
-        # В combined stream kline лежит в data["k"]
-        k = data.get("k")
-        if not isinstance(k, dict):
-            return None
-
-        sym = str(data.get("s") or k.get("s") or "").upper().strip()
-        if not sym:
-            return None
-
-        symbol_id = int(symbol_ids.get(sym) or 0)
-        if symbol_id <= 0:
-            return None
-
-        interval = str(k.get("i") or "").strip()
-        if not interval:
-            return None
-
-        open_ms = k.get("t")
-        open_time = _from_ms(open_ms)
-        if open_time is None:
-            return None
-
-        is_closed = bool(k.get("x"))
-
-        o = _safe_float(k.get("o"), 0.0)
-        h = _safe_float(k.get("h"), 0.0)
-        l = _safe_float(k.get("l"), 0.0)
-        c = _safe_float(k.get("c"), 0.0)
-
-        vol = _safe_float(k.get("v"), 0.0)
-        qv = _safe_float(k.get("q"), 0.0)
-
-        trades = _safe_int(k.get("n"), 0)
-
-        tbb = _safe_float(k.get("V"), 0.0)  # taker buy base
-        tbq = _safe_float(k.get("Q"), 0.0)  # taker buy quote
-
-        now = _utc_now()
-
-        row = {
-            "exchange_id": int(exchange_id),
-            "symbol_id": int(symbol_id),
-            "interval": str(interval),
-            "open_time": open_time,
-            "open": o,
-            "high": h,
-            "low": l,
-            "close": c,
-            "volume": vol,
-            "quote_volume": qv,
-            "trades": trades,
-            "taker_buy_base": tbb,
-            "taker_buy_quote": tbq,
-            "taker_sell_base": vol - tbb,
-            "taker_sell_quote": qv - tbq,
-            "source": "ws_kline",
-            "updated_at": now,
-            "is_closed": is_closed,
-        }
-        return row
-
-    except Exception:
-        logger.exception("[CandlesWS] normalize failed")
-        return None
-
-
-# -------------------------
 # WS worker (COMBINED intervals per chunk)
 # -------------------------
 
 class _WSCombinedKlineWorker(threading.Thread):
     """
     ✅ 1 WS connection на chunk symbols
-    ✅ внутри сразу все интервалы
+    ✅ внутри сразу все интервалы (1m+5m+...)
     ✅ URL limit + rebuild on reconnect
     ✅ REST catchup async (не блокирует WS event loop)
     """
@@ -581,23 +481,27 @@ class _WSCombinedKlineWorker(threading.Thread):
         exchange_id: int,
         symbol_ids_ref: Dict[str, int],   # shared ref
         intervals_ref: List[str],         # shared ref
+
         chunk_index: int,
         ws_max_streams_per_conn: int,
         ws_url_max_len: int,
+
         outer_stop_event: threading.Event,
         local_stop_event: threading.Event,
+
         update_open_candle: bool,
+
         flush_sec: float = 1.0,
         max_buffer: int = 2000,
+
         rest_catchup_on_connect: bool = True,
         rest_catchup_overlap_minutes: int = 120,
         rest_catchup_limit: int = 1500,
         rest_catchup_max_pages: int = 2,
         per_request_sleep_sec: float = 0.15,
+
         catchup_seed_days: int = 2,
         catchup_max_symbols: int = 0,
-        ws_ping_interval: int = 60,
-        ws_ping_timeout: int = 30,
     ) -> None:
         super().__init__(daemon=True, name=name)
 
@@ -628,9 +532,6 @@ class _WSCombinedKlineWorker(threading.Thread):
 
         self.catchup_seed_days = int(catchup_seed_days)
         self.catchup_max_symbols = int(catchup_max_symbols)
-
-        self.ws_ping_interval = int(ws_ping_interval)
-        self.ws_ping_timeout = int(ws_ping_timeout)
 
         self._buf: List[dict] = []
         self._last_flush = time.time()
@@ -664,7 +565,7 @@ class _WSCombinedKlineWorker(threading.Thread):
         except Exception:
             logger.exception("[CandlesWS][%s] upsert_candles failed", self.name)
 
-    def _on_message_dict(self, msg: dict) -> None:
+    def _on_message(self, msg: dict) -> None:
         data = msg.get("data") if isinstance(msg, dict) else None
         if not isinstance(data, dict):
             return
@@ -674,7 +575,7 @@ class _WSCombinedKlineWorker(threading.Thread):
         except Exception:
             symbol_ids_snapshot = {}
 
-        row = _norm_ws_kline_event(self.exchange_id, symbol_ids_snapshot, data)
+        row = norm_kline_event(self.exchange_id, symbol_ids_snapshot, data)
         if not row:
             return
 
@@ -774,11 +675,14 @@ class _WSCombinedKlineWorker(threading.Thread):
                             max_pages=int(self.rest_catchup_max_pages),
                             per_request_sleep_sec=float(self.per_request_sleep_sec),
                             overlap_minutes=int(self.rest_catchup_overlap_minutes),
-                            stop_event=self.outer_stop_event,  # global stop
+                            stop_event=self.outer_stop_event,  # outer stop is global kill
                             source="rest_tail_catchup",
                         )
                     except Exception:
-                        logger.exception("[CandlesWS][%s] REST tail catchup failed sym=%s itv=%s", self.name, sym, itv)
+                        logger.exception(
+                            "[CandlesWS][%s] REST tail catchup failed sym=%s itv=%s",
+                            self.name, sym, itv
+                        )
         finally:
             with self._catchup_lock:
                 self._catchup_running = False
@@ -806,30 +710,24 @@ class _WSCombinedKlineWorker(threading.Thread):
                     continue
 
                 logger.info(
-                    "[CandlesWS][%s] connect symbols=%d intervals=%s url_len=%d ping=%ds timeout=%ds",
+                    "[CandlesWS][%s] connect symbols=%d intervals=%s url_len=%d",
                     self.name,
                     len(self._active_symbols),
                     ",".join(self._active_intervals),
                     len(self._active_url),
-                    self.ws_ping_interval,
-                    self.ws_ping_timeout,
                 )
 
-                def on_message(_ws, message: Any) -> None:
-                    txt = _ensure_text_message(message)
-                    if not txt:
-                        return
+                def on_message(_ws, message: str) -> None:
                     try:
-                        msg = json.loads(txt)
-                        if not isinstance(msg, dict):
-                            return
-                        self._on_message_dict(msg)
+                        msg = json.loads(message)
                     except Exception:
-                        # ✅ не валим весь воркер от мусора/глюка
-                        logger.exception("[CandlesWS][%s] on_message parse/handle failed", self.name)
+                        return
+                    self._on_message(msg)
 
                 def on_open(_ws) -> None:
                     logger.info("[CandlesWS][%s] connected", self.name)
+
+                    # ✅ catchup в отдельном потоке (не блокирует WS)
                     if self.rest_catchup_on_connect:
                         th = threading.Thread(
                             target=self._catchup_rest_tail_multi,
@@ -852,6 +750,7 @@ class _WSCombinedKlineWorker(threading.Thread):
                     on_close=on_close,
                 )
 
+                # ✅ ВАЖНО: если supervisor решил рестартнуть — нужно уметь закрыть WS
                 def stop_watcher() -> None:
                     while not self._any_stop():
                         time.sleep(0.25)
@@ -864,10 +763,8 @@ class _WSCombinedKlineWorker(threading.Thread):
                 watcher.start()
 
                 ws_app.run_forever(
-                    ping_interval=max(10, int(self.ws_ping_interval)),
-                    ping_timeout=max(5, int(self.ws_ping_timeout)),
-                    ping_payload="ping",
-                    skip_utf8_validation=True,
+                    ping_interval=20,
+                    ping_timeout=10,
                 )
 
             except Exception:
@@ -906,19 +803,23 @@ class _WSCombinedSupervisor(threading.Thread):
         exchange_id: int,
         symbol_ids_ref: Dict[str, int],
         intervals_ref: List[str],
+
         outer_stop_event: threading.Event,
+
         update_open_candle: bool,
+
         ws_max_streams_per_conn: int,
         ws_url_max_len: int,
+
         rest_catchup_on_connect: bool,
         rest_catchup_overlap_minutes: int,
         rest_catchup_limit: int,
         rest_catchup_max_pages: int,
         per_request_sleep_sec: float,
+
         catchup_seed_days: int,
         catchup_max_symbols: int,
-        ws_ping_interval: int = 60,
-        ws_ping_timeout: int = 30,
+
         check_sec: int = 30,
         min_restart_sec: int = 120,
         debounce_checks: int = 2,
@@ -949,9 +850,6 @@ class _WSCombinedSupervisor(threading.Thread):
         self.catchup_seed_days = int(catchup_seed_days)
         self.catchup_max_symbols = int(catchup_max_symbols)
 
-        self.ws_ping_interval = int(ws_ping_interval)
-        self.ws_ping_timeout = int(ws_ping_timeout)
-
         self.check_sec = max(5, int(check_sec))
         self.min_restart_sec = max(10, int(min_restart_sec))
         self.debounce_checks = max(1, int(debounce_checks))
@@ -966,6 +864,10 @@ class _WSCombinedSupervisor(threading.Thread):
         self._last_restart_ts: float = 0.0
 
     def _snapshot_signature(self) -> Tuple[str, int, int]:
+        """
+        Возвращает:
+          signature_hash, symbol_count, chunk_count
+        """
         try:
             sym_ids = {str(k).upper(): int(v) for k, v in dict(self.symbol_ids_ref).items()}
         except Exception:
@@ -983,6 +885,8 @@ class _WSCombinedSupervisor(threading.Thread):
             max_url_len=self.ws_url_max_len,
         )
 
+        # signature includes intervals + symbols list
+        # (достаточно, чтобы ловить изменения universe)
         s = "I:" + ",".join(intervals) + "|S:" + ",".join(symbols_all) + "|C:" + ",".join(str(len(x)) for x in chunks)
         return _sha1(s), len(symbols_all), len(chunks)
 
@@ -1025,8 +929,6 @@ class _WSCombinedSupervisor(threading.Thread):
                 per_request_sleep_sec=self.per_request_sleep_sec,
                 catchup_seed_days=self.catchup_seed_days,
                 catchup_max_symbols=self.catchup_max_symbols,
-                ws_ping_interval=self.ws_ping_interval,
-                ws_ping_timeout=self.ws_ping_timeout,
             )
             w.start()
             self._workers.append(w)
@@ -1037,7 +939,11 @@ class _WSCombinedSupervisor(threading.Thread):
             logger.warning("[CandlesWS][Supervisor] restart skipped (cooldown) reason=%s", reason)
             return
 
-        logger.warning("[CandlesWS][Supervisor] RESTART workers -> chunks=%d reason=%s", int(chunk_count), reason)
+        logger.warning(
+            "[CandlesWS][Supervisor] RESTART workers -> chunks=%d reason=%s",
+            int(chunk_count),
+            reason,
+        )
         self._stop_generation()
         self._start_generation(chunk_count)
         self._last_restart_ts = time.time()
@@ -1050,10 +956,15 @@ class _WSCombinedSupervisor(threading.Thread):
             self.debounce_checks,
         )
 
+        # initial start
         sig, sym_count, chunk_count = self._snapshot_signature()
         self._last_sig = sig
         self._start_generation(chunk_count)
-        logger.info("[CandlesWS][Supervisor] initial universe symbols=%d chunks=%d", sym_count, chunk_count)
+        logger.info(
+            "[CandlesWS][Supervisor] initial universe symbols=%d chunks=%d",
+            sym_count,
+            chunk_count,
+        )
 
         while not self.outer_stop_event.is_set():
             if self.outer_stop_event.wait(self.check_sec):
@@ -1066,6 +977,7 @@ class _WSCombinedSupervisor(threading.Thread):
                 self._pending_hits = 0
                 continue
 
+            # debounce: change must be stable несколько проверок подряд
             if self._pending_sig != sig2:
                 self._pending_sig = sig2
                 self._pending_hits = 1
@@ -1086,6 +998,7 @@ class _WSCombinedSupervisor(threading.Thread):
                 self._pending_hits = 0
                 self._restart_now(chunk_count2, reason="universe_changed")
 
+        # stop all
         self._stop_generation()
         logger.info("[CandlesWS][Supervisor] stopped")
 
@@ -1113,9 +1026,9 @@ def start_candles_collector(
     use_ws: bool = True,
 
     ws_max_streams_per_conn: int = 120,
-    ws_url_max_len: int = 2600,
+    ws_url_max_len: int = 1800,
 
-    update_open_candle: bool = False,
+    update_open_candle: bool = True,
 
     rest_catchup_on_connect: bool = True,
     rest_catchup_overlap_minutes: int = 120,
@@ -1124,9 +1037,6 @@ def start_candles_collector(
 
     catchup_seed_days: int = 2,
     catchup_max_symbols: int = 0,
-
-    ws_ping_interval: int = 60,
-    ws_ping_timeout: int = 30,
 
     stop_event: threading.Event | None = None,
 
@@ -1143,6 +1053,7 @@ def start_candles_collector(
     if not intervals:
         intervals = ["5m"]
 
+    # snapshot list for seed
     pairs = sorted(
         ((str(sym).upper().strip(), int(sid)) for sym, sid in (symbol_ids or {}).items() if str(sym).strip()),
         key=lambda x: x[0],
@@ -1212,12 +1123,13 @@ def start_candles_collector(
                 logger.info("[CandlesSeed] interval=%s batch=%d upserts=%d", itv, len(batch), up_total)
 
     # -------------------------
-    # LIVE: websocket klines
+    # LIVE: websocket klines (COMBINED + SUPERVISOR)
     # -------------------------
     if not bool(use_ws):
         logger.warning("[Candles] use_ws=false -> LIVE WS disabled")
         return []
 
+    # supervisor settings from config (optional)
     sup_cfg = _kwargs.get("ws_supervisor")
     if isinstance(sup_cfg, dict):
         sup_enabled = bool(sup_cfg.get("enabled", True))
@@ -1230,7 +1142,9 @@ def start_candles_collector(
         sup_min_restart_sec = int(_kwargs.get("ws_supervisor_min_restart_sec", 120))
         sup_debounce = int(_kwargs.get("ws_supervisor_debounce_checks", 2))
 
+    # если supervisor выключен -> просто стартанём 1 поколение воркеров (без авторестарта)
     if not sup_enabled:
+        # one-shot workers (no restart)
         chunks0 = _chunk_symbols_by_limits(
             symbols=symbols,
             intervals=intervals,
@@ -1264,8 +1178,6 @@ def start_candles_collector(
                 per_request_sleep_sec=float(per_request_sleep_sec),
                 catchup_seed_days=int(catchup_seed_days),
                 catchup_max_symbols=int(catchup_max_symbols),
-                ws_ping_interval=int(ws_ping_interval),
-                ws_ping_timeout=int(ws_ping_timeout),
             )
             w.start()
             threads.append(w)
@@ -1276,6 +1188,7 @@ def start_candles_collector(
         )
         return threads
 
+    # supervisor mode
     sup = _WSCombinedSupervisor(
         storage=storage,
         rest=rest,
@@ -1293,8 +1206,6 @@ def start_candles_collector(
         per_request_sleep_sec=float(per_request_sleep_sec),
         catchup_seed_days=int(catchup_seed_days),
         catchup_max_symbols=int(catchup_max_symbols),
-        ws_ping_interval=int(ws_ping_interval),
-        ws_ping_timeout=int(ws_ping_timeout),
         check_sec=int(sup_check_sec),
         min_restart_sec=int(sup_min_restart_sec),
         debounce_checks=int(sup_debounce),

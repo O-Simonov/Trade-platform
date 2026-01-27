@@ -1,168 +1,160 @@
 # src/platform/exchanges/binance/ws.py
 from __future__ import annotations
 
-import json
-import threading
 import time
+import random
+import threading
 import logging
 from typing import Callable, Optional, Any
 
-import websocket
+import websocket  # websocket-client
 
 log = logging.getLogger("binance.ws")
 
+# ✅ НУЖНЫЕ КОНСТАНТЫ (их ждут collector'ы)
 WS_STREAM_BASE = "wss://fstream.binance.com/stream?streams="
-WS_WS_BASE = "wss://fstream.binance.com/ws"
+WS_WS_BASE = "wss://fstream.binance.com/ws/"
 
 
-class BinanceWS(threading.Thread):
+class BinanceWS:
     """
-    Простая WS-обёртка с автопереподключением.
-
-    Важно:
-      ✅ combined streams {"stream": "...", "data": {...}} -> отдаёт payload=data
-      ✅ combined streams {"stream": "...", "data": [ {...}, {...} ]} -> отдаёт payload=list
-      ✅ ловит исключения callback-а и логирует (иначе OMS может молча не получать события)
-      ✅ stop() корректно завершает цикл
+    Надёжный WS:
+    ✅ 1 поток на соединение (без утечки)
+    ✅ reconnect внутри потока
+    ✅ backoff + jitter
+    ✅ ping_interval / ping_timeout
+    ✅ stop() прерывает sleep (мгновенная остановка)
     """
 
     def __init__(
         self,
         *,
+        name: str,
         url: str,
-        on_message: Callable[[Any], None],
-        name: str = "BinanceWS",
+        on_message: Callable[[str], None],
         on_open: Optional[Callable[[], None]] = None,
         on_close: Optional[Callable[[], None]] = None,
-        ping_interval: int = 20,
-        ping_timeout: int = 10,
-        reconnect_delay_sec: float = 2.0,
+        ping_interval: int = 30,
+        ping_timeout: int = 20,
+        reconnect_min_delay: float = 1.0,
+        reconnect_max_delay: float = 30.0,
     ):
-        super().__init__(daemon=True, name=name)
+        self.name = str(name)
         self.url = str(url)
-        self.on_message_cb = on_message
 
-        self._ws: websocket.WebSocketApp | None = None
+        self._on_message_cb = on_message
+        self._on_open_cb = on_open
+        self._on_close_cb = on_close
+
+        self.ping_interval = max(10, int(ping_interval))
+        self.ping_timeout = max(5, int(ping_timeout))
+
+        self.reconnect_min_delay = max(0.2, float(reconnect_min_delay))
+        self.reconnect_max_delay = max(self.reconnect_min_delay, float(reconnect_max_delay))
+
         self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._ws: Optional[websocket.WebSocketApp] = None
 
-        self.connected = threading.Event()
-        self._on_open_hook = on_open
-        self._on_close_hook = on_close
+        # ✅ чтобы backoff можно было сбрасывать после успешного on_open
+        self._opened_once = False
+        self._opened_lock = threading.Lock()
 
-        self._ping_interval = int(ping_interval)
-        self._ping_timeout = int(ping_timeout)
-        self._reconnect_delay_sec = float(reconnect_delay_sec)
-
-    def run(self) -> None:
-        log.info("[%s] connecting → %s", self.name, self.url)
-
-        def _on_open(_ws):
-            self.connected.set()
-            log.info("[%s] WS CONNECTED", self.name)
-            try:
-                if self._on_open_hook:
-                    self._on_open_hook()
-            except Exception:
-                log.exception("[%s] on_open hook failed", self.name)
-
-        def _on_close(_ws, *_a):
-            self.connected.clear()
-            log.warning("[%s] WS CLOSED", self.name)
-            try:
-                if self._on_close_hook:
-                    self._on_close_hook()
-            except Exception:
-                log.exception("[%s] on_close hook failed", self.name)
-
-        def _on_error(_ws, err):
-            # error не всегда означает close, поэтому connected не трогаем тут
-            log.error("[%s] WS ERROR: %s", self.name, err)
-
-        # небольшой backoff можно постепенно увеличивать (если хочешь)
-        backoff = max(0.1, self._reconnect_delay_sec)
-
-        while not self._stop.is_set():
-            try:
-                self._ws = websocket.WebSocketApp(
-                    self.url,
-                    on_open=_on_open,
-                    on_message=lambda ws, msg: self._handle(msg),
-                    on_error=_on_error,
-                    on_close=_on_close,
-                )
-
-                # ws.run_forever блокирующий — выходим только когда сокет разорвётся
-                self._ws.run_forever(
-                    ping_interval=self._ping_interval,
-                    ping_timeout=self._ping_timeout,
-                )
-
-            except Exception as e:
-                self.connected.clear()
-                log.exception("[%s] WS exception: %s", self.name, e)
-
-            if self._stop.is_set():
-                break
-
-            # backoff перед переподключением
-            time.sleep(backoff)
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._run_loop,
+            name=self.name,
+            daemon=True,
+        )
+        self._thread.start()
 
     def stop(self) -> None:
-        """
-        Остановка потока.
-        """
         self._stop.set()
-        self.connected.clear()
-
         try:
             if self._ws:
+                # мягкое завершение run_forever
+                self._ws.keep_running = False
                 self._ws.close()
         except Exception:
             pass
 
-    def _handle(self, msg: str) -> None:
-        """
-        msg: raw JSON string
-        """
+    def _run_loop(self) -> None:
+        delay = self.reconnect_min_delay
+
+        while not self._stop.is_set():
+            try:
+                # перед стартом нового run_forever
+                with self._opened_lock:
+                    self._opened_once = False
+
+                self._ws = websocket.WebSocketApp(
+                    self.url,
+                    on_open=self._on_open,
+                    on_message=self._on_message,
+                    on_error=self._on_error,
+                    on_close=self._on_close,
+                )
+
+                # run_forever блокирует поток (это нормально)
+                self._ws.run_forever(
+                    ping_interval=self.ping_interval,
+                    ping_timeout=self.ping_timeout,
+                    ping_payload="ping",
+                    skip_utf8_validation=True,
+                )
+
+            except Exception:
+                log.exception("[%s] WS LOOP EXCEPTION", self.name)
+
+            # если stop -> выходим
+            if self._stop.is_set():
+                break
+
+            # ✅ если подключение успело открыться — backoff можно сбросить
+            with self._opened_lock:
+                opened = self._opened_once
+            if opened:
+                delay = self.reconnect_min_delay
+
+            # backoff + jitter
+            jitter = random.uniform(0.0, 0.35)
+            sleep_s = min(self.reconnect_max_delay, delay) * (1.0 + jitter)
+
+            log.warning("[%s] reconnect in %.2fs ...", self.name, sleep_s)
+
+            # ✅ важно: стоп прерывает сон
+            if self._stop.wait(sleep_s):
+                break
+
+            delay = min(self.reconnect_max_delay, max(self.reconnect_min_delay, delay * 1.7))
+
+    def _on_open(self, ws) -> None:
+        log.info("[%s] WS CONNECTED", self.name)
+        with self._opened_lock:
+            self._opened_once = True
         try:
-            data = json.loads(msg)
+            if self._on_open_cb:
+                self._on_open_cb()
         except Exception:
-            return
+            log.exception("[%s] on_open callback failed", self.name)
 
-        # combined stream -> {"stream":"...", "data":{...}} или {"stream":"...", "data":[...]}
-        if isinstance(data, dict) and "data" in data and "stream" in data:
-            payload = data.get("data")
-        else:
-            payload = data
-
-        # ✅ Принимаем dict И list — важно для !markPrice@arr
-        if not isinstance(payload, (dict, list)):
-            return
-
+    def _on_message(self, ws, message: str) -> None:
+        # ❗️ ДОЛЖНО БЫТЬ МАКСИМАЛЬНО БЫСТРО
         try:
-            self.on_message_cb(payload)
+            self._on_message_cb(message)
         except Exception:
-            ev = self._guess_event(payload)
+            log.exception("[%s] on_message callback failed", self.name)
 
-            snippet = str(payload)
-            if len(snippet) > 800:
-                snippet = snippet[:800] + "…"
+    def _on_error(self, ws, error: Any) -> None:
+        log.error("[%s] WS ERROR: %s", self.name, error)
 
-            log.exception("[%s] on_message_cb failed (event=%s) payload=%s", self.name, ev, snippet)
-
-    @staticmethod
-    def _guess_event(payload: Any) -> str:
-        """
-        Пытаемся понять тип события для логов.
-        """
+    def _on_close(self, ws, close_status_code, close_msg) -> None:
+        log.warning("[%s] WS CLOSED code=%s msg=%s", self.name, close_status_code, close_msg)
         try:
-            if isinstance(payload, dict):
-                return str(payload.get("e") or payload.get("eventType") or "?")
-            if isinstance(payload, list) and payload:
-                first = payload[0]
-                if isinstance(first, dict):
-                    return str(first.get("e") or first.get("eventType") or "list")
-                return "list"
-            return "?"
+            if self._on_close_cb:
+                self._on_close_cb()
         except Exception:
-            return "?"
+            log.exception("[%s] on_close callback failed", self.name)

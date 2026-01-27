@@ -1,11 +1,8 @@
-# FAST PROCESS: minimal REST load, WS candles (1m/5m) + liquidations
+# FAST PROCESS: minimal REST load, WS candles (1m/5m) + optional liquidations
 # Purpose:
-#   - seed 2 days by REST for 1m/5m
-#   - then maintain via WS kline streams
-#   - liquidations fast flush
-# Notes:
-#   - Universe + SymbolFilters are handled by SLOW (no duplicates)
-#   - Retention is handled by SLOW
+#   - свечи 1m/5m в реальном времени
+#   - seed только 2 дня
+#   - universe/filters/retention НЕ тут
 
 exchange: binance
 exchange_id: 1
@@ -19,11 +16,9 @@ startup_stagger:
   after_candles: 0.4
   after_liquidations: 0.3
 
-# Universe handled by SLOW
 universe:
   enabled: false
 
-# Filters handled by SLOW
 symbol_filters:
   enabled: false
 
@@ -34,42 +29,44 @@ market_data:
   enabled: true
   candle_intervals: ["1m", "5m"]
 
-  # ✅ REST seed to fill last 2 days fast
+  # REST seed: последние 2 дня
   seed_on_start: true
   seed_days: 2
   seed_limit: 1500
-
-  # ✅ minimum pages for 1m (2 days) is usually 2+
   seed_max_pages_per_symbol: 2
-  seed_symbols_per_cycle: 10
-  per_request_sleep_sec: 0.10
+  seed_symbols_per_cycle: 8
+  per_request_sleep_sec: 0.12
+  seed_overlap_minutes: 30
 
-  # ✅ WS for continuous updates
+  # WS candles
   use_ws: true
-  ws_max_streams_per_conn: 60
-  update_open_candle: true
+  ws_max_streams_per_conn: 120
+  ws_url_max_len: 2600
 
-  lookback_days_if_empty: 2
-  refresh_symbols_sec: 300
+  # ✅ ВАЖНО: только закрытые свечи (снимает 90% нагрузки)
+  update_open_candle: false
 
-# ✅ liquidations fast
+  # supervisor не нужен (universe фиксированный)
+  ws_supervisor:
+    enabled: false
+
+  # ✅ стабильные ping/pong (используется твоим collector_candles.py)
+  ws_ping_interval: 60
+  ws_ping_timeout: 30
+
+  # REST catchup при подключении (легкий)
+  rest_catchup_on_connect: true
+  rest_catchup_overlap_minutes: 15
+  rest_catchup_limit: 1500
+  rest_catchup_max_pages: 1
+
+  catchup_seed_days: 1
+  catchup_max_symbols: 40
+
 liquidations:
   enabled: true
-  flush_sec: 2.0
+  flush_sec: 1.0
 
-# optional: only for a few symbols, usually OFF
-market_data_active:
-  enabled: false
-  candle_intervals: ["1m"]
-  extra_symbols: ["BTCUSDT", "ETHUSDT"]
-  poll_sec: 30
-  symbols_per_cycle: 2
-  req_sleep_sec: 0.30
-  max_active_symbols: 10
-  seed_on_start: false
-  klines_limit: 2
-
-# everything heavy = OFF in FAST
 open_interest:
   enabled: false
 

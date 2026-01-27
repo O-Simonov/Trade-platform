@@ -1,16 +1,11 @@
-# SLOW PROCESS: heavy collectors + higher TF candles + OI + funding + ticker_24h + trades_all + universe/filters + retention
-# Purpose:
-#   - Universe + Filters
-#   - candles: 15m/1h/4h/1d (NO 1m/5m)
-#   - open interest hist: 5m/15m/1h/4h/1d with stall blacklist
-#   - market_trades_all for delta/CVD
-#   - gap repair WITHOUT 5m (avoid conflicts with FAST WS)
-#   - retention cleanup
+# SLOW PROCESS: heavy collectors + universe/filters + OI + funding + ticker_24h + trades_all + retention
+# ВАЖНО:
+#   - WS свечи только 15m (самое стабильное)
+#   - 1h/4h/1d делаем gap_repair'ом (REST)
 
 exchange: binance
 exchange_id: 1
 
-# ✅ SLOW is heavy: keep REST limits low
 rest_limits:
   max_rps: 2.0
   max_rpm: 250
@@ -23,9 +18,8 @@ startup_stagger:
   after_open_interest: 1.0
   after_funding: 0.8
   after_ticker_24h: 0.8
-  after_gap_repair: 10.0
+  after_gap_repair: 8.0
 
-# ✅ Universe only in SLOW
 universe:
   enabled: true
   seed_on_start: false
@@ -33,7 +27,6 @@ universe:
   min_size: 200
   max_drop_ratio: 0.30
 
-# ✅ Symbol filters only in SLOW
 symbol_filters:
   enabled: true
   refresh_sec: 7200
@@ -42,30 +35,47 @@ symbol_filters:
 symbols_refresh:
   refresh_sec: 60
 
-# ✅ Higher TF candles only (NO 1m/5m)
-#candles:
 market_data:
   enabled: true
-  candle_intervals: [ "15m","1h","4h","1d" ]
+
+  # ✅ WS только 15m (чтобы НЕ было 20+ WS chunk’ов)
+  candle_intervals: ["15m"]
+
   seed_on_start: true
   seed_days: 30
   seed_limit: 1500
-  seed_max_pages_per_symbol: 0      # ✅ авто под интервал
-  seed_symbols_per_cycle: 4
-  per_request_sleep_sec: 0.20
+  seed_max_pages_per_symbol: 0
+  seed_symbols_per_cycle: 5
+  per_request_sleep_sec: 0.25
   seed_overlap_minutes: 60
 
   use_ws: true
-  ws_max_streams_per_conn: 120
-  update_open_candle: true
+  # ✅ больше символов в одном WS (меньше коннектов)
+  ws_max_streams_per_conn: 180
+  ws_url_max_len: 3500
 
-  # ✅ фикс разрывов при падениях WS
+  ws_supervisor:
+    enabled: true
+    check_sec: 60
+    debounce_checks: 2
+    min_restart_sec: 180
+
+  # ✅ только закрытые свечи
+  update_open_candle: false
+
+  # ✅ ping/pong стабильнее
+  ws_ping_interval: 60
+  ws_ping_timeout: 30
+
+  # REST catchup при подключении (хвост)
   rest_catchup_on_connect: true
-  rest_catchup_overlap_minutes: 120
+  rest_catchup_overlap_minutes: 180
   rest_catchup_limit: 1500
   rest_catchup_max_pages: 2
 
-# ✅ Open Interest (heavy)
+  catchup_seed_days: 2
+  catchup_max_symbols: 80
+
 open_interest:
   enabled: true
   intervals: ["5m", "15m", "1h", "4h", "1d"]
@@ -86,47 +96,41 @@ open_interest:
   refresh_symbols_sec: 3600
   log_each_cycle: true
 
-  # ✅ auto-blacklist stalled
   stall_hits_to_blacklist: 3
   blacklist_hours: 6
   blacklist_log_every_sec: 120
 
-  # ✅ per-interval schedules (added 1h/4h/1d)
   schedule:
-    "5m": 20            # каждые 20 секунд
-    "15m": 240          # каждые 4 минуты
-    "1h": 1200          # каждые 20 минут
-    "4h": 3600          # каждый час
-    "1d": 14400         # каждый день
+    "5m": 25
+    "15m": 240
+    "1h": 1200
+    "4h": 3600
+    "1d": 21600
   schedule_jitter_sec: 1.0
 
   dynamic_budget:
     enabled: true
-    safety_factor: 0.90  # безопасность на 90%
-    endpoint_weight: 2.0 # вес конечной точки (можно уменьшить, если возникают ошибки)
+    safety_factor: 0.90
+    endpoint_weight: 2.0
     min_symbols_per_tick: 5
-    max_symbols_per_tick_cap: 50 # ограничение количества символов на тик
+    max_symbols_per_tick_cap: 50
 
   adaptive:
     enabled: true
     penalty_step: 5
     recovery_step: 1
-    extra_sleep_penalty_sec: 0.10  # увеличена задержка после ошибок 429
+    extra_sleep_penalty_sec: 0.10
     extra_sleep_recovery_sec: 0.01
     extra_sleep_max_sec: 0.50
-    post_tick_sleep_max_sec: 20.0  # увеличена пауза после каждого цикла
-
-# ✅ Funding
+    post_tick_sleep_max_sec: 20.0
 
 funding:
   enabled: true
   backfill_on_start: true
   backfill_days: 30
 
-  # if you have WS support - keep ON, REST is safety
   use_ws: true
 
-  # REST safety
   rest_safety_poll: true
   poll_sec: 1800
 
@@ -139,11 +143,15 @@ funding:
 
   overlap_hours: 72
 
-# ✅ Ticker 24h
 ticker_24h:
   enabled: true
-  poll_sec: 600
-  source: rest_24h
+  source: ws_24h
+  flush_sec: 10
+  ws_stream: "!ticker@arr"
+  ws_ping_interval: 60
+  ws_ping_timeout: 30
+  rest_safety_poll: false
+
 
 market_state_5m:
   enabled: true
@@ -152,49 +160,67 @@ market_state_5m:
   lookback_minutes: 180
   refresh_symbols_sec: 300
 
-# ✅ delta/CVD for all symbols (soft limits)
 market_trades_all:
   enabled: true
+  use_ws: true
 
-  poll_sleep: 0.10
-  req_sleep_sec: 0.08
-  symbols_per_cycle: 15
+  ws_max_streams_per_conn: 160
+  ws_url_max_len: 3500
+  ws_ping_interval: 60
+  ws_ping_timeout: 30
+
+  flush_sec: 0.75
+  flush_max_rows: 5000
 
   overlap_minutes: 60
-  lag_tail_sec: 600
-
-  refresh_symbols_sec: 600
-  max_symbols: 0
-
+  agg_upsert_every_sec: 10
   recalc_cvd_every_sec: 120
   cvd_hours_back: 24
 
+  # normal tail sync (после warmup)
+  tail_sync_enabled: true
+  lag_tail_sec: 600
+  tail_sync_every_sec: 5
+  tail_sync_symbols_per_cycle: 2
+  tail_sync_limit: 1000
+  tail_sync_max_pages_per_symbol: 3
+  tail_sync_max_requests_per_cycle: 6
+  tail_sync_min_symbol_interval_sec: 45
+  tail_sync_safety_lag_sec: 3
 
-# ✅ single-symbol trades collector is not needed
+  # ✅ WARMUP: ускоренный догон первые 3 минуты
+  warmup_enabled: true
+  warmup_sec: 180
+  warmup_lag_tail_sec: 60
+  warmup_tail_sync_every_sec: 3
+  warmup_tail_sync_symbols_per_cycle: 3
+  warmup_tail_sync_max_requests_per_cycle: 8
+  warmup_tail_sync_max_pages_per_symbol: 4
+  warmup_tail_sync_min_symbol_interval_sec: 20
+
 market_trades:
   enabled: false
 
-# ✅ gap repair - NO 5m (avoid FAST conflict)
 candles_gap_repair:
   enabled: true
-  intervals: ["4h", "1h", "15m", "5m"]     # можно расширять
-  every_sec: 600                          # раз в 10 минут
-  only_active_symbols: true
+  # ✅ Тут добиваем старшие ТФ вместо WS
+  intervals: ["1h", "4h", "1d"]
+  every_sec: 600
 
-  max_symbols_per_cycle: 60
-  max_gaps_per_cycle: 20
+  only_active_symbols: true
+  max_symbols_per_cycle: 80
+  max_gaps_per_cycle: 25
   gaps_per_symbol: 2
 
-  max_gap_days: 30                        # ✅ критично (не 0)
+  max_gap_days: 30
   min_gap_points: 1
 
   limit: 1500
   sleep_sec: 0.25
 
-  priority: 1                             # 0=агрессивно, 1=норм, 2=медленно
-  priority_symbols: ["BTCUSDT","ETHUSDT"]
+  priority: 1
+  priority_symbols: []
 
-# ✅ retention only in SLOW
 retention:
   enabled: true
   run_sec: 3600
@@ -202,7 +228,7 @@ retention:
   log_zero_deletes: true
 
   candles_days: 90
-  candle_intervals: ["1m","5m","15m","1h","4h","1d"]
+  candle_intervals: ["1m", "5m", "15m", "1h", "4h", "1d"]
 
   oi_keep_days:
     "5m": 14
@@ -212,11 +238,9 @@ retention:
     "1d": 365
 
   funding_days: 90
-  ticker_24h_days: 60
+  ticker_24h_days: 30
 
   market_state_5m_days: 30
 
-  # ✅ NEW
   market_trades_days: 14
   candles_trades_agg_days: 60
-

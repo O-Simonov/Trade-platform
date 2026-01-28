@@ -109,7 +109,7 @@ def _normalize_float_list(v: Any) -> List[float]:
 
 def _build_interval_liq_pairs(params: Dict[str, Any]) -> List[Tuple[str, Optional[float]]]:
     """
-    Главное правило (то, что ты хочешь):
+    Главное правило:
       intervals[i] -> volume_liquid_limit[i]
 
     Если volume_liquid_limit:
@@ -299,6 +299,10 @@ def _send_telegram_if_enabled(
     if not telegram_enabled or not packed_rows:
         return
 
+    telegram_send_text = bool(params.get("telegram_send_text", True))
+    if not telegram_send_text:
+        return
+
     telegram_mode = str(params.get("telegram_mode", "batch")).strip().lower()
     if telegram_mode not in ("batch", "single"):
         telegram_mode = "batch"
@@ -380,6 +384,221 @@ def _send_telegram_if_enabled(
 
     except Exception:
         log.exception("Telegram notify failed")
+
+
+def _human_usdt_km(x: Any) -> str:
+    """
+    Формат для ΣLiq: 15500 -> 15.5k, 1200000 -> 1.2M
+    """
+    try:
+        v = float(x or 0)
+        v = abs(v)
+        if v >= 1_000_000_000:
+            s = f"{v/1_000_000_000:.2f}".rstrip("0").rstrip(".")
+            return f"{s}B"
+        if v >= 1_000_000:
+            s = f"{v/1_000_000:.2f}".rstrip("0").rstrip(".")
+            return f"{s}M"
+        if v >= 1_000:
+            s = f"{v/1_000:.2f}".rstrip("0").rstrip(".")
+            return f"{s}k"
+        s = f"{v:.0f}"
+        return s
+    except Exception:
+        return "0"
+
+
+def _fmt_price_compact(x: Any) -> str:
+    """
+    Компактная цена для заголовков:
+      >=100 -> 2 знака
+      >=1   -> 4 знака
+      иначе -> 8 знаков
+    """
+    try:
+        if x is None:
+            return "—"
+        v = float(x)
+        if v >= 100:
+            s = f"{v:.2f}"
+        elif v >= 1:
+            s = f"{v:.4f}"
+        else:
+            s = f"{v:.8f}"
+        return s.rstrip("0").rstrip(".")
+    except Exception:
+        return str(x)
+
+
+def _build_telegram_plot_caption(
+    *,
+    screener_name: str,
+    timeframe: str,
+    row: Dict[str, Any],
+    tz_name: Optional[str],
+) -> str:
+    symbol = str(row.get("symbol") or "")
+    side = str(row.get("side") or "").upper()
+    day_seq = int(row.get("day_seq") or 0)
+
+    entry = _fmt_price_compact(row.get("entry_price"))
+    sl = _fmt_price(row.get("stop_loss"))
+    tp = _fmt_price(row.get("take_profit"))
+
+    sl_pct = _fmt_pct(row.get("stop_loss_pct"))
+    tp_pct = _fmt_pct(row.get("take_profit_pct"))
+
+    liq_s_v = float(row.get("liq_short_usdt") or 0)
+    liq_l_v = float(row.get("liq_long_usdt") or 0)
+    liq_sum = abs(liq_s_v) + abs(liq_l_v)
+
+    liq_sum_s = _human_usdt_km(liq_sum)
+    liq_s_s = _human_usdt_km(liq_s_v)
+    liq_l_s = _human_usdt_km(liq_l_v)
+
+    risk_usdt = _fmt_usdt_2(row.get("risk_trade_usdt"))
+    risk_pct = _fmt_pct(row.get("risk_trade_pct"))
+    qty = _fmt_qty(row.get("position_qty"))
+    notional = _fmt_usdt_int(row.get("position_notional_usdt"))
+
+    ts = row.get("signal_ts")
+    if isinstance(ts, datetime):
+        ts_local = _fmt_local_ts(ts, tz_name)
+    else:
+        ts_local = str(ts or "—")
+
+    lines = [
+        f"⚪️ {symbol} | {side} | TF {timeframe} | 🧾 #{day_seq}",
+        f"Entry {entry} | SL {sl} ({sl_pct}%) | TP {tp} ({tp_pct}%)",
+        f"💥 ΣLiq {liq_sum_s} (Short {liq_s_s} / Long {liq_l_s})",
+        f"💰 Risk {risk_usdt} USDT({risk_pct}%) | Qty {qty} | Notional {notional}",
+        f"⏱️ {ts_local} | {screener_name}",
+    ]
+    return "\n".join(lines).strip()
+
+
+
+def _build_telegram_plot_followup_text(
+    *,
+    screener_name: str,
+    timeframe: str,
+    row: Dict[str, Any],
+) -> str:
+    """
+    Второе сообщение (короткое), как на твоём примере.
+    """
+    symbol = str(row.get("symbol") or "")
+    side = str(row.get("side") or "").upper()
+    day_seq = int(row.get("day_seq") or 0)
+
+    entry = _fmt_price_compact(row.get("entry_price"))
+
+    liq_s_v = float(row.get("liq_short_usdt") or 0)
+    liq_l_v = float(row.get("liq_long_usdt") or 0)
+    liq_sum = abs(liq_s_v) + abs(liq_l_v)
+    liq_sum_s = _human_usdt_km(liq_sum)
+
+    return f"{symbol} {timeframe} {side} | entry {entry} | ΣLiq {liq_sum_s} | #{day_seq} | {screener_name}"
+
+
+def _send_telegram_plots_if_enabled(
+    *,
+    screener_name: str,
+    timeframe: str,
+    params: dict,
+    plot_items: List[Tuple[str, Dict[str, Any]]],  # [(png_path, row_dict)]
+) -> None:
+    """
+    Отправляет:
+      1) картинку (photo/document) + caption
+      2) второе короткое сообщение
+    """
+    telegram_enabled = bool(params.get("telegram_enabled", False))
+    telegram_send_plots = bool(params.get("telegram_send_plots", False))
+    if (not telegram_enabled) or (not telegram_send_plots) or (not plot_items):
+        return
+
+    telegram_plot_mode = str(params.get("telegram_plot_mode", "photo")).strip().lower()
+    if telegram_plot_mode not in ("photo", "document"):
+        telegram_plot_mode = "photo"
+
+    telegram_send_followup = bool(params.get("telegram_send_plot_followup_text", True))
+    telegram_max_plot_signals = int(params.get("telegram_max_plot_signals", 20))
+    tz_name = str(params.get("telegram_timezone", "")).strip() or None
+
+    try:
+        from src.platform.notifications.telegram import (
+            send_telegram_photo,
+            send_telegram_document,
+            send_telegram_message,
+        )
+
+        targets = _resolve_telegram_targets(params)
+        if not targets:
+            log.warning("Telegram plots enabled, but no targets resolved (check env keys)")
+            return
+
+        items = plot_items[: max(1, telegram_max_plot_signals)]
+
+        dead_targets: Set[str] = set()
+        ok_total = 0
+        total_total = 0
+
+        for png_path, row in items:
+            caption = _build_telegram_plot_caption(
+                screener_name=screener_name,
+                timeframe=timeframe,
+                row=row,
+                tz_name=tz_name,
+            )
+            followup = _build_telegram_plot_followup_text(
+                screener_name=screener_name,
+                timeframe=timeframe,
+                row=row,
+            )
+
+            for t in targets:
+                if getattr(t, "name", "") in dead_targets:
+                    continue
+
+                # 1) фото/док
+                total_total += 1
+                if telegram_plot_mode == "document":
+                    sent = bool(send_telegram_document(png_path, caption=caption, target=t))
+                else:
+                    sent = bool(send_telegram_photo(png_path, caption=caption, target=t))
+
+                if sent:
+                    ok_total += 1
+                else:
+                    dead_targets.add(getattr(t, "name", "unknown"))
+                    log.warning(
+                        "Telegram plot FAILED target=%s chat_id=%s -> disabled for this run",
+                        getattr(t, "name", "unknown"),
+                        getattr(t, "chat_id", None),
+                    )
+                    continue
+
+                # 2) follow-up text
+                if telegram_send_followup:
+                    try:
+                        send_telegram_message(followup, target=t)
+                    except Exception:
+                        log.warning("Telegram followup text failed target=%s", getattr(t, "name", "unknown"))
+
+        log.info(
+            "Telegram plots sent ok=%d/%d mode=%s plots=%d targets=%d (alive=%d) followup=%s",
+            ok_total,
+            total_total,
+            telegram_plot_mode,
+            len(items),
+            len(targets),
+            max(0, len(targets) - len(dead_targets)),
+            telegram_send_followup,
+        )
+
+    except Exception:
+        log.exception("Telegram plots send failed")
 
 
 # -----------------------------
@@ -511,7 +730,9 @@ def main() -> None:
                 if not pairs:
                     pairs = [("1h", None)]
 
-                mapping_str = ", ".join([f"{itv}=>{int(liq) if liq is not None and float(liq).is_integer() else liq}" for itv, liq in pairs])
+                mapping_str = ", ".join(
+                    [f"{itv}=>{int(liq) if liq is not None and float(liq).is_integer() else liq}" for itv, liq in pairs]
+                )
                 log.info("------------------------------------------------------------")
                 log.info("Run screener=%s v=%s mapping: %s", name, version, mapping_str)
 
@@ -537,7 +758,6 @@ def main() -> None:
                         log.info("No signals interval=%s", interval)
                         continue
 
-                    # ✅ пишем использованный порог в context (чтобы потом в БД/телеге было понятно)
                     for s in signals:
                         try:
                             ctx = dict(s.context or {})
@@ -568,6 +788,7 @@ def main() -> None:
 
                     rows: List[Dict[str, Any]] = []
                     packed_for_telegram: List[Dict[str, Any]] = []
+                    packed_by_key: Dict[Tuple[int, datetime], Dict[str, Any]] = {}
 
                     for s in new_signals:
                         signal_day = s.signal_ts.date()
@@ -605,25 +826,27 @@ def main() -> None:
                             }
                         )
 
-                        packed_for_telegram.append(
-                            {
-                                "symbol": str(s.symbol or ""),
-                                "side": str(s.side).upper(),
-                                "entry_price": s.entry_price,
-                                "stop_loss": s.stop_loss,
-                                "take_profit": s.take_profit,
-                                "signal_ts": s.signal_ts,
-                                "day_seq": int(day_seq),
-                                "liq_long_usdt": ctx.get("liq_long_usdt"),
-                                "liq_short_usdt": ctx.get("liq_short_usdt"),
-                                "risk_trade_usdt": ctx.get("risk_trade_usdt"),
-                                "position_qty": ctx.get("position_qty"),
-                                "position_notional_usdt": ctx.get("position_notional_usdt"),
-                                "risk_trade_pct": ctx.get("risk_trade_pct"),
-                                "stop_loss_pct": ctx.get("stop_loss_pct"),
-                                "take_profit_pct": ctx.get("take_profit_pct"),
-                            }
-                        )
+                        packed = {
+                            "symbol": str(s.symbol or ""),
+                            "side": str(s.side).upper(),
+                            "entry_price": s.entry_price,
+                            "stop_loss": s.stop_loss,
+                            "take_profit": s.take_profit,
+                            "signal_ts": s.signal_ts,
+                            "day_seq": int(day_seq),
+                            "liq_long_usdt": ctx.get("liq_long_usdt"),
+                            "liq_short_usdt": ctx.get("liq_short_usdt"),
+                            "risk_trade_usdt": ctx.get("risk_trade_usdt"),
+                            "position_qty": ctx.get("position_qty"),
+                            "position_notional_usdt": ctx.get("position_notional_usdt"),
+                            "risk_trade_pct": ctx.get("risk_trade_pct"),
+                            "stop_loss_pct": ctx.get("stop_loss_pct"),
+                            "take_profit_pct": ctx.get("take_profit_pct"),
+                            "volume_liquid_limit_used": ctx.get("volume_liquid_limit_used"),
+                        }
+
+                        packed_for_telegram.append(packed)
+                        packed_by_key[(int(s.symbol_id), s.signal_ts)] = packed
 
                     inserted = _insert_signals_safe(store, rows)
                     total_inserted += inserted
@@ -642,7 +865,7 @@ def main() -> None:
                         _send_telegram_if_enabled(
                             screener_name=name,
                             timeframe=interval,
-                            params=params_i,  # важно: копия с текущим interval/liq_limit
+                            params=params_i,
                             packed_rows=packed_for_telegram,
                         )
 
@@ -657,8 +880,25 @@ def main() -> None:
                         lookback = int(params_i.get("plot_lookback", 120))
                         forward_bars = int(params_i.get("plot_lookforward", 20))
 
+                        telegram_send_plots = bool(params_i.get("telegram_send_plots", False))
+                        telegram_max_plot_signals = int(params_i.get("telegram_max_plot_signals", 20))
+
+                        def _liq_sum_signal(sig) -> float:
+                            try:
+                                ctx2 = dict(sig.context or {})
+                                return abs(float(ctx2.get("liq_long_usdt") or 0)) + abs(float(ctx2.get("liq_short_usdt") or 0))
+                            except Exception:
+                                return 0.0
+
+                        sigs_for_plots = sorted(list(new_signals), key=_liq_sum_signal, reverse=True)
+
+                        if telegram_send_plots and telegram_max_plot_signals > 0:
+                            sigs_for_plots = sigs_for_plots[: max(1, telegram_max_plot_signals)]
+
                         saved = 0
-                        for s in new_signals:
+                        plot_items_for_tg: List[Tuple[str, Dict[str, Any]]] = []
+
+                        for s in sigs_for_plots:
                             try:
                                 candles = store.fetch_candles_window(
                                     exchange_id=exchange_id,
@@ -712,11 +952,25 @@ def main() -> None:
                                 saved += 1
                                 log.info("Plot saved -> %s", out_png)
 
+                                if telegram_send_plots:
+                                    key = (int(s.symbol_id), s.signal_ts)
+                                    row = packed_by_key.get(key)
+                                    if row:
+                                        plot_items_for_tg.append((str(out_png), row))
+
                             except Exception:
                                 log.exception("Plot failed for %s", s.symbol)
 
                         total_plots += saved
                         log.info("Plots saved interval=%s: %d into %s", interval, saved, plots_dir)
+
+                        if inserted > 0 and telegram_send_plots and plot_items_for_tg:
+                            _send_telegram_plots_if_enabled(
+                                screener_name=name,
+                                timeframe=interval,
+                                params=params_i,
+                                plot_items=plot_items_for_tg,
+                            )
 
             log.info("------------------------------------------------------------")
             log.info(

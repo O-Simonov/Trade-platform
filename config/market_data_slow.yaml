@@ -227,7 +227,7 @@ retention:
   log_each_cycle: true
   log_zero_deletes: true
 
-  candles_days: 90
+  candles_days: 180
   candle_intervals: ["1m", "5m", "15m", "1h", "4h", "1d"]
 
   oi_keep_days:
@@ -242,5 +242,5 @@ retention:
 
   market_state_5m_days: 30
 
-  market_trades_days: 14
+  market_trades_days: 30
   candles_trades_agg_days: 60

@@ -11,12 +11,12 @@ screeners:
       # ---------------------------
       intervals: ["15m","1h","4h","1d"]  # Временной интервал для анализа данных (например, 1h / 4h / 1d)
       min_price: 0.0000001  # Минимальная цена для символа (отсечь слишком дешёвые монеты)
-      max_price: 100000  # Максимальная цена для символа (отсечь слишком дорогие активы)
+      max_price: 1000  # Максимальная цена для символа (отсечь слишком дорогие активы)
 
       # ✅ Минимальный объем ликвидаций в anchor-свече (если меньше — сигнал игнорируется)
       # BUY: long_liq >= volume_liquid_limit
       # SELL: short_liq >= volume_liquid_limit
-      volume_liquid_limit: [3000,5000,10000,15000]
+      volume_liquid_limit: [15000,20000,30000,50000]
 
       # ✅ Доминирование ликвидаций (например 5% => 1.05 раза больше противоположных)
       # BUY: long_liq >= short_liq * (1 + liq_dominance_pct/100)
@@ -58,7 +58,7 @@ screeners:
       # ---------------------------
       # Уровни / Логика
       # ---------------------------
-      period_levels: 180  # Количество свечей для поиска уровней поддержки/сопротивления (чем больше — тем стабильнее уровни)
+      period_levels: 240  # Количество свечей для поиска уровней поддержки/сопротивления (чем больше — тем стабильнее уровни)
 
       pivot_left: 4  # Количество свечей слева от текущей свечи для определения пивота (уровня)
       pivot_right: 4  # Количество свечей справа от текущей свечи для определения пивота (уровня)
@@ -98,7 +98,7 @@ screeners:
       # Опциональные подтверждения (можно выключить полностью)
       # ---------------------------
       kof_fund: 0.0001  # Коэффициент для фильтра финансирования (используется если enable_funding=true)
-      enable_funding: false  # Включить ли проверку funding-rate
+      enable_funding: true  # Включить ли проверку funding-rate
       enable_oi: false  # Включить ли проверку open_interest
       enable_cvd: false  # Включить ли проверку CVD (Cumulative Volume Delta)
 
@@ -117,11 +117,26 @@ screeners:
       debug_top: 3  # Количество топ строк в debug (по сумме liq_long+liq_short)
 
       # ✅ TELEGRAM
-      telegram_enabled: true     # ✅ выключить -> false
-      telegram_mode: "batch"     # batch или single
-      telegram_max_signals: 200  # лимит сигналов за прогон
+      telegram_enabled: true
       telegram_timezone: "Europe/Moscow"   # можно удалить => возьмёт локальную ОС
 
-      # ✅ Внешние получатели (можно включать/выключать одной кнопкой)
-      telegram_extras_enabled: true   # ✅ выключить внешние рассылки
+      # ✅ Внешние получатели
+      telegram_extras_enabled: true
       telegram_max_friends: 2
+
+      # ❌ отдельные текстовые сообщения НЕ шлём
+      telegram_send_text: false
+
+      # ✅ шлём график + caption (одно сообщение)
+      telegram_send_plots: true
+      telegram_plot_mode: "photo"
+      telegram_max_plot_signals: 50
+
+      # ❌ если в коде включали "второе сообщение после фото" — выключаем
+      telegram_send_plot_followup_text: false
+
+      # (опционально) ограничить генерацию графиков
+      plot_max_signals: 50
+
+
+

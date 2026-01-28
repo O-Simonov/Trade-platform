@@ -228,6 +228,136 @@ def send_telegram_message(
         return False
 
 
+# -------------------------
+# send media (photo/document)
+# -------------------------
+def _truncate_caption(text: str, max_len: int = 1024) -> str:
+    s = (text or "").strip()
+    if not s:
+        return ""
+    return s if len(s) <= max_len else (s[: max_len - 1] + "…")
+
+
+def send_telegram_photo(
+    photo_path: str,
+    *,
+    caption: str = "",
+    target: Optional[TelegramTarget] = None,
+    bot_token: Optional[str] = None,
+    chat_id: Optional[str] = None,
+    disable_notification: bool = False,
+) -> bool:
+    """
+    Отправляет PNG/JPG как фото в Telegram (sendPhoto).
+    photo_path: путь к файлу на диске.
+    """
+    photo_path = str(photo_path or "").strip()
+    if not photo_path or (not os.path.exists(photo_path)):
+        log.warning("Telegram photo not found: %s", photo_path)
+        return False
+
+    if target is None:
+        if bot_token and chat_id:
+            target = TelegramTarget(name="inline", bot_token=str(bot_token), chat_id=str(chat_id))
+        else:
+            token = _env("TELEGRAM_BOT_TOKEN")
+            cid = _env("TELEGRAM_CHAT_ID")
+            if token and cid:
+                target = TelegramTarget(name="primary", bot_token=token, chat_id=cid)
+
+    if target is None:
+        log.warning("Telegram target not configured (missing token/chat_id)")
+        return False
+
+    url = f"https://api.telegram.org/bot{target.bot_token}/sendPhoto"
+    data = {
+        "chat_id": target.chat_id,
+        "caption": _truncate_caption(caption),
+        "disable_notification": bool(disable_notification),
+    }
+
+    try:
+        with open(photo_path, "rb") as f:
+            files = {"photo": f}
+            r = requests.post(url, data=data, files=files, timeout=30)
+
+        if r.status_code != 200:
+            log.error("Telegram sendPhoto failed: %s %s", r.status_code, r.text[:300])
+            return False
+        return True
+    except Exception:
+        log.exception("Telegram sendPhoto exception")
+        return False
+
+
+def send_telegram_document(
+    file_path: str,
+    *,
+    caption: str = "",
+    target: Optional[TelegramTarget] = None,
+    bot_token: Optional[str] = None,
+    chat_id: Optional[str] = None,
+    disable_notification: bool = False,
+) -> bool:
+    """
+    Отправляет файл как документ в Telegram (sendDocument).
+    Полезно, если PNG слишком большой или нужно сохранить «как файл».
+    """
+    file_path = str(file_path or "").strip()
+    if not file_path or (not os.path.exists(file_path)):
+        log.warning("Telegram document not found: %s", file_path)
+        return False
+
+    if target is None:
+        if bot_token and chat_id:
+            target = TelegramTarget(name="inline", bot_token=str(bot_token), chat_id=str(chat_id))
+        else:
+            token = _env("TELEGRAM_BOT_TOKEN")
+            cid = _env("TELEGRAM_CHAT_ID")
+            if token and cid:
+                target = TelegramTarget(name="primary", bot_token=token, chat_id=cid)
+
+    if target is None:
+        log.warning("Telegram target not configured (missing token/chat_id)")
+        return False
+
+    url = f"https://api.telegram.org/bot{target.bot_token}/sendDocument"
+    data = {
+        "chat_id": target.chat_id,
+        "caption": _truncate_caption(caption),
+        "disable_notification": bool(disable_notification),
+    }
+
+    try:
+        with open(file_path, "rb") as f:
+            files = {"document": f}
+            r = requests.post(url, data=data, files=files, timeout=60)
+
+        if r.status_code != 200:
+            log.error("Telegram sendDocument failed: %s %s", r.status_code, r.text[:300])
+            return False
+        return True
+    except Exception:
+        log.exception("Telegram sendDocument exception")
+        return False
+
+
+def broadcast_telegram_photo(photo_path: str, *, caption: str = "", targets: List[TelegramTarget]) -> int:
+    ok = 0
+    for t in targets:
+        if send_telegram_photo(photo_path, caption=caption, target=t):
+            ok += 1
+    return ok
+
+
+def broadcast_telegram_document(file_path: str, *, caption: str = "", targets: List[TelegramTarget]) -> int:
+    ok = 0
+    for t in targets:
+        if send_telegram_document(file_path, caption=caption, target=t):
+            ok += 1
+    return ok
+
+
 def broadcast_telegram_message(text: str, *, targets: List[TelegramTarget]) -> int:
     """
     Рассылает одно сообщение в несколько получателей.

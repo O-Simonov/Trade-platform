@@ -303,6 +303,8 @@ def save_signal_plot(
     liquidation_series: Optional[Sequence[Dict[str, Any]]] = None,
     liq_short_usdt: Optional[float] = None,
     liq_long_usdt: Optional[float] = None,
+    funding_series: Optional[Sequence[Dict[str, Any]]] = None,
+    funding_rate: Optional[float] = None,
     level_zone_pct: float = 0.003,  # 0.3%
     **_: Any,
 ) -> None:
@@ -349,7 +351,7 @@ def save_signal_plot(
     fig = Figure(figsize=(14, 9.5), dpi=110)
     _ = FigureCanvas(fig)
 
-    ax_price, ax_vol, ax_liq = fig.subplots(3, 1, sharex=True, height_ratios=[3.2, 1.0, 1.6])
+    ax_price, ax_vol, ax_liq = fig.subplots(3, 1, sharex=True, height_ratios=[3.1, 1.0, 1.6])
 
     # =========================================================
     # PRICE (Candles)

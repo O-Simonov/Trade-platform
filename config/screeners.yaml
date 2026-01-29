@@ -16,7 +16,7 @@ screeners:
       # ✅ Минимальный объем ликвидаций в anchor-свече (если меньше — сигнал игнорируется)
       # BUY: long_liq >= volume_liquid_limit
       # SELL: short_liq >= volume_liquid_limit
-      volume_liquid_limit: [15000,20000,30000,50000]
+      volume_liquid_limit: [10000,20000,30000,50000]
 
       # ✅ Доминирование ликвидаций (например 5% => 1.05 раза больше противоположных)
       # BUY: long_liq >= short_liq * (1 + liq_dominance_pct/100)
@@ -97,8 +97,8 @@ screeners:
       # ---------------------------
       # Опциональные подтверждения (можно выключить полностью)
       # ---------------------------
-      kof_fund: 0.0001  # Коэффициент для фильтра финансирования (используется если enable_funding=true)
-      enable_funding: true  # Включить ли проверку funding-rate
+      enable_funding: true
+      kof_fund: 0.005   # порог 0.005%  -> thr=0.00005
       enable_oi: false  # Включить ли проверку open_interest
       enable_cvd: false  # Включить ли проверку CVD (Cumulative Volume Delta)
 

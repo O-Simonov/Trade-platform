@@ -58,15 +58,95 @@ def _classify_http_error(exc: Exception) -> Optional[int]:
 
 def _normalize_funding_time(dt: Optional[datetime]) -> Optional[datetime]:
     """
-    ✅ ВАЖНО: Binance funding time по сути дискретен (обычно граница часа/8ч),
+    ✅ ВАЖНО: Binance funding time дискретен (обычно 00/08/16 UTC),
     а WS иногда приходит с микро/миллисекундами.
-    Нормализуем до начала часа, чтобы:
-      - REST и WS попадали в один и тот же PK funding_time
-      - WS делал UPDATE одной записи, а не плодил "почти одинаковые" времена
+    Нормализуем до начала часа, чтобы REST и WS попадали в один и тот же PK.
     """
     if dt is None:
         return None
     return dt.replace(minute=0, second=0, microsecond=0)
+
+
+# -------------------------
+# DB upsert (hard-safe)
+# -------------------------
+
+def _upsert_funding_rows(*, storage, rows: List[dict]) -> int:
+    """
+    Жёстко гарантируем UPSERT, чтобы:
+      - не плодились дубли
+      - при уникальном индексе не было падений
+    Сначала пробуем storage.upsert_funding(rows). Если он отсутствует/падает,
+    делаем прямой SQL UPSERT через storage.pool.
+
+    Поддерживаем 2 схемы:
+      A) (exchange_id, symbol_id, funding_time, funding_rate, mark_price, source)
+      B) минимальная (exchange_id, symbol_id, funding_time, funding_rate)
+    """
+    if not rows:
+        return 0
+
+    fn = getattr(storage, "upsert_funding", None)
+    if callable(fn):
+        try:
+            n = fn(rows)
+            return int(n or 0)
+        except Exception as e:
+            logger.warning("[Funding] storage.upsert_funding failed -> fallback SQL UPSERT (%s)", e, exc_info=True)
+
+    pool = getattr(storage, "pool", None)
+    if pool is None:
+        raise RuntimeError("[Funding] storage.pool not found for SQL UPSERT fallback")
+
+    params_full: List[Tuple[Any, ...]] = []
+    params_min: List[Tuple[Any, ...]] = []
+    for r in rows:
+        params_full.append((
+            int(r.get("exchange_id")),
+            int(r.get("symbol_id")),
+            r.get("funding_time"),
+            _safe_float(r.get("funding_rate"), 0.0),
+            (None if r.get("mark_price") is None else _safe_float(r.get("mark_price"), 0.0)),
+            str(r.get("source") or ""),
+        ))
+        params_min.append((
+            int(r.get("exchange_id")),
+            int(r.get("symbol_id")),
+            r.get("funding_time"),
+            _safe_float(r.get("funding_rate"), 0.0),
+        ))
+
+    sql_full = """
+    INSERT INTO public.funding (exchange_id, symbol_id, funding_time, funding_rate, mark_price, source)
+    VALUES (%s, %s, %s, %s, %s, %s)
+    ON CONFLICT (exchange_id, symbol_id, funding_time)
+    DO UPDATE SET
+        funding_rate = EXCLUDED.funding_rate,
+        mark_price = COALESCE(EXCLUDED.mark_price, public.funding.mark_price),
+        source = EXCLUDED.source
+    """
+
+    sql_min = """
+    INSERT INTO public.funding (exchange_id, symbol_id, funding_time, funding_rate)
+    VALUES (%s, %s, %s, %s)
+    ON CONFLICT (exchange_id, symbol_id, funding_time)
+    DO UPDATE SET
+        funding_rate = EXCLUDED.funding_rate
+    """
+
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            try:
+                cur.executemany(sql_full, params_full)
+            except Exception:
+                # если таблица не имеет mark_price/source — упадём сюда и вставим минимально
+                cur.executemany(sql_min, params_min)
+        try:
+            conn.commit()
+        except Exception:
+            pass
+
+    return len(rows)
 
 
 # -------------------------
@@ -90,7 +170,7 @@ def _load_watermarks_from_db(*, storage, exchange_id: int) -> Dict[int, datetime
                 cur.execute(
                     """
                     SELECT symbol_id, MAX(funding_time) AS last_ts
-                    FROM funding
+                    FROM public.funding
                     WHERE exchange_id = %s
                     GROUP BY symbol_id
                     """,
@@ -100,7 +180,6 @@ def _load_watermarks_from_db(*, storage, exchange_id: int) -> Dict[int, datetime
                 for sid, last_ts in rows:
                     if sid is None or last_ts is None:
                         continue
-                    # ✅ водяной знак тоже нормализуем, чтобы overlap работал ровно
                     wm[int(sid)] = _normalize_funding_time(last_ts) or last_ts
     except Exception:
         logger.exception("[Funding] failed to load watermarks from DB")
@@ -178,16 +257,15 @@ def _parse_ws_mark_price_update(
     Binance USD-M Futures markPriceUpdate event:
       {
         "e": "markPriceUpdate",
-        "E": 1562305380000,
+        "E": ...,
         "s": "BTCUSDT",
-        "p": "11185.87786614",   # mark price
-        "r": "0.00030000",       # funding rate
-        "T": 1562306400000       # next funding time
+        "p": "...",   # mark price
+        "r": "...",   # funding rate
+        "T": ...      # next funding time
       }
 
-    Мы пишем funding_time = nextFundingTime (T).
-    Это будущая точка funding, которая обновляется до момента списания.
-    UPSERT будет обновлять rate/mark_price на одной и той же funding_time.
+    Мы пишем funding_time = nextFundingTime (T) — будущая точка.
+    UPSERT будет обновлять rate/mark_price по одному ключу.
     """
     if not isinstance(msg, dict):
         return None
@@ -246,9 +324,6 @@ def _run_funding_history_paged(
 ) -> Tuple[int, Optional[datetime]]:
     """
     Надёжная догрузка fundingRate history с пагинацией.
-
-    Binance обычно отдаёт максимум limit (<=1000).
-    Поэтому если диапазон большой — делаем paging.
     """
     limit = max(1, min(int(limit), 1000))
     max_pages = max(1, int(max_pages))
@@ -258,7 +333,6 @@ def _run_funding_history_paged(
     best_total: Optional[datetime] = None
     last_progress: Optional[datetime] = None
 
-    # защитимся от неверного окна
     if start_dt >= end_dt:
         return 0, None
 
@@ -291,15 +365,14 @@ def _run_funding_history_paged(
         if not rows:
             break
 
-        n = int(storage.upsert_funding(rows) or 0)
-        total_upserts += n
+        n = _upsert_funding_rows(storage=storage, rows=rows)
+        total_upserts += int(n or 0)
 
         best = _max_funding_time(rows)
         if best is not None:
             if best_total is None or best > best_total:
                 best_total = best
 
-        # guard against infinite loop
         if last_progress is not None and best is not None and best <= last_progress:
             logger.warning(
                 "[Funding][%s] pagination stalled (best=%s <= last=%s) -> stop paging",
@@ -311,11 +384,9 @@ def _run_funding_history_paged(
         if best is not None:
             last_progress = best
 
-        # last page is not full -> no more in range
         if len(rows) < limit:
             break
 
-        # move window forward
         if best is None:
             break
         start_dt = best + timedelta(milliseconds=1)
@@ -329,7 +400,7 @@ def _run_funding_history_paged(
 
 
 # -------------------------
-# BACKFILL on start (SMART: up to backfill_days, not always full)
+# BACKFILL on start (SMART)
 # -------------------------
 
 def _run_backfill_all_symbols(
@@ -348,11 +419,6 @@ def _run_backfill_all_symbols(
     cooldown_until: Dict[str, datetime],
     stop_event: threading.Event,
 ) -> None:
-    """
-    Умный backfill:
-      - если по symbol данных нет -> качаем window [now-backfill_days .. now]
-      - если есть watermark -> качаем только хвост max(now-backfill_days, watermark-overlap_hours)
-    """
     if backfill_days <= 0:
         logger.info("[Funding][Backfill] backfill_days<=0 -> skip")
         return
@@ -447,20 +513,12 @@ def start_funding_ws_collector(
     symbol_ids: Dict[str, int],
     stop_event: threading.Event,
 ) -> BinanceWS:
-    """
-    WS funding updates через !markPrice@arr (все символы одним потоком).
-    Требует улучшенный ws.py (payload может быть list).
-
-    ✅ Добавлена поддержка combined stream формата:
-      {"stream": "...", "data": [...]}
-    """
     url = WS_STREAM_BASE + "!markPrice@arr"
 
     def _on_message(payload: Any) -> None:
         if stop_event.is_set():
             return
 
-        # combined stream wrapper: {"data":[...]}
         if isinstance(payload, dict) and isinstance(payload.get("data"), list):
             payload2 = payload.get("data")
         else:
@@ -491,7 +549,7 @@ def start_funding_ws_collector(
 
         if rows:
             try:
-                storage.upsert_funding(rows)
+                _upsert_funding_rows(storage=storage, rows=rows)
             except Exception:
                 logger.exception("[Funding][WS] upsert failed rows=%d", len(rows))
 
@@ -530,40 +588,28 @@ def run_funding_collector(
     cfg: dict,
     stop_event: threading.Event,
 ) -> None:
-    """
-    Funding collector:
-      ✅ REST backfill history (на backfill_days, умно)
-      ✅ WS live updates (!markPrice@arr)
-      ✅ REST safety loop (страховка, закрывает дыры)
-    """
     cfg = cfg or {}
 
     if not bool(cfg.get("enabled", True)):
         logger.info("[Funding] disabled by config")
         return
 
-    # --- режимы ---
     use_ws = bool(cfg.get("use_ws", True))
     rest_safety_poll = bool(cfg.get("rest_safety_poll", True))
 
-    # --- backfill ---
     backfill_on_start = bool(cfg.get("backfill_on_start", True))
     backfill_days = max(0, int(cfg.get("backfill_days", 10)))
 
-    # --- polling REST safety ---
-    poll_sec = max(30.0, float(cfg.get("poll_sec", 1800.0)))  # 30 мин дефолт
+    poll_sec = max(30.0, float(cfg.get("poll_sec", 1800.0)))
     symbols_per_cycle = max(1, int(cfg.get("symbols_per_cycle", 20)))
     req_sleep_sec = max(0.0, float(cfg.get("req_sleep_sec", 0.20)))
 
-    # --- paging ---
     limit = max(1, min(int(cfg.get("limit", 1000)), 1000))
     max_pages = max(1, int(cfg.get("max_pages", 50)))
     page_sleep_sec = max(0.0, float(cfg.get("page_sleep_sec", 0.0)))
 
-    # --- overlap to close holes ---
     overlap_hours = max(0, int(cfg.get("overlap_hours", 72)))
 
-    # symbols
     symbols = sorted(
         (
             (str(sym).upper().strip(), int(sid))
@@ -590,15 +636,11 @@ def run_funding_collector(
         overlap_hours,
     )
 
-    # watermarks + cooldowns
     watermarks = _load_watermarks_from_db(storage=storage, exchange_id=int(exchange_id))
     logger.info("[Funding] loaded watermarks from DB: %d", len(watermarks))
 
     cooldown_until: Dict[str, datetime] = {}
 
-    # -------------------------
-    # REST Backfill on start (SMART, bounded by backfill_days)
-    # -------------------------
     if backfill_on_start and backfill_days > 0 and total > 0:
         _run_backfill_all_symbols(
             storage=storage,
@@ -616,9 +658,6 @@ def run_funding_collector(
             stop_event=stop_event,
         )
 
-    # -------------------------
-    # WS Live updates
-    # -------------------------
     ws_client: Optional[BinanceWS] = None
     if use_ws and total > 0:
         ws_client = start_funding_ws_collector(
@@ -628,9 +667,6 @@ def run_funding_collector(
             stop_event=stop_event,
         )
 
-    # -------------------------
-    # REST safety loop (страховка)
-    # -------------------------
     if not rest_safety_poll:
         logger.info("[Funding] REST safety poll disabled -> WS only mode")
         while not stop_event.is_set():
@@ -670,7 +706,6 @@ def run_funding_collector(
                 if last_dt is None:
                     start_dt = min_dt
                 else:
-                    # ✅ clamp by backfill_days (не качаем дальше чем backfill_days назад)
                     start_dt = max(min_dt, last_dt - timedelta(hours=int(overlap_hours)))
 
                 if start_dt >= now:

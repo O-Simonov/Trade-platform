@@ -13,6 +13,7 @@ from psycopg.types.json import Jsonb
 from psycopg import sql as _sql
 from psycopg_pool import ConnectionPool
 
+
 logger = logging.getLogger(__name__)
 log = logging.getLogger("storage.sql")
 
@@ -2466,8 +2467,62 @@ class PostgreSQLStorage:
     # FUNDING / OPEN INTEREST / TICKER_24H
     # ======================================================================
 
+    @staticmethod
+    def _normalize_funding_time(dt: Any) -> Any:
+        """
+        Binance funding time дискретен (обычно 00/08/16 UTC).
+        Приводим к началу часа, чтобы не плодить "почти одинаковые" ключи.
+        """
+        if dt is None:
+            return None
+        if isinstance(dt, datetime):
+            # в UTC
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            else:
+                dt = dt.astimezone(timezone.utc)
+            return dt.replace(minute=0, second=0, microsecond=0)
+        return dt
+
     def upsert_funding(self, rows: list[dict]) -> int:
         if not rows:
+            return 0
+
+        # ✅ safety-normalize input rows
+        prepared: list[dict] = []
+        for r in rows:
+            d = dict(r or {})
+            d["exchange_id"] = int(d.get("exchange_id") or 0)
+            d["symbol_id"] = int(d.get("symbol_id") or 0)
+
+            ft = d.get("funding_time")
+            ft = self._normalize_funding_time(ft)
+            if ft is None:
+                continue
+            d["funding_time"] = ft
+
+            # числа
+            if d.get("funding_rate") is not None:
+                try:
+                    d["funding_rate"] = float(d["funding_rate"])
+                except Exception:
+                    d["funding_rate"] = 0.0
+            else:
+                d["funding_rate"] = 0.0
+
+            if d.get("mark_price") is not None:
+                try:
+                    d["mark_price"] = float(d["mark_price"])
+                except Exception:
+                    d["mark_price"] = None
+            else:
+                d["mark_price"] = None
+
+            d["source"] = str(d.get("source") or "unknown")
+
+            prepared.append(d)
+
+        if not prepared:
             return 0
 
         query = """
@@ -2482,15 +2537,247 @@ class PostgreSQLStorage:
             ON CONFLICT (exchange_id, symbol_id, funding_time)
             DO UPDATE SET
                 funding_rate = EXCLUDED.funding_rate,
-                mark_price   = EXCLUDED.mark_price,
-                source       = EXCLUDED.source
+                mark_price   = COALESCE(EXCLUDED.mark_price, funding.mark_price),
+                source       = COALESCE(NULLIF(EXCLUDED.source, ''), funding.source)
         """
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
-                cur.executemany(query, rows)
+                cur.executemany(query, prepared)
                 n = cur.rowcount
             conn.commit()
-        return int(n or 0)
+
+        return int(n if n is not None and n >= 0 else len(prepared))
+
+    def get_next_funding_eta(self, *, exchange_id: int, symbol_id: int) -> dict:
+        """
+        Возвращает ближайший будущий funding_time и сколько осталось до начисления.
+        Если будущего funding_time в таблице нет — рассчитывает по расписанию 00/08/16 UTC.
+        """
+        exchange_id = int(exchange_id)
+        symbol_id = int(symbol_id)
+        now = _utcnow()
+
+        # 1) пробуем взять из БД (если WS пишет будущую точку funding_time)
+        q = """
+            SELECT funding_time, funding_rate, mark_price, source
+            FROM funding
+            WHERE exchange_id = %s
+              AND symbol_id = %s
+              AND funding_time > NOW()
+            ORDER BY funding_time ASC
+            LIMIT 1
+        """
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(q, (exchange_id, symbol_id))
+                row = cur.fetchone()
+
+        if row:
+            next_ft, rate, mp, src = row
+            next_ft = self._normalize_funding_time(next_ft)
+        else:
+            # 2) fallback: Binance USD-M funding обычно каждые 8 часов: 00:00 / 08:00 / 16:00 UTC
+            h = now.hour
+            next_h = ((h // 8) + 1) * 8
+            if next_h >= 24:
+                next_ft = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+            else:
+                next_ft = now.replace(hour=next_h, minute=0, second=0, microsecond=0)
+            rate, mp, src = None, None, "schedule_fallback"
+
+        eta = next_ft - now
+        eta_sec = int(eta.total_seconds())
+
+        def _fmt(sec: int) -> str:
+            if sec < 0:
+                sec = 0
+            m, s = divmod(sec, 60)
+            h, m = divmod(m, 60)
+            d, h = divmod(h, 24)
+            if d > 0:
+                return f"{d}d {h:02d}:{m:02d}:{s:02d}"
+            return f"{h:02d}:{m:02d}:{s:02d}"
+
+        return {
+            "now_utc": now,
+            "next_funding_time": next_ft,
+            "eta_sec": eta_sec,
+            "eta_str": _fmt(eta_sec),
+            "funding_rate": (float(rate) if rate is not None else None),
+            "mark_price": (float(mp) if mp is not None else None),
+            "source": src,
+        }
+
+
+    def fetch_next_funding_bulk(
+            self,
+            *,
+            exchange_id: int,
+            symbol_ids: list[int],
+            as_of: datetime | None = None,
+    ) -> dict[int, dict]:
+        """
+        Возвращает по каждому symbol_id:
+          funding_time (NEXT, строго > as_of; если в БД future нет — вычисляем),
+          funding_rate (если future нет — берём последний известный),
+          mark_price,
+          is_next=True,
+          funding_interval_hours (4/8/...), is_estimated (если вычислено).
+
+        out: {sid: {"funding_time": dt, "funding_rate": float|None, "mark_price": float|None,
+                    "is_next": bool, "funding_interval_hours": int|None, "is_estimated": bool}}
+        """
+        symbol_ids = [int(x) for x in (symbol_ids or []) if x is not None]
+        if not symbol_ids:
+            return {}
+
+        if as_of is None:
+            as_of = _utcnow()
+        as_of = _utc(as_of)
+
+        def _infer_interval_hours(last_t: Optional[datetime], prev_t: Optional[datetime]) -> int:
+            # 1) по разнице двух последних
+            if isinstance(last_t, datetime) and isinstance(prev_t, datetime):
+                dh = (last_t - prev_t).total_seconds() / 3600.0
+                dh_r = int(round(dh))
+                if dh_r in (1, 2, 4, 8, 12, 24):
+                    return dh_r
+
+            # 2) по “сетке часов” как fallback
+            if isinstance(last_t, datetime):
+                h = int(last_t.hour)
+                if h in (0, 8, 16):
+                    return 8
+                if h in (0, 4, 8, 12, 16, 20):
+                    return 4
+
+            return 8  # дефолт
+
+        def _calc_next_time(last_t: datetime, now_t: datetime, interval_h: int) -> datetime:
+            step = timedelta(hours=int(interval_h))
+            # хотим строго > now_t, чтобы не было "next in 0s"
+            # (и чтобы не зависеть от миллисекунд)
+            if last_t > now_t:
+                nxt = last_t
+            else:
+                delta_s = (now_t - last_t).total_seconds()
+                step_s = step.total_seconds()
+                k = int(delta_s // step_s) + 1
+                nxt = last_t + k * step
+
+            # защита: если получилось почти "сейчас" — сдвинем на шаг
+            if (nxt - now_t).total_seconds() <= 1.0:
+                nxt = nxt + step
+            return nxt
+
+        sql = """
+              WITH next_row AS (SELECT DISTINCT \
+              ON (symbol_id)
+                  symbol_id, funding_time, funding_rate, mark_price
+              FROM funding
+              WHERE exchange_id = %s
+                AND symbol_id = ANY (%s)
+                AND funding_time \
+                  > %s
+              ORDER BY symbol_id, funding_time ASC
+                  ),
+                  hist AS (
+              SELECT
+                  symbol_id, funding_time, funding_rate, mark_price, LAG(funding_time) OVER (PARTITION BY symbol_id ORDER BY funding_time ASC) AS prev_time
+              FROM funding
+              WHERE exchange_id = %s
+                AND symbol_id = ANY (%s)
+                AND funding_time <= %s
+                  ) \
+                  , last_row AS (
+              SELECT DISTINCT \
+              ON (symbol_id)
+                  symbol_id,
+                  funding_time AS last_time,
+                  prev_time,
+                  funding_rate AS last_rate,
+                  mark_price AS last_mark
+              FROM hist
+              ORDER BY symbol_id, funding_time DESC
+                  )
+              SELECT COALESCE(n.symbol_id, l.symbol_id) AS symbol_id, \
+
+                     n.funding_time                     AS next_time, \
+                     n.funding_rate                     AS next_rate, \
+                     n.mark_price                       AS next_mark, \
+
+                     l.last_time, \
+                     l.prev_time, \
+                     l.last_rate, \
+                     l.last_mark
+              FROM last_row l
+                       FULL OUTER JOIN next_row n USING (symbol_id) \
+              """
+
+        out: dict[int, dict] = {}
+
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    sql,
+                    (int(exchange_id), symbol_ids, as_of, int(exchange_id), symbol_ids, as_of),
+                )
+                for row in (cur.fetchall() or []):
+                    (
+                        sid,
+                        next_time, next_rate, next_mark,
+                        last_time, prev_time, last_rate, last_mark
+                    ) = row
+
+                    if sid is None:
+                        continue
+
+                    sid = int(sid)
+
+                    # нормализуем tz
+                    next_time = _utc(next_time) if isinstance(next_time, datetime) else None
+                    last_time = _utc(last_time) if isinstance(last_time, datetime) else None
+                    prev_time = _utc(prev_time) if isinstance(prev_time, datetime) else None
+
+                    if isinstance(next_time, datetime):
+                        # future реально есть в БД
+                        interval_h = _infer_interval_hours(last_time, prev_time)
+                        out[sid] = {
+                            "funding_time": next_time,
+                            "funding_rate": float(next_rate) if next_rate is not None else None,
+                            "mark_price": float(next_mark) if next_mark is not None else None,
+                            "is_next": True,
+                            "funding_interval_hours": int(interval_h),
+                            "is_estimated": False,
+                        }
+                        continue
+
+                    if isinstance(last_time, datetime):
+                        # future нет -> вычисляем NEXT
+                        interval_h = _infer_interval_hours(last_time, prev_time)
+                        computed_next = _calc_next_time(last_time, as_of, interval_h)
+
+                        out[sid] = {
+                            "funding_time": computed_next,
+                            "funding_rate": float(last_rate) if last_rate is not None else None,  # последний известный
+                            "mark_price": float(last_mark) if last_mark is not None else None,
+                            "is_next": True,  # важное: теперь это "next" (пусть вычисленное)
+                            "funding_interval_hours": int(interval_h),
+                            "is_estimated": True,
+                        }
+                        continue
+
+                    # вообще нет данных по символу
+                    out[sid] = {
+                        "funding_time": None,
+                        "funding_rate": None,
+                        "mark_price": None,
+                        "is_next": False,
+                        "funding_interval_hours": None,
+                        "is_estimated": False,
+                    }
+
+        return out
 
     def upsert_open_interest(self, rows: list[dict]) -> int:
         if not rows:

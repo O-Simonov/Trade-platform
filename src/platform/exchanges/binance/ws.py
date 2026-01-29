@@ -1,7 +1,7 @@
 # src/platform/exchanges/binance/ws.py
 from __future__ import annotations
 
-import time
+import json
 import random
 import threading
 import logging
@@ -11,7 +11,6 @@ import websocket  # websocket-client
 
 log = logging.getLogger("binance.ws")
 
-# ✅ НУЖНЫЕ КОНСТАНТЫ (их ждут collector'ы)
 WS_STREAM_BASE = "wss://fstream.binance.com/stream?streams="
 WS_WS_BASE = "wss://fstream.binance.com/ws/"
 
@@ -19,11 +18,12 @@ WS_WS_BASE = "wss://fstream.binance.com/ws/"
 class BinanceWS:
     """
     Надёжный WS:
-    ✅ 1 поток на соединение (без утечки)
+    ✅ 1 поток на соединение
     ✅ reconnect внутри потока
     ✅ backoff + jitter
     ✅ ping_interval / ping_timeout
-    ✅ stop() прерывает sleep (мгновенная остановка)
+    ✅ stop() прерывает sleep
+    ✅ JSON decode (dict/list) для on_message
     """
 
     def __init__(
@@ -31,13 +31,14 @@ class BinanceWS:
         *,
         name: str,
         url: str,
-        on_message: Callable[[str], None],
+        on_message: Callable[[Any], None],
         on_open: Optional[Callable[[], None]] = None,
         on_close: Optional[Callable[[], None]] = None,
         ping_interval: int = 30,
         ping_timeout: int = 20,
         reconnect_min_delay: float = 1.0,
         reconnect_max_delay: float = 30.0,
+        parse_json: bool = True,
     ):
         self.name = str(name)
         self.url = str(url)
@@ -52,11 +53,12 @@ class BinanceWS:
         self.reconnect_min_delay = max(0.2, float(reconnect_min_delay))
         self.reconnect_max_delay = max(self.reconnect_min_delay, float(reconnect_max_delay))
 
+        self.parse_json = bool(parse_json)
+
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._ws: Optional[websocket.WebSocketApp] = None
 
-        # ✅ чтобы backoff можно было сбрасывать после успешного on_open
         self._opened_once = False
         self._opened_lock = threading.Lock()
 
@@ -64,18 +66,13 @@ class BinanceWS:
         if self._thread and self._thread.is_alive():
             return
         self._stop.clear()
-        self._thread = threading.Thread(
-            target=self._run_loop,
-            name=self.name,
-            daemon=True,
-        )
+        self._thread = threading.Thread(target=self._run_loop, name=self.name, daemon=True)
         self._thread.start()
 
     def stop(self) -> None:
         self._stop.set()
         try:
             if self._ws:
-                # мягкое завершение run_forever
                 self._ws.keep_running = False
                 self._ws.close()
         except Exception:
@@ -86,7 +83,6 @@ class BinanceWS:
 
         while not self._stop.is_set():
             try:
-                # перед стартом нового run_forever
                 with self._opened_lock:
                     self._opened_once = False
 
@@ -98,7 +94,6 @@ class BinanceWS:
                     on_close=self._on_close,
                 )
 
-                # run_forever блокирует поток (это нормально)
                 self._ws.run_forever(
                     ping_interval=self.ping_interval,
                     ping_timeout=self.ping_timeout,
@@ -109,23 +104,19 @@ class BinanceWS:
             except Exception:
                 log.exception("[%s] WS LOOP EXCEPTION", self.name)
 
-            # если stop -> выходим
             if self._stop.is_set():
                 break
 
-            # ✅ если подключение успело открыться — backoff можно сбросить
             with self._opened_lock:
                 opened = self._opened_once
             if opened:
                 delay = self.reconnect_min_delay
 
-            # backoff + jitter
             jitter = random.uniform(0.0, 0.35)
             sleep_s = min(self.reconnect_max_delay, delay) * (1.0 + jitter)
 
             log.warning("[%s] reconnect in %.2fs ...", self.name, sleep_s)
 
-            # ✅ важно: стоп прерывает сон
             if self._stop.wait(sleep_s):
                 break
 
@@ -142,9 +133,15 @@ class BinanceWS:
             log.exception("[%s] on_open callback failed", self.name)
 
     def _on_message(self, ws, message: str) -> None:
-        # ❗️ ДОЛЖНО БЫТЬ МАКСИМАЛЬНО БЫСТРО
+        payload: Any = message
+        if self.parse_json:
+            try:
+                payload = json.loads(message)
+            except Exception:
+                payload = message  # fallback
+
         try:
-            self._on_message_cb(message)
+            self._on_message_cb(payload)
         except Exception:
             log.exception("[%s] on_message callback failed", self.name)
 

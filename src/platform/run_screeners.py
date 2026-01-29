@@ -5,8 +5,9 @@ import os
 import time
 import logging
 from pathlib import Path
-from datetime import datetime, timezone, date
 from typing import Any, Dict, List, Tuple, Set, Optional
+from datetime import datetime, timezone, date
+
 
 import yaml
 from psycopg.errors import UniqueViolation
@@ -207,6 +208,43 @@ def _fmt_pct(x: Any) -> str:
         return "—"
 
 
+def _fmt_funding_pct(x: Any) -> str:
+    """
+    Funding очень маленький, показываем аккуратнее (до 6 знаков).
+    Пример: 0.00383%
+    """
+    try:
+        if x is None:
+            return "—"
+        v = float(x)
+        s = f"{v:.6f}".rstrip("0").rstrip(".")
+        return s if s else str(v)
+    except Exception:
+        return "—"
+
+
+def _fmt_time_left_seconds(x: Any) -> str:
+    """
+    x: seconds (float/int). Возвращает: "2h 15m 03s" или "—"
+    """
+    try:
+        if x is None:
+            return "—"
+        sec = int(round(float(x)))
+        if sec < 0:
+            sec = 0
+        h = sec // 3600
+        m = (sec % 3600) // 60
+        s = sec % 60
+        if h > 0:
+            return f"{h}h {m:02d}m {s:02d}s"
+        if m > 0:
+            return f"{m}m {s:02d}s"
+        return f"{s}s"
+    except Exception:
+        return "—"
+
+
 def _to_local(dt_utc: datetime, tz_name: Optional[str]) -> datetime:
     if dt_utc.tzinfo is None:
         dt_utc = dt_utc.replace(tzinfo=timezone.utc)
@@ -257,6 +295,15 @@ def _build_telegram_batch_message(
         qty = _fmt_qty(r.get("position_qty"))
         notional = _fmt_usdt_int(r.get("position_notional_usdt"))
 
+        # ✅ funding
+        funding_pct = _fmt_funding_pct(r.get("funding_pct"))
+        funding_left = _fmt_time_left_seconds(r.get("funding_time_left_sec"))
+        ft = r.get("funding_time")
+        if isinstance(ft, datetime):
+            funding_time_local = _fmt_local_ts(ft, tz_name)
+        else:
+            funding_time_local = str(ft or "—")
+
         ts = r.get("signal_ts")
         if isinstance(ts, str):
             ts_local = ts
@@ -269,6 +316,7 @@ def _build_telegram_batch_message(
         out.append(f"   🎯 SL {sl} ({sl_pct}%) | TP {tp} ({tp_pct}%)")
         out.append(f"   💥 SHORT {liq_s} USDT | LONG {liq_l} USDT")
         out.append(f"   💰 Risk {risk_usdt} USDT ({risk_pct}%) | Qty {qty} | Notional {notional} USDT")
+        out.append(f"   💸 Funding {funding_pct}% | next in {funding_left} | {funding_time_local}")
         out.append(f"   ⏱️ {ts_local} | TF {timeframe} | 🧾 #{day_seq}")
         out.append("")
 
@@ -461,6 +509,15 @@ def _build_telegram_plot_caption(
     qty = _fmt_qty(row.get("position_qty"))
     notional = _fmt_usdt_int(row.get("position_notional_usdt"))
 
+    # ✅ funding
+    funding_pct = _fmt_funding_pct(row.get("funding_pct"))
+    funding_left = _fmt_time_left_seconds(row.get("funding_time_left_sec"))
+    ft = row.get("funding_time")
+    if isinstance(ft, datetime):
+        funding_time_local = _fmt_local_ts(ft, tz_name)
+    else:
+        funding_time_local = str(ft or "—")
+
     ts = row.get("signal_ts")
     if isinstance(ts, datetime):
         ts_local = _fmt_local_ts(ts, tz_name)
@@ -472,10 +529,10 @@ def _build_telegram_plot_caption(
         f"Entry {entry} | SL {sl} ({sl_pct}%) | TP {tp} ({tp_pct}%)",
         f"💥 ΣLiq {liq_sum_s} (Short {liq_s_s} / Long {liq_l_s})",
         f"💰 Risk {risk_usdt} USDT({risk_pct}%) | Qty {qty} | Notional {notional}",
+        f"💸 Funding {funding_pct}% | next in {funding_left} | {funding_time_local}",
         f"⏱️ {ts_local} | {screener_name}",
     ]
     return "\n".join(lines).strip()
-
 
 
 def _build_telegram_plot_followup_text(
@@ -498,7 +555,10 @@ def _build_telegram_plot_followup_text(
     liq_sum = abs(liq_s_v) + abs(liq_l_v)
     liq_sum_s = _human_usdt_km(liq_sum)
 
-    return f"{symbol} {timeframe} {side} | entry {entry} | ΣLiq {liq_sum_s} | #{day_seq} | {screener_name}"
+    funding_pct = _fmt_funding_pct(row.get("funding_pct"))
+    funding_left = _fmt_time_left_seconds(row.get("funding_time_left_sec"))
+
+    return f"{symbol} {timeframe} {side} | entry {entry} | ΣLiq {liq_sum_s} | fund {funding_pct}% in {funding_left} | #{day_seq} | {screener_name}"
 
 
 def _send_telegram_plots_if_enabled(
@@ -561,7 +621,6 @@ def _send_telegram_plots_if_enabled(
                 if getattr(t, "name", "") in dead_targets:
                     continue
 
-                # 1) фото/док
                 total_total += 1
                 if telegram_plot_mode == "document":
                     sent = bool(send_telegram_document(png_path, caption=caption, target=t))
@@ -579,7 +638,6 @@ def _send_telegram_plots_if_enabled(
                     )
                     continue
 
-                # 2) follow-up text
                 if telegram_send_followup:
                     try:
                         send_telegram_message(followup, target=t)
@@ -786,6 +844,19 @@ def main() -> None:
                         log.info("All signals already exist (duplicates) interval=%s", interval)
                         continue
 
+                    # ✅ подтягиваем funding на момент отправки (NOW)
+                    now_ts = _utc_now()
+                    try:
+                        symbol_ids = sorted({int(s.symbol_id) for s in new_signals})
+                        funding_map = store.fetch_next_funding_bulk(
+                            exchange_id=int(exchange_id),
+                            symbol_ids=symbol_ids,
+                            as_of=now_ts,
+                        )
+                    except Exception:
+                        funding_map = {}
+                        log.warning("Funding snapshot load failed", exc_info=True)
+
                     rows: List[Dict[str, Any]] = []
                     packed_for_telegram: List[Dict[str, Any]] = []
                     packed_by_key: Dict[Tuple[int, datetime], Dict[str, Any]] = {}
@@ -793,6 +864,25 @@ def main() -> None:
                     for s in new_signals:
                         signal_day = s.signal_ts.date()
                         ctx = _jsonable(dict(s.context or {}))
+
+                        # ✅ funding в context
+                        f = funding_map.get(int(s.symbol_id), {}) or {}
+
+                        f_time = f.get("funding_time")
+                        f_rate = f.get("funding_rate")
+                        f_pct = (float(f_rate) * 100.0) if f_rate is not None else None
+
+                        is_next = bool(f.get("is_next", False))
+                        f_left_sec = None
+                        if is_next and isinstance(f_time, datetime):
+                            f_left_sec = max(0.0, (f_time - now_ts).total_seconds())
+
+                        ctx["funding_time"] = f_time
+                        ctx["funding_rate"] = f_rate
+                        ctx["funding_pct"] = f_pct
+                        ctx["funding_is_next"] = is_next
+                        ctx["funding_time_left_sec"] = f_left_sec
+                        ctx["funding_is_estimated"] = bool(f.get("is_estimated", False))  # опционально
 
                         day_seq = store.next_signal_seq(
                             exchange_id=exchange_id,
@@ -843,6 +933,12 @@ def main() -> None:
                             "stop_loss_pct": ctx.get("stop_loss_pct"),
                             "take_profit_pct": ctx.get("take_profit_pct"),
                             "volume_liquid_limit_used": ctx.get("volume_liquid_limit_used"),
+
+                            # ✅ funding для телеги
+                            "funding_time": f_time,
+                            "funding_rate": f_rate,
+                            "funding_pct": f_pct,
+                            "funding_time_left_sec": f_left_sec,
                         }
 
                         packed_for_telegram.append(packed)

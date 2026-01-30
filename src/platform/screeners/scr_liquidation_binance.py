@@ -4,6 +4,7 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+from src.platform.core.utils.candles import aggregate_candles
 
 log = logging.getLogger("screeners.scr_liquidation_binance")
 
@@ -77,6 +78,14 @@ class ScrParams:
     min_price: float = 0.00000001
     max_price: float = 100000.0
     interval: str = "1h"
+    # -------------------------
+    # LIVE candles (агрегация 15m -> 1h/4h/1d)
+    # -------------------------
+    live_candles_enabled: bool = True
+    live_prefer_agg: bool = True
+    live_base_interval: str = "15m"
+    live_extra_base_bars: int = 64
+
 
     # -------------------------
     # ликвидации + объём
@@ -278,6 +287,12 @@ class ScrLiquidationBinance:
 
         p.min_price = _to_float(params.get("min_price", p.min_price), p.min_price)
         p.max_price = _to_float(params.get("max_price", p.max_price), p.max_price)
+
+        # LIVE candles
+        p.live_candles_enabled = _to_bool(params.get("live_candles_enabled", p.live_candles_enabled), p.live_candles_enabled)
+        p.live_prefer_agg = _to_bool(params.get("live_prefer_agg", p.live_prefer_agg), p.live_prefer_agg)
+        p.live_base_interval = str(params.get("live_base_interval", p.live_base_interval))
+        p.live_extra_base_bars = _to_int(params.get("live_extra_base_bars", p.live_extra_base_bars), p.live_extra_base_bars)
 
         p.volume_liquid_limit = _to_float(params.get("volume_liquid_limit", p.volume_liquid_limit), p.volume_liquid_limit)
         p.windows = _to_int(params.get("windows", p.windows), p.windows)
@@ -842,7 +857,7 @@ class ScrLiquidationBinance:
                 return _to_float(r[0]) if r else None
 
     @staticmethod
-    def _fetch_last_candles(
+    def _fetch_last_candles_db(
         storage: Any,
         exchange_id: int,
         symbol_id: int,
@@ -883,6 +898,45 @@ class ScrLiquidationBinance:
             )
         return out
 
+
+    def _fetch_last_candles(
+        self,
+        storage: Any,
+        exchange_id: int,
+        symbol_id: int,
+        interval: str,
+        limit: int,
+        sp: Optional[ScrParams] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        1) Пытаемся взять свечи нужного interval напрямую из БД.
+        2) Если включен LIVE-режим и interval != base, то берём base (обычно 15m) и агрегируем
+           в interval (1h/4h/1d), чтобы получать текущую формирующуюся свечу без лага.
+        """
+        interval = str(interval)
+
+        if sp and sp.live_candles_enabled and sp.live_prefer_agg:
+            base = str(sp.live_base_interval or "15m")
+            if base and base != interval:
+                base_td = _parse_interval(base)
+                tgt_td = _parse_interval(interval)
+                base_sec = int(base_td.total_seconds()) if base_td.total_seconds() > 0 else 0
+                tgt_sec = int(tgt_td.total_seconds()) if tgt_td.total_seconds() > 0 else 0
+
+                # поддерживаем только кратные интервалы: 15m -> 1h/4h/1d
+                if base_sec > 0 and tgt_sec > 0 and (tgt_sec % base_sec == 0):
+                    ratio = max(1, int(tgt_sec // base_sec))
+                    base_limit = int(limit) * ratio + max(0, int(sp.live_extra_base_bars))
+                    base_rows = self._fetch_last_candles_db(storage, exchange_id, symbol_id, base, limit=base_limit)
+                    if base_rows:
+                        agg = aggregate_candles(base_rows, target_interval=interval)
+                        if len(agg) >= int(limit):
+                            return list(agg)[-int(limit):]
+                        if agg:
+                            return agg
+
+        # fallback: обычные свечи нужного интервала
+        return self._fetch_last_candles_db(storage, exchange_id, symbol_id, interval, limit=int(limit))
     @staticmethod
     def _fetch_oi_at(storage: Any, exchange_id: int, symbol_id: int, interval: str, ts: datetime) -> Optional[float]:
         q = """
@@ -924,9 +978,12 @@ class ScrLiquidationBinance:
         """
         with storage.pool.connection() as conn:
             with conn.cursor() as cur:
-                cur.execute(q, (int(exchange_id), int(symbol_id), _utc(ts)))
-                r = cur.fetchone()
-                return _to_float(r[0]) if r else None
+                try:
+                    cur.execute(q, (int(exchange_id), int(symbol_id), _utc(ts)))
+                    r = cur.fetchone()
+                    return _to_float(r[0]) if r else None
+                except Exception:
+                    return None
 
     @staticmethod
     def _fetch_liquidations_for_candle(
@@ -1040,7 +1097,7 @@ class ScrLiquidationBinance:
             if not (p.min_price <= current_price <= p.max_price):
                 continue
 
-            candles = self._fetch_last_candles(storage, exchange_id, symbol_id, p.interval, limit=need)
+            candles = self._fetch_last_candles(storage, exchange_id, symbol_id, p.interval, limit=need, sp=p)
             min_need = max(p.period_levels + p.windows + p.confirm_lookforward + 12, 140)
             if len(candles) < min_need:
                 continue

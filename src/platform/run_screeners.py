@@ -8,13 +8,14 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple, Set, Optional
 from datetime import datetime, timezone, date
 
-
 import yaml
 from psycopg.errors import UniqueViolation
 
 from src.platform.data.storage.postgres.pool import create_pool
 from src.platform.data.storage.postgres.storage import PostgreSQLStorage
 from src.platform.screeners.scr_liquidation_binance import ScrLiquidationBinance
+from src.platform.notifications import telegram as tg
+from src.platform.core.utils.candles import aggregate_candles, interval_to_timedelta, slice_window
 
 log = logging.getLogger("platform.run_screeners")
 
@@ -295,7 +296,6 @@ def _build_telegram_batch_message(
         qty = _fmt_qty(r.get("position_qty"))
         notional = _fmt_usdt_int(r.get("position_notional_usdt"))
 
-        # ✅ funding
         funding_pct = _fmt_funding_pct(r.get("funding_pct"))
         funding_left = _fmt_time_left_seconds(r.get("funding_time_left_sec"))
         ft = r.get("funding_time")
@@ -323,13 +323,48 @@ def _build_telegram_batch_message(
     return "\n".join(out).strip()
 
 
-def _resolve_telegram_targets(params: dict) -> list:
-    from src.platform.notifications.telegram import resolve_targets_from_env
+# -----------------------------
+# Screener runner compatibility (robust)
+# -----------------------------
+def _call_screener(
+    scr: Any,
+    *,
+    storage: PostgreSQLStorage,
+    exchange_id: int,
+    interval: str,
+    params: Dict[str, Any],
+):
+    """
+    Совместимость между версиями скринера.
+    Ищем методы (включая приватные), чтобы не ломалось при рефакторе.
+    """
+    runner = (
+        getattr(scr, "run", None)
+        or getattr(scr, "scan", None)
+        or getattr(scr, "run_once", None)
+        or getattr(scr, "_run", None)
+        or getattr(scr, "_scan", None)
+        or getattr(scr, "_run_once", None)
+        or (scr if callable(scr) else None)
+    )
 
+    if runner is None:
+        public = [m for m in dir(scr) if not m.startswith("_")]
+        raise AttributeError(
+            f"Screener {type(scr).__name__} has no run/scan/run_once/_run. Methods: {', '.join(sorted(public))}"
+        )
+
+    try:
+        return runner(storage=storage, exchange_id=exchange_id, interval=interval, params=params)
+    except TypeError:
+        return runner(storage, exchange_id, interval, params)
+
+
+def _resolve_telegram_targets(params: dict) -> list:
     extras_enabled = bool(params.get("telegram_extras_enabled", False))
     max_friends = int(params.get("telegram_max_friends", 10))
 
-    return resolve_targets_from_env(
+    return tg.resolve_targets_from_env(
         include_friends=extras_enabled,
         max_friends=max_friends,
         fallback_friend_token_to_primary=True,
@@ -359,15 +394,12 @@ def _send_telegram_if_enabled(
     tz_name = str(params.get("telegram_timezone", "")).strip() or None
 
     try:
-        from src.platform.notifications.telegram import send_telegram_message, split_long_message
-
         targets = _resolve_telegram_targets(params)
         if not targets:
             log.warning("Telegram enabled, but no targets resolved (check env keys)")
             return
 
         rows = packed_rows[: max(1, telegram_max_signals)]
-
         dead_targets: Set[str] = set()
 
         def _send_parts_to_targets(parts: List[str]) -> Tuple[int, int]:
@@ -379,7 +411,7 @@ def _send_telegram_if_enabled(
                         continue
 
                     total += 1
-                    sent = bool(send_telegram_message(part, target=t))
+                    sent = bool(tg.send_telegram_message(part, target=t))
                     if sent:
                         ok += 1
                     else:
@@ -403,7 +435,7 @@ def _send_telegram_if_enabled(
                     rows=[r],
                     tz_name=tz_name,
                 )
-                parts = split_long_message(msg)
+                parts = tg.split_long_message(msg)
                 parts_total += len(parts)
                 ok, total = _send_parts_to_targets(parts)
                 ok_total += ok
@@ -415,7 +447,7 @@ def _send_telegram_if_enabled(
                 rows=rows,
                 tz_name=tz_name,
             )
-            parts = split_long_message(msg)
+            parts = tg.split_long_message(msg)
             parts_total = len(parts)
             ok_total, total_total = _send_parts_to_targets(parts)
 
@@ -435,9 +467,7 @@ def _send_telegram_if_enabled(
 
 
 def _human_usdt_km(x: Any) -> str:
-    """
-    Формат для ΣLiq: 15500 -> 15.5k, 1200000 -> 1.2M
-    """
+    """Формат для ΣLiq: 15500 -> 15.5k, 1200000 -> 1.2M"""
     try:
         v = float(x or 0)
         v = abs(v)
@@ -450,19 +480,13 @@ def _human_usdt_km(x: Any) -> str:
         if v >= 1_000:
             s = f"{v/1_000:.2f}".rstrip("0").rstrip(".")
             return f"{s}k"
-        s = f"{v:.0f}"
-        return s
+        return f"{v:.0f}"
     except Exception:
         return "0"
 
 
 def _fmt_price_compact(x: Any) -> str:
-    """
-    Компактная цена для заголовков:
-      >=100 -> 2 знака
-      >=1   -> 4 знака
-      иначе -> 8 знаков
-    """
+    """Компактная цена для заголовков."""
     try:
         if x is None:
             return "—"
@@ -509,7 +533,6 @@ def _build_telegram_plot_caption(
     qty = _fmt_qty(row.get("position_qty"))
     notional = _fmt_usdt_int(row.get("position_notional_usdt"))
 
-    # ✅ funding
     funding_pct = _fmt_funding_pct(row.get("funding_pct"))
     funding_left = _fmt_time_left_seconds(row.get("funding_time_left_sec"))
     ft = row.get("funding_time")
@@ -541,9 +564,6 @@ def _build_telegram_plot_followup_text(
     timeframe: str,
     row: Dict[str, Any],
 ) -> str:
-    """
-    Второе сообщение (короткое), как на твоём примере.
-    """
     symbol = str(row.get("symbol") or "")
     side = str(row.get("side") or "").upper()
     day_seq = int(row.get("day_seq") or 0)
@@ -558,7 +578,10 @@ def _build_telegram_plot_followup_text(
     funding_pct = _fmt_funding_pct(row.get("funding_pct"))
     funding_left = _fmt_time_left_seconds(row.get("funding_time_left_sec"))
 
-    return f"{symbol} {timeframe} {side} | entry {entry} | ΣLiq {liq_sum_s} | fund {funding_pct}% in {funding_left} | #{day_seq} | {screener_name}"
+    return (
+        f"{symbol} {timeframe} {side} | entry {entry} | ΣLiq {liq_sum_s} | "
+        f"fund {funding_pct}% in {funding_left} | #{day_seq} | {screener_name}"
+    )
 
 
 def _send_telegram_plots_if_enabled(
@@ -568,11 +591,6 @@ def _send_telegram_plots_if_enabled(
     params: dict,
     plot_items: List[Tuple[str, Dict[str, Any]]],  # [(png_path, row_dict)]
 ) -> None:
-    """
-    Отправляет:
-      1) картинку (photo/document) + caption
-      2) второе короткое сообщение
-    """
     telegram_enabled = bool(params.get("telegram_enabled", False))
     telegram_send_plots = bool(params.get("telegram_send_plots", False))
     if (not telegram_enabled) or (not telegram_send_plots) or (not plot_items):
@@ -587,20 +605,14 @@ def _send_telegram_plots_if_enabled(
     tz_name = str(params.get("telegram_timezone", "")).strip() or None
 
     try:
-        from src.platform.notifications.telegram import (
-            send_telegram_photo,
-            send_telegram_document,
-            send_telegram_message,
-        )
-
         targets = _resolve_telegram_targets(params)
         if not targets:
             log.warning("Telegram plots enabled, but no targets resolved (check env keys)")
             return
 
         items = plot_items[: max(1, telegram_max_plot_signals)]
-
         dead_targets: Set[str] = set()
+
         ok_total = 0
         total_total = 0
 
@@ -623,9 +635,9 @@ def _send_telegram_plots_if_enabled(
 
                 total_total += 1
                 if telegram_plot_mode == "document":
-                    sent = bool(send_telegram_document(png_path, caption=caption, target=t))
+                    sent = bool(tg.send_telegram_document(png_path, caption=caption, target=t))
                 else:
-                    sent = bool(send_telegram_photo(png_path, caption=caption, target=t))
+                    sent = bool(tg.send_telegram_photo(png_path, caption=caption, target=t))
 
                 if sent:
                     ok_total += 1
@@ -640,7 +652,7 @@ def _send_telegram_plots_if_enabled(
 
                 if telegram_send_followup:
                     try:
-                        send_telegram_message(followup, target=t)
+                        tg.send_telegram_message(followup, target=t)
                     except Exception:
                         log.warning("Telegram followup text failed target=%s", getattr(t, "name", "unknown"))
 
@@ -734,8 +746,8 @@ def main() -> None:
         force=True,
     )
 
-    from src.platform.notifications.telegram import load_dotenv_file
-    load_dotenv_file(".env", override=False)
+    # .env (telegram tokens, etc.)
+    tg.load_dotenv_file(".env", override=False)
 
     cfg_path = os.getenv("SCREENERS_CONFIG", "config/screeners.yaml")
     log.info("=== RUN SCREENERS START ===")
@@ -798,20 +810,35 @@ def main() -> None:
                 scr = screener_registry[name]()
 
                 for interval, liq_limit in pairs:
-                    log.info("  -> interval=%s volume_liquid_limit=%s", interval, liq_limit if liq_limit is not None else "DEFAULT")
+                    log.info(
+                        "  -> interval=%s volume_liquid_limit=%s",
+                        interval,
+                        liq_limit if liq_limit is not None else "DEFAULT",
+                    )
 
                     params_i: Dict[str, Any] = dict(params)
                     params_i["interval"] = interval
+
+                    # ✅ apply confirm_lookforward_map per timeframe (if provided)
+                    cf_map = params_i.get("confirm_lookforward_map") or {}
+                    if isinstance(cf_map, dict):
+                        v = cf_map.get(str(interval))
+                        if v is not None:
+                            try:
+                                params_i["confirm_lookforward"] = int(v)
+                            except Exception:
+                                pass
+
                     if liq_limit is not None:
                         params_i["volume_liquid_limit"] = float(liq_limit)
 
-                    signals = scr.run(
+                    signals = _call_screener(
+                        scr,
                         storage=store,
                         exchange_id=exchange_id,
                         interval=interval,
                         params=params_i,
                     )
-
                     if not signals:
                         log.info("No signals interval=%s", interval)
                         continue
@@ -819,7 +846,9 @@ def main() -> None:
                     for s in signals:
                         try:
                             ctx = dict(s.context or {})
-                            ctx["volume_liquid_limit_used"] = float(liq_limit) if liq_limit is not None else ctx.get("volume_liquid_limit_used")
+                            ctx["volume_liquid_limit_used"] = (
+                                float(liq_limit) if liq_limit is not None else ctx.get("volume_liquid_limit_used")
+                            )
                             ctx["interval"] = str(interval)
                             s.context = ctx
                         except Exception:
@@ -844,7 +873,7 @@ def main() -> None:
                         log.info("All signals already exist (duplicates) interval=%s", interval)
                         continue
 
-                    # ✅ подтягиваем funding на момент отправки (NOW)
+                    # ✅ FUNDING ALWAYS (как ты попросил)
                     now_ts = _utc_now()
                     try:
                         symbol_ids = sorted({int(s.symbol_id) for s in new_signals})
@@ -865,9 +894,7 @@ def main() -> None:
                         signal_day = s.signal_ts.date()
                         ctx = _jsonable(dict(s.context or {}))
 
-                        # ✅ funding в context
                         f = funding_map.get(int(s.symbol_id), {}) or {}
-
                         f_time = f.get("funding_time")
                         f_rate = f.get("funding_rate")
                         f_pct = (float(f_rate) * 100.0) if f_rate is not None else None
@@ -882,7 +909,7 @@ def main() -> None:
                         ctx["funding_pct"] = f_pct
                         ctx["funding_is_next"] = is_next
                         ctx["funding_time_left_sec"] = f_left_sec
-                        ctx["funding_is_estimated"] = bool(f.get("is_estimated", False))  # опционально
+                        ctx["funding_is_estimated"] = bool(f.get("is_estimated", False))
 
                         day_seq = store.next_signal_seq(
                             exchange_id=exchange_id,
@@ -933,8 +960,6 @@ def main() -> None:
                             "stop_loss_pct": ctx.get("stop_loss_pct"),
                             "take_profit_pct": ctx.get("take_profit_pct"),
                             "volume_liquid_limit_used": ctx.get("volume_liquid_limit_used"),
-
-                            # ✅ funding для телеги
                             "funding_time": f_time,
                             "funding_rate": f_rate,
                             "funding_pct": f_pct,
@@ -996,14 +1021,62 @@ def main() -> None:
 
                         for s in sigs_for_plots:
                             try:
-                                candles = store.fetch_candles_window(
-                                    exchange_id=exchange_id,
-                                    symbol_id=s.symbol_id,
-                                    interval=interval,
-                                    center_ts=s.signal_ts,
-                                    lookback=lookback,
-                                    lookforward=forward_bars,
-                                )
+                                now_ts_plot = _utc_now()
+                                delta = interval_to_timedelta(interval)
+
+                                center_ts = now_ts_plot
+                                try:
+                                    if s.signal_ts < (now_ts_plot - (delta * int(lookback))):
+                                        center_ts = s.signal_ts
+                                except Exception:
+                                    center_ts = now_ts_plot
+
+                                live_enabled = bool(params_i.get("live_candles_enabled", True))
+                                live_prefer_agg = bool(params_i.get("live_prefer_agg", True))
+                                live_base_interval = str(params_i.get("live_base_interval", "15m"))
+                                live_extra_base_bars = int(params_i.get("live_extra_base_bars", 64))
+
+                                candles = []
+                                if live_enabled and live_prefer_agg and live_base_interval and live_base_interval != interval:
+                                    try:
+                                        base_td = interval_to_timedelta(live_base_interval)
+                                        tgt_td = interval_to_timedelta(interval)
+                                        base_sec = int(base_td.total_seconds()) if base_td.total_seconds() > 0 else 0
+                                        tgt_sec = int(tgt_td.total_seconds()) if tgt_td.total_seconds() > 0 else 0
+                                        if base_sec > 0 and tgt_sec > 0 and (tgt_sec % base_sec == 0):
+                                            ratio = max(1, int(tgt_sec // base_sec))
+                                            base_lb = int(lookback) * ratio + max(0, int(live_extra_base_bars))
+                                            base_fw = int(forward_bars) * ratio + max(0, int(live_extra_base_bars // 2))
+                                            base_candles = store.fetch_candles_window(
+                                                exchange_id=exchange_id,
+                                                symbol_id=s.symbol_id,
+                                                interval=live_base_interval,
+                                                center_ts=center_ts,
+                                                lookback=base_lb,
+                                                lookforward=base_fw,
+                                            )
+                                            if base_candles:
+                                                agg = aggregate_candles(base_candles, target_interval=interval)
+                                                candles = slice_window(
+                                                    agg,
+                                                    center_ts=center_ts,
+                                                    interval=interval,
+                                                    lookback=int(lookback),
+                                                    lookforward=int(forward_bars),
+                                                )
+                                    except Exception:
+                                        candles = []
+
+                                if not candles:
+                                    candles = store.fetch_candles_window(
+                                        exchange_id=exchange_id,
+                                        symbol_id=s.symbol_id,
+                                        interval=interval,
+                                        center_ts=center_ts,
+                                        lookback=lookback,
+                                        lookforward=forward_bars,
+                                    )
+
                                 if not candles:
                                     log.warning("No candles for plot: %s %s %s", s.symbol, interval, s.signal_ts)
                                     continue
@@ -1014,7 +1087,7 @@ def main() -> None:
                                 liq_series = None
                                 try:
                                     start_ts = candles[0]["ts"]
-                                    end_ts = candles[-1]["ts"]
+                                    end_ts = candles[-1]["ts"] + interval_to_timedelta(interval)
                                     liq_series = store.fetch_liquidations_window(
                                         exchange_id=exchange_id,
                                         symbol_id=s.symbol_id,
@@ -1040,6 +1113,8 @@ def main() -> None:
                                     touch_ts=touch_ts,
                                     up_level=ctx_plot.get("up_level"),
                                     down_level=ctx_plot.get("down_level"),
+                                    stop_loss=s.stop_loss,
+                                    take_profit=s.take_profit,
                                     liquidation_series=liq_series,
                                     liq_short_usdt=ctx_plot.get("liq_short_usdt"),
                                     liq_long_usdt=ctx_plot.get("liq_long_usdt"),

@@ -38,8 +38,8 @@ symbols_refresh:
 market_data:
   enabled: true
 
-  # ✅ WS только 15m (чтобы НЕ было 20+ WS chunk’ов)
-  candle_intervals: ["15m"]
+  # ✅ WS
+  candle_intervals: ["15m","1h", "4h", "1d"]
 
   seed_on_start: true
   seed_days: 30
@@ -61,7 +61,7 @@ market_data:
     min_restart_sec: 180
 
   # ✅ только закрытые свечи
-  update_open_candle: false
+  update_open_candle: true
 
   # ✅ ping/pong стабильнее
   ws_ping_interval: 60
@@ -69,12 +69,12 @@ market_data:
 
   # REST catchup при подключении (хвост)
   rest_catchup_on_connect: true
-  rest_catchup_overlap_minutes: 180
-  rest_catchup_limit: 1500
-  rest_catchup_max_pages: 2
+  catchup_max_symbols: 10          # было 80
+  rest_catchup_max_pages: 1        # было 2
+  rest_catchup_overlap_minutes: 60 # было 180
 
+  rest_catchup_limit: 1500
   catchup_seed_days: 2
-  catchup_max_symbols: 80
 
 open_interest:
   enabled: true
@@ -203,13 +203,13 @@ market_trades:
 
 candles_gap_repair:
   enabled: true
+  every_sec: 1800   # было 600
+  max_symbols_per_cycle: 40
+  max_gaps_per_cycle: 10
+
   # ✅ Тут добиваем старшие ТФ вместо WS
   intervals: ["1h", "4h", "1d"]
-  every_sec: 600
-
   only_active_symbols: true
-  max_symbols_per_cycle: 80
-  max_gaps_per_cycle: 25
   gaps_per_symbol: 2
 
   max_gap_days: 30

@@ -7,8 +7,10 @@ exchange: binance
 exchange_id: 1
 
 rest_limits:
-  max_rps: 2.0
-  max_rpm: 250
+  # 2 rps на всё сразу (funding + gap_repair + хвосты) часто душит.
+  # Это не "ускорение", это чтобы разные коллекторы не голодали.
+  max_rps: 3.5
+  max_rpm: 350
   force: true
 
 startup_stagger:
@@ -33,24 +35,23 @@ symbol_filters:
   seed_on_start: true
 
 symbols_refresh:
-  refresh_sec: 60
+  refresh_sec: 300
 
 market_data:
   enabled: true
 
-  # ✅ WS
-  candle_intervals: ["15m","1h", "4h", "1d"]
+  # ✅ WS только 15m (как и задумано)
+  candle_intervals: ["15m"]
 
   seed_on_start: true
   seed_days: 30
   seed_limit: 1500
-  seed_max_pages_per_symbol: 0
-  seed_symbols_per_cycle: 5
+  seed_max_pages_per_symbol: 3       # было 0
+  seed_symbols_per_cycle: 4
   per_request_sleep_sec: 0.25
   seed_overlap_minutes: 60
 
   use_ws: true
-  # ✅ больше символов в одном WS (меньше коннектов)
   ws_max_streams_per_conn: 180
   ws_url_max_len: 3500
 
@@ -60,88 +61,68 @@ market_data:
     debounce_checks: 2
     min_restart_sec: 180
 
-  # ✅ только закрытые свечи
-  update_open_candle: true
+  # ✅ реально только закрытые свечи (а не как было true)
+  update_open_candle: false
 
-  # ✅ ping/pong стабильнее
   ws_ping_interval: 60
   ws_ping_timeout: 30
 
   # REST catchup при подключении (хвост)
   rest_catchup_on_connect: true
-  catchup_max_symbols: 10          # было 80
-  rest_catchup_max_pages: 1        # было 2
-  rest_catchup_overlap_minutes: 60 # было 180
-
+  catchup_max_symbols: 10
+  rest_catchup_max_pages: 1
+  rest_catchup_overlap_minutes: 60
   rest_catchup_limit: 1500
   catchup_seed_days: 2
 
 open_interest:
   enabled: true
-  intervals: ["5m", "15m", "1h", "4h", "1d"]
+  intervals: ["5m"]
 
   seed_on_start: false
-  seed_days: 30
+  seed_days: 14
   seed_limit: 500
-  seed_max_pages_per_symbol: 8
-  seed_symbols_per_cycle: 10
+  seed_max_pages_per_symbol: 10
+  seed_symbols_per_cycle: 2
 
-  poll_sec: 60
-  batch_size: 20
-
-  per_request_sleep_sec: 0.12
   overlap_minutes: 60
   safety_lag_sec: 15
 
-  refresh_symbols_sec: 3600
-  log_each_cycle: true
+  poll_limit_max: 200
+  poll_max_pages_per_symbol: 3
+  batch_size: 10
+  scan_sleep_sec: 0.10
 
-  stall_hits_to_blacklist: 3
-  blacklist_hours: 6
-  blacklist_log_every_sec: 120
-
-  schedule:
-    "5m": 25
-    "15m": 240
-    "1h": 1200
-    "4h": 3600
-    "1d": 21600
-  schedule_jitter_sec: 1.0
-
-  dynamic_budget:
+  rate_limit:
     enabled: true
-    safety_factor: 0.90
-    endpoint_weight: 2.0
-    min_symbols_per_tick: 5
-    max_symbols_per_tick_cap: 50
-
-  adaptive:
-    enabled: true
-    penalty_step: 5
-    recovery_step: 1
-    extra_sleep_penalty_sec: 0.10
-    extra_sleep_recovery_sec: 0.01
-    extra_sleep_max_sec: 0.50
-    post_tick_sleep_max_sec: 20.0
+    ip_limit_per_5m: 1000
+    window_sec: 300
+    safety_factor: 0.70
+    burst: 30
+    backoff_min_sec: 1.0
+    backoff_max_sec: 30.0
 
 funding:
   enabled: true
   backfill_on_start: true
-  backfill_days: 30
+  backfill_days: 14               # было 30 (сильно снижает стартовую нагрузку)
 
   use_ws: true
 
   rest_safety_poll: true
-  poll_sec: 1800
+  poll_sec: 3600                   # было 1800
 
-  symbols_per_cycle: 20
-  req_sleep_sec: 0.20
+  symbols_per_cycle: 10            # было 20
+  req_sleep_sec: 0.25              # было 0.20
 
   limit: 1000
-  max_pages: 50
-  page_sleep_sec: 0.0
+  max_pages: 25                    # было 50
+  page_sleep_sec: 0.05             # было 0.0
 
   overlap_hours: 72
+
+liquidations:
+  enabled: false
 
 ticker_24h:
   enabled: true
@@ -152,11 +133,10 @@ ticker_24h:
   ws_ping_timeout: 30
   rest_safety_poll: false
 
-
 market_state_5m:
   enabled: true
-  poll_sec: 10
-  symbols_per_cycle: 40
+  poll_sec: 15                     # было 10 (чуть разгружаем)
+  symbols_per_cycle: 30            # было 40
   lookback_minutes: 180
   refresh_symbols_sec: 300
 
@@ -169,45 +149,40 @@ market_trades_all:
   ws_ping_interval: 60
   ws_ping_timeout: 30
 
-  flush_sec: 0.75
+  flush_sec: 1.0                   # было 0.75
   flush_max_rows: 5000
 
   overlap_minutes: 60
-  agg_upsert_every_sec: 10
-  recalc_cvd_every_sec: 120
+  agg_upsert_every_sec: 15         # было 10
+  recalc_cvd_every_sec: 180        # было 120
   cvd_hours_back: 24
 
-  # normal tail sync (после warmup)
   tail_sync_enabled: true
   lag_tail_sec: 600
-  tail_sync_every_sec: 5
+  tail_sync_every_sec: 6           # было 5
   tail_sync_symbols_per_cycle: 2
   tail_sync_limit: 1000
   tail_sync_max_pages_per_symbol: 3
   tail_sync_max_requests_per_cycle: 6
-  tail_sync_min_symbol_interval_sec: 45
+  tail_sync_min_symbol_interval_sec: 60  # было 45
   tail_sync_safety_lag_sec: 3
 
-  # ✅ WARMUP: ускоренный догон первые 3 минуты
   warmup_enabled: true
   warmup_sec: 180
   warmup_lag_tail_sec: 60
-  warmup_tail_sync_every_sec: 3
+  warmup_tail_sync_every_sec: 4          # было 3
   warmup_tail_sync_symbols_per_cycle: 3
   warmup_tail_sync_max_requests_per_cycle: 8
   warmup_tail_sync_max_pages_per_symbol: 4
-  warmup_tail_sync_min_symbol_interval_sec: 20
-
-market_trades:
-  enabled: false
+  warmup_tail_sync_min_symbol_interval_sec: 25  # было 20
 
 candles_gap_repair:
   enabled: true
-  every_sec: 1800   # было 600
+  every_sec: 1800
   max_symbols_per_cycle: 40
   max_gaps_per_cycle: 10
 
-  # ✅ Тут добиваем старшие ТФ вместо WS
+  # ✅ добиваем старшие ТФ только REST'ом (WS там больше не включен)
   intervals: ["1h", "4h", "1d"]
   only_active_symbols: true
   gaps_per_symbol: 2
@@ -230,12 +205,9 @@ retention:
   candles_days: 180
   candle_intervals: ["1m", "5m", "15m", "1h", "4h", "1d"]
 
+  # раз OI теперь только 5m — оставляем только его
   oi_keep_days:
-    "5m": 14
-    "15m": 60
-    "1h": 90
-    "4h": 180
-    "1d": 365
+    "5m": 30
 
   funding_days: 90
   ticker_24h_days: 30

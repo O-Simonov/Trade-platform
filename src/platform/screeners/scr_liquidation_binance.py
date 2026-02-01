@@ -1,3 +1,4 @@
+# src/platform/screeners/scr_liquidation_binance.py
 from __future__ import annotations
 
 import logging
@@ -20,6 +21,11 @@ def _utc(dt: Any) -> datetime:
         return dt.astimezone(timezone.utc)
     raise TypeError(f"Expected datetime, got {type(dt)}")
 
+def _ts_key(dt: Any) -> datetime:
+    """Normalize timestamps for dict keys (UTC, no microseconds)."""
+    d = _utc(dt)
+    return d.replace(microsecond=0)
+
 
 def _to_float(x: Any, default: float = 0.0) -> float:
     if x is None:
@@ -28,6 +34,16 @@ def _to_float(x: Any, default: float = 0.0) -> float:
         return float(x)
     except (TypeError, ValueError):
         return default
+
+def _to_float_opt(x: Any) -> Optional[float]:
+    """Return float(x) or None if x is None/invalid (keeps missing data visible)."""
+    if x is None:
+        return None
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return None
+
 
 
 def _to_int(x: Any, default: int = 0) -> int:
@@ -501,6 +517,8 @@ class ScrLiquidationBinance:
         oi_anchor: Any,
         cvd_anchor: Any,
         confirm_window: Sequence[Dict[str, Any]],
+        oi_map: Optional[Dict[datetime, Optional[float]]] = None,
+        cvd_map: Optional[Dict[datetime, Optional[float]]] = None,
     ) -> Optional[Tuple[datetime, float, Any, Any, Any, str]]:
         if not confirm_window:
             return None
@@ -509,6 +527,7 @@ class ScrLiquidationBinance:
 
         for c in confirm_window:
             ts = _utc(c["ts"])
+            ts_key = _ts_key(ts)
             o = _to_float(c.get("open"))
             close = _to_float(c.get("close"))
 
@@ -518,14 +537,22 @@ class ScrLiquidationBinance:
             oi_c = cvd_c = fund_c = None
 
             if p.enable_oi:
-                oi_c = self._fetch_oi_at(storage, exchange_id, symbol_id, interval, ts)
+                if oi_map is not None:
+                    oi_c = oi_map.get(ts_key)
+                else:
+                    oi_c = self._fetch_oi_at(storage, exchange_id, symbol_id, interval, ts)
                 if oi_anchor is None or oi_c is None:
                     continue
                 if _to_float(oi_c) >= _to_float(oi_anchor):
                     continue
 
             if p.enable_cvd:
-                cvd_c = self._fetch_cvd_at(storage, exchange_id, symbol_id, interval, ts)
+                cvd_c = c.get("cvd_quote")
+                if cvd_c is None:
+                    if cvd_map is not None:
+                        cvd_c = cvd_map.get(ts_key)
+                    else:
+                        cvd_c = self._fetch_cvd_at(storage, exchange_id, symbol_id, interval, ts)
                 if cvd_anchor is None or cvd_c is None:
                     continue
                 if _to_float(cvd_c) >= _to_float(cvd_anchor):
@@ -555,6 +582,8 @@ class ScrLiquidationBinance:
         oi_anchor: Any,
         cvd_anchor: Any,
         confirm_window: Sequence[Dict[str, Any]],
+        oi_map: Optional[Dict[datetime, Optional[float]]] = None,
+        cvd_map: Optional[Dict[datetime, Optional[float]]] = None,
     ) -> Optional[Tuple[datetime, float, Any, Any, Any, str]]:
         if not confirm_window:
             return None
@@ -563,6 +592,7 @@ class ScrLiquidationBinance:
 
         for c in confirm_window:
             ts = _utc(c["ts"])
+            ts_key = _ts_key(ts)
             o = _to_float(c.get("open"))
             close = _to_float(c.get("close"))
 
@@ -572,14 +602,22 @@ class ScrLiquidationBinance:
             oi_c = cvd_c = fund_c = None
 
             if p.enable_oi:
-                oi_c = self._fetch_oi_at(storage, exchange_id, symbol_id, interval, ts)
+                if oi_map is not None:
+                    oi_c = oi_map.get(ts_key)
+                else:
+                    oi_c = self._fetch_oi_at(storage, exchange_id, symbol_id, interval, ts)
                 if oi_anchor is None or oi_c is None:
                     continue
                 if _to_float(oi_c) >= _to_float(oi_anchor):
                     continue
 
             if p.enable_cvd:
-                cvd_c = self._fetch_cvd_at(storage, exchange_id, symbol_id, interval, ts)
+                cvd_c = c.get("cvd_quote")
+                if cvd_c is None:
+                    if cvd_map is not None:
+                        cvd_c = cvd_map.get(ts_key)
+                    else:
+                        cvd_c = self._fetch_cvd_at(storage, exchange_id, symbol_id, interval, ts)
                 if cvd_anchor is None or cvd_c is None:
                     continue
                 if _to_float(cvd_c) <= _to_float(cvd_anchor):
@@ -893,7 +931,7 @@ class ScrLiquidationBinance:
                     "close": _to_float(r[4]),
                     "volume": _to_float(r[5]),
                     "quote_volume": _to_float(r[6]),
-                    "cvd_quote": _to_float(r[7]),
+                    "cvd_quote": _to_float_opt(r[7]),
                 }
             )
         return out
@@ -930,6 +968,10 @@ class ScrLiquidationBinance:
                     base_rows = self._fetch_last_candles_db(storage, exchange_id, symbol_id, base, limit=base_limit)
                     if base_rows:
                         agg = aggregate_candles(base_rows, target_interval=interval)
+                        try:
+                            agg = self._inject_cvd_for_agg(base_rows, agg, target_interval=interval)
+                        except Exception:
+                            pass
                         if len(agg) >= int(limit):
                             return list(agg)[-int(limit):]
                         if agg:
@@ -937,35 +979,426 @@ class ScrLiquidationBinance:
 
         # fallback: обычные свечи нужного интервала
         return self._fetch_last_candles_db(storage, exchange_id, symbol_id, interval, limit=int(limit))
+
+    @staticmethod
+    def _inject_cvd_for_agg(
+        base_rows: Sequence[Dict[str, Any]],
+        agg_rows: Sequence[Dict[str, Any]],
+        target_interval: str,
+    ) -> List[Dict[str, Any]]:
+        """Заполняет cvd_quote для агрегированных свечей.
+
+        aggregate_candles() обычно агрегирует OHLCV, но cvd_quote (кумулятивный индикатор) нужно "подтянуть" отдельно.
+        Правило: CVD на закрытии свечи = последнее НЕ-NULL значение cvd_quote с base-интервала, чьё ts <= close_time.
+
+        base_rows должны быть отсортированы по ts по возрастанию (как у _fetch_last_candles_db()).
+        """
+        target_td = _parse_interval(str(target_interval))
+        if target_td.total_seconds() <= 0:
+            target_td = timedelta(hours=1)
+
+        # Берём только валидные (ts, cvd) и только не-NULL cvd
+        points: List[Tuple[datetime, float]] = []
+        for r in base_rows:
+            try:
+                ts = _utc(r.get("ts"))
+                cvd = r.get("cvd_quote")
+                if cvd is None:
+                    continue
+                cvd_f = float(cvd)
+                points.append((ts, cvd_f))
+            except Exception:
+                continue
+
+        if not points:
+            return list(agg_rows)
+
+        points.sort(key=lambda x: x[0])
+        times = [t for t, _ in points]
+        values = [v for _, v in points]
+
+        from bisect import bisect_right
+
+        out: List[Dict[str, Any]] = []
+        for a in agg_rows:
+            try:
+                open_ts = _utc(a.get("ts"))
+                close_ts = open_ts + target_td
+                close_eps = close_ts - timedelta(microseconds=1)
+
+                j = bisect_right(times, close_eps) - 1
+                if j >= 0:
+                    a = dict(a)
+                    a["cvd_quote"] = float(values[j])
+                out.append(a)
+            except Exception:
+                out.append(a)
+
+        return out
+
+    # =========================================================
+    # batched prefetch (performance)
+    # =========================================================
+
+    @staticmethod
+    def _prefetch_oi_close_map(
+        storage: Any,
+        exchange_id: int,
+        symbol_id: int,
+        interval: str,
+        candle_open_times: Sequence[datetime],
+    ) -> Dict[datetime, Optional[float]]:
+        """Batch OI lookup for a set of candle open times.
+
+        Returns mapping: candle_open_ts (UTC, no microseconds) -> oi_value (float) on candle CLOSE.
+
+        Strategy:
+        - For each candle open_ts compute close_ts = open_ts + interval
+        - Fetch OI points for two candidate intervals:
+            * interval (same as candle TF)
+            * '5m' (freshest, near-real-time)
+        - For each candle choose the value coming from the freshest point (largest oi_ts) among candidates.
+
+        This reduces DB round-trips (1 per candle) to a couple of queries per symbol.
+        """
+        if not candle_open_times:
+            return {}
+
+        interval = str(interval).strip()
+        td = _parse_interval(interval)
+        if td.total_seconds() <= 0:
+            td = timedelta(hours=1)
+
+        opens = [_ts_key(t) for t in candle_open_times]
+        close_ts_list = [o + td for o in opens]
+        start_bound = min(opens) - max(td, timedelta(hours=6))
+        end_bound = max(close_ts_list)
+
+        ivs: List[str] = [interval]
+        if interval != "5m":
+            ivs.append("5m")
+
+        # dynamic placeholders for intervals
+        ph = ", ".join(["%s"] * len(ivs))
+
+        q_seed = f"""
+        SELECT DISTINCT ON (interval) interval, ts, open_interest
+        FROM open_interest
+        WHERE exchange_id=%s AND symbol_id=%s
+          AND interval IN ({ph})
+          AND ts <= %s
+        ORDER BY interval, ts DESC
+        """
+
+        q_range = f"""
+        SELECT interval, ts, open_interest
+        FROM open_interest
+        WHERE exchange_id=%s AND symbol_id=%s
+          AND interval IN ({ph})
+          AND ts > %s AND ts <= %s
+        ORDER BY interval, ts ASC
+        """
+
+        points_by_iv: Dict[str, List[Tuple[datetime, float]]] = {iv: [] for iv in ivs}
+
+        try:
+            with storage.pool.connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(q_seed, (int(exchange_id), int(symbol_id), *ivs, start_bound))
+                    for iv, ts, val in cur.fetchall() or []:
+                        v = _to_float_opt(val)
+                        if v is None:
+                            continue
+                        points_by_iv[str(iv)].append((_utc(ts), float(v)))
+
+                    cur.execute(q_range, (int(exchange_id), int(symbol_id), *ivs, start_bound, end_bound))
+                    for iv, ts, val in cur.fetchall() or []:
+                        v = _to_float_opt(val)
+                        if v is None:
+                            continue
+                        points_by_iv[str(iv)].append((_utc(ts), float(v)))
+        except Exception:
+            # if DB hiccup — return empty map and let fallback per-candle queries handle it
+            return {}
+
+        # sort points for bisect
+        for iv in ivs:
+            points_by_iv[iv].sort(key=lambda x: x[0])
+
+        from bisect import bisect_right
+
+        times_by_iv: Dict[str, List[datetime]] = {
+            iv: [t for t, _ in (points_by_iv.get(iv) or [])] for iv in ivs
+        }
+
+        out: Dict[datetime, Optional[float]] = {}
+
+        for open_ts, close_ts in zip(opens, close_ts_list):
+            best_point_ts: Optional[datetime] = None
+            best_val: Optional[float] = None
+
+            for iv in ivs:
+                pts = points_by_iv.get(iv) or []
+                if not pts:
+                    continue
+                times = times_by_iv.get(iv) or []
+                j = bisect_right(times, close_ts) - 1
+                if j < 0:
+                    continue
+                pt_ts, pt_val = pts[j]
+                if best_point_ts is None or pt_ts > best_point_ts:
+                    best_point_ts = pt_ts
+                    best_val = float(pt_val)
+
+            out[open_ts] = best_val
+
+        return out
+
+    @staticmethod
+    def _prefetch_cvd_close_map(
+        storage: Any,
+        exchange_id: int,
+        symbol_id: int,
+        interval: str,
+        candle_open_times: Sequence[datetime],
+    ) -> Dict[datetime, Optional[float]]:
+        """Batch CVD lookup for a set of candle open times.
+
+        Returns mapping: candle_open_ts (UTC, no microseconds) -> cvd_quote on candle CLOSE.
+
+        Candidate sources (in order of preference by freshness):
+          - interval (same TF, if not NULL)
+          - 15m (best coverage in your DB)
+          - 5m
+
+        For each candle we pick the freshest point (largest open_time) among candidates.
+        """
+        if not candle_open_times:
+            return {}
+
+        interval = str(interval).strip()
+        td = _parse_interval(interval)
+        if td.total_seconds() <= 0:
+            td = timedelta(hours=1)
+
+        opens = [_ts_key(t) for t in candle_open_times]
+        close_ts_list = [o + td for o in opens]
+        start_bound = min(opens) - max(td, timedelta(hours=6))
+        end_bound = max(close_ts_list)
+
+        # build unique candidates
+        ivs: List[str] = []
+        for iv in (interval, "15m", "5m"):
+            if iv not in ivs:
+                ivs.append(iv)
+
+        ph = ", ".join(["%s"] * len(ivs))
+
+        q_seed = f"""
+        SELECT DISTINCT ON (interval) interval, open_time, cvd_quote
+        FROM candles
+        WHERE exchange_id=%s AND symbol_id=%s
+          AND interval IN ({ph})
+          AND open_time <= %s
+          AND cvd_quote IS NOT NULL
+        ORDER BY interval, open_time DESC
+        """
+
+        q_range = f"""
+        SELECT interval, open_time, cvd_quote
+        FROM candles
+        WHERE exchange_id=%s AND symbol_id=%s
+          AND interval IN ({ph})
+          AND open_time > %s AND open_time <= %s
+          AND cvd_quote IS NOT NULL
+        ORDER BY interval, open_time ASC
+        """
+
+        points_by_iv: Dict[str, List[Tuple[datetime, float]]] = {iv: [] for iv in ivs}
+
+        try:
+            with storage.pool.connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(q_seed, (int(exchange_id), int(symbol_id), *ivs, start_bound))
+                    for iv, ts, val in cur.fetchall() or []:
+                        v = _to_float_opt(val)
+                        if v is None:
+                            continue
+                        points_by_iv[str(iv)].append((_utc(ts), float(v)))
+
+                    cur.execute(q_range, (int(exchange_id), int(symbol_id), *ivs, start_bound, end_bound))
+                    for iv, ts, val in cur.fetchall() or []:
+                        v = _to_float_opt(val)
+                        if v is None:
+                            continue
+                        points_by_iv[str(iv)].append((_utc(ts), float(v)))
+        except Exception:
+            return {}
+
+        for iv in ivs:
+            points_by_iv[iv].sort(key=lambda x: x[0])
+
+        from bisect import bisect_right
+
+        times_by_iv: Dict[str, List[datetime]] = {
+            iv: [t for t, _ in (points_by_iv.get(iv) or [])] for iv in ivs
+        }
+
+        out: Dict[datetime, Optional[float]] = {}
+
+        for open_ts, close_ts in zip(opens, close_ts_list):
+            best_point_ts: Optional[datetime] = None
+            best_val: Optional[float] = None
+
+            for iv in ivs:
+                pts = points_by_iv.get(iv) or []
+                if not pts:
+                    continue
+                times = times_by_iv.get(iv) or []
+                j = bisect_right(times, close_ts) - 1
+                if j < 0:
+                    continue
+                pt_ts, pt_val = pts[j]
+                if best_point_ts is None or pt_ts > best_point_ts:
+                    best_point_ts = pt_ts
+                    best_val = float(pt_val)
+
+            out[open_ts] = best_val
+
+        return out
+
     @staticmethod
     def _fetch_oi_at(storage: Any, exchange_id: int, symbol_id: int, interval: str, ts: datetime) -> Optional[float]:
+        """Open Interest на закрытии свечи с умным выбором таймфрейма.
+
+        В БД у тебя есть OI и по 1h/4h, но они могут сильно лагать. При этом 5m обновляется почти в реальном времени.
+        Поэтому для каждой свечи берём OI как **последнее значение <= close_time свечи** и выбираем самый свежий вариант
+        среди:
+          - interval (тот же TF, что и анализ)
+          - base_interval='5m' (если interval != 5m)
+
+        Это даёт:
+          - исторически: будут использоваться 1h/4h (когда 5m ещё нет)
+          - в онлайне: будет использоваться 5m, если 1h/4h отстают
+        """
+        interval = str(interval).strip()
+        open_ts = _utc(ts)
+        td = _parse_interval(interval)
+        if td.total_seconds() <= 0:
+            td = timedelta(hours=1)
+        close_ts = open_ts + td
+        close_eps = close_ts - timedelta(microseconds=1)
+
         q = """
-        SELECT open_interest
+        SELECT ts, open_interest
         FROM open_interest
         WHERE exchange_id=%s AND symbol_id=%s AND interval=%s AND ts <= %s
         ORDER BY ts DESC
         LIMIT 1
         """
-        with storage.pool.connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(q, (int(exchange_id), int(symbol_id), str(interval), _utc(ts)))
-                r = cur.fetchone()
-                return _to_float(r[0]) if r else None
+
+        base_interval = "5m"
+
+        try:
+            with storage.pool.connection() as conn:
+                with conn.cursor() as cur:
+                    best_ts: Optional[datetime] = None
+                    best_val: Optional[float] = None
+                    best_iv: Optional[str] = None
+
+                    candidates = [interval]
+                    if interval != base_interval:
+                        candidates.append(base_interval)
+
+                    for iv in candidates:
+                        cur.execute(q, (int(exchange_id), int(symbol_id), iv, close_eps))
+                        r = cur.fetchone()
+                        if not r:
+                            continue
+                        r_ts = _utc(r[0])
+                        r_val = _to_float_opt(r[1])
+                        if r_val is None:
+                            continue
+                        if best_ts is None or r_ts > best_ts:
+                            best_ts, best_val, best_iv = r_ts, float(r_val), iv
+
+                    if best_val is not None:
+                        if best_iv and best_iv != interval:
+                            try:
+                                log.debug(
+                                    "OI pick fresher interval=%s instead of %s symbol_id=%s close=%s oi_ts=%s",
+                                    best_iv, interval, int(symbol_id), close_eps, best_ts
+                                )
+                            except Exception:
+                                pass
+                        return float(best_val)
+        except Exception:
+            return None
+
+        return None
 
     @staticmethod
     def _fetch_cvd_at(storage: Any, exchange_id: int, symbol_id: int, interval: str, ts: datetime) -> Optional[float]:
+        """CVD (candles.cvd_quote) на закрытии свечи.
+
+        По твоей статистике:
+          - 15m: cvd_quote заполнен (nulls=0)
+          - 4h: много NULL (nulls большие)
+        Поэтому работаем так:
+          1) пытаемся взять cvd_quote из того же interval (если не NULL)
+          2) если NULL/нет — берём самый свежий cvd_quote <= close_time из 15m
+          3) если 15m вдруг нет — пробуем 5m
+
+        Важно: считаем cvd_quote кумулятивным, поэтому "последнее значение до конца свечи" = CVD на close.
+        """
+        interval = str(interval).strip()
+        open_ts = _utc(ts)
+        td = _parse_interval(interval)
+        if td.total_seconds() <= 0:
+            td = timedelta(hours=1)
+        close_ts = open_ts + td
+        close_eps = close_ts - timedelta(microseconds=1)
+
         q = """
-        SELECT cvd_quote
+        SELECT open_time, cvd_quote
         FROM candles
-        WHERE exchange_id=%s AND symbol_id=%s AND interval=%s AND open_time <= %s
+        WHERE exchange_id=%s AND symbol_id=%s AND interval=%s
+          AND open_time <= %s
+          AND cvd_quote IS NOT NULL
         ORDER BY open_time DESC
         LIMIT 1
         """
-        with storage.pool.connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(q, (int(exchange_id), int(symbol_id), str(interval), _utc(ts)))
-                r = cur.fetchone()
-                return _to_float(r[0]) if r else None
+
+        # Порядок важен для производительности: 15m обычно намного легче чем 1m,
+        # и у тебя 15m уже полностью заполнен.
+        fallbacks = ["15m", "5m"]
+
+        try:
+            with storage.pool.connection() as conn:
+                with conn.cursor() as cur:
+                    best_ts: Optional[datetime] = None
+                    best_val: Optional[float] = None
+
+                    candidates = [interval] + [x for x in fallbacks if x != interval]
+
+                    for iv in candidates:
+                        cur.execute(q, (int(exchange_id), int(symbol_id), iv, close_eps))
+                        r = cur.fetchone()
+                        if not r:
+                            continue
+                        r_ts = _utc(r[0])
+                        r_val = _to_float_opt(r[1])
+                        if r_val is None:
+                            continue
+                        if best_ts is None or r_ts > best_ts:
+                            best_ts, best_val = r_ts, float(r_val)
+
+                    if best_val is not None:
+                        return float(best_val)
+        except Exception:
+            return None
+
+        return None
 
     @staticmethod
     def _fetch_funding_at(storage: Any, exchange_id: int, symbol_id: int, ts: datetime) -> Optional[float]:
@@ -1115,6 +1548,25 @@ class ScrLiquidationBinance:
             anchor_close = _to_float(anchor["close"])
 
             confirm_window = candles[anchor_idx + 1: anchor_idx + 1 + lf] if lf > 0 else []
+            # -------------------------
+            # batched OI/CVD prefetch for anchor + confirm window (performance)
+            # -------------------------
+            oi_map: Optional[Dict[datetime, Optional[float]]] = None
+            cvd_map: Optional[Dict[datetime, Optional[float]]] = None
+
+            pref_times = [anchor_ts] + [_utc(c["ts"]) for c in confirm_window]
+
+            if p.enable_oi:
+                oi_map = self._prefetch_oi_close_map(storage, exchange_id, symbol_id, p.interval, pref_times)
+
+            if p.enable_cvd:
+                # If all candles already carry cvd_quote (e.g. from live aggregation), skip DB prefetch.
+                need_db_cvd = any((c.get("cvd_quote") is None) for c in ([anchor] + list(confirm_window)))
+                if need_db_cvd:
+                    cvd_map = self._prefetch_cvd_close_map(storage, exchange_id, symbol_id, p.interval, pref_times)
+                else:
+                    cvd_map = {}
+
 
             lvl_hist = candles[max(0, anchor_idx - (p.period_levels + 25)): anchor_idx]
             up_level, down_level, lvl_meta = self._build_levels(
@@ -1154,10 +1606,21 @@ class ScrLiquidationBinance:
             buy_ready = bool(touch_dn and buy_liq_ok and vol_ok and dom_buy_ok)
 
             oi_anchor = cvd_anchor = None
+
             if p.enable_oi:
-                oi_anchor = self._fetch_oi_at(storage, exchange_id, symbol_id, p.interval, anchor_ts)
+                # Prefer batched map, fallback to per-candle query if missing
+                if oi_map is not None:
+                    oi_anchor = oi_map.get(_ts_key(anchor_ts))
+                if oi_anchor is None:
+                    oi_anchor = self._fetch_oi_at(storage, exchange_id, symbol_id, p.interval, anchor_ts)
+
             if p.enable_cvd:
-                cvd_anchor = self._fetch_cvd_at(storage, exchange_id, symbol_id, p.interval, anchor_ts)
+                # Prefer CVD attached to candle (works for live aggregated candles too).
+                cvd_anchor = anchor.get("cvd_quote")
+                if cvd_anchor is None and cvd_map is not None:
+                    cvd_anchor = cvd_map.get(_ts_key(anchor_ts))
+                if cvd_anchor is None:
+                    cvd_anchor = self._fetch_cvd_at(storage, exchange_id, symbol_id, p.interval, anchor_ts)
 
             sell_hit_data = None
             buy_hit_data = None
@@ -1172,6 +1635,8 @@ class ScrLiquidationBinance:
                     p=p,
                     oi_anchor=oi_anchor,
                     cvd_anchor=cvd_anchor,
+                    oi_map=oi_map,
+                    cvd_map=cvd_map,
                     confirm_window=confirm_window,
                 )
 
@@ -1185,6 +1650,8 @@ class ScrLiquidationBinance:
                     p=p,
                     oi_anchor=oi_anchor,
                     cvd_anchor=cvd_anchor,
+                    oi_map=oi_map,
+                    cvd_map=cvd_map,
                     confirm_window=confirm_window,
                 )
 

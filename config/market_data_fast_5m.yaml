@@ -1,9 +1,4 @@
-# FAST PROCESS: minimal REST load, WS candles (1m/5m) + optional liquidations
-# Purpose:
-#   - свечи 1m/5m в реальном времени
-#   - seed только 2 дня
-#   - universe/filters/retention НЕ тут
-
+# FAST PROCESS: minimal REST load, WS candles (1m/5m) + liquidations (optional)
 exchange: binance
 exchange_id: 1
 
@@ -13,8 +8,8 @@ rest_limits:
   force: true
 
 startup_stagger:
-  after_candles: 0.4
-  after_liquidations: 0.3
+  after_candles: 0.6
+  after_liquidations: 0.4
 
 universe:
   enabled: false
@@ -22,19 +17,20 @@ universe:
 symbol_filters:
   enabled: false
 
+# раз universe/filters отключены — нет смысла дёргать символы каждую минуту
 symbols_refresh:
-  refresh_sec: 60
+  refresh_sec: 600
 
 market_data:
   enabled: true
   candle_intervals: ["1m", "5m"]
 
-  # REST seed: последние 2 дня
+  # REST seed: последние 2 дня (хватает: 1m ~2880 точек => 1500*2 страницы)
   seed_on_start: true
   seed_days: 2
   seed_limit: 1500
   seed_max_pages_per_symbol: 2
-  seed_symbols_per_cycle: 8
+  seed_symbols_per_cycle: 4          # было 8 (меньше бурст на старте)
   per_request_sleep_sec: 0.12
   seed_overlap_minutes: 30
 
@@ -43,18 +39,16 @@ market_data:
   ws_max_streams_per_conn: 120
   ws_url_max_len: 2600
 
-  # ✅ ВАЖНО: только закрытые свечи (снимает 90% нагрузки)
+  # ✅ только закрытые свечи (меньше апдейтов/записей)
   update_open_candle: false
 
-  # supervisor не нужен (universe фиксированный)
   ws_supervisor:
     enabled: false
 
-  # ✅ стабильные ping/pong (используется твоим collector_candles.py)
   ws_ping_interval: 60
   ws_ping_timeout: 30
 
-  # REST catchup при подключении (легкий)
+  # REST catchup при подключении (легкий хвост)
   rest_catchup_on_connect: true
   rest_catchup_overlap_minutes: 15
   rest_catchup_limit: 1500
@@ -65,7 +59,7 @@ market_data:
 
 liquidations:
   enabled: true
-  flush_sec: 1.0
+  flush_sec: 2.0
 
 open_interest:
   enabled: false
@@ -74,9 +68,6 @@ funding:
   enabled: false
 
 ticker_24h:
-  enabled: false
-
-market_trades:
   enabled: false
 
 market_trades_all:

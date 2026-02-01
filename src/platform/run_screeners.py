@@ -1,4 +1,5 @@
 # src/platform/run_screeners.py
+
 from __future__ import annotations
 
 import os
@@ -6,7 +7,7 @@ import time
 import logging
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Set, Optional
-from datetime import datetime, timezone, date
+from datetime import datetime, timezone, date, timedelta
 
 import yaml
 from psycopg.errors import UniqueViolation
@@ -22,6 +23,36 @@ log = logging.getLogger("platform.run_screeners")
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _ensure_dt_utc(v: Any) -> Optional[datetime]:
+    """
+    Нормализует signal_ts к timezone-aware UTC datetime.
+    Поддерживает datetime и ISO-строки (включая суффикс 'Z').
+    """
+    if v is None:
+        return None
+
+    if isinstance(v, datetime):
+        if v.tzinfo is None:
+            v = v.replace(tzinfo=timezone.utc)
+        return v.astimezone(timezone.utc)
+
+    if isinstance(v, str):
+        s = v.strip()
+        if not s:
+            return None
+        try:
+            s = s.replace("Z", "+00:00")
+            dt = datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        except Exception:
+            return None
+
+    return None
+
 
 
 # -----------------------------
@@ -841,6 +872,33 @@ def main() -> None:
                     )
                     if not signals:
                         log.info("No signals interval=%s", interval)
+                        continue
+
+                    # ✅ сохраняем/шлём ТОЛЬКО свежие сигналы (по умолчанию за последние 15 минут)
+                    now_ts_fresh = _utc_now()
+                    fresh_minutes = int(params_i.get("fresh_signal_minutes", 30))
+                    if fresh_minutes > 0:
+                        thr = now_ts_fresh - timedelta(minutes=fresh_minutes)
+                        sigs2 = []
+                        for s in signals:
+                            try:
+                                dt = _ensure_dt_utc(getattr(s, "signal_ts", None))
+                                if dt is None:
+                                    continue
+                                s.signal_ts = dt  # normalize
+                                if dt >= thr:
+                                    sigs2.append(s)
+                            except Exception:
+                                continue
+
+                        skipped_old = len(signals) - len(sigs2)
+                        if skipped_old > 0:
+                            log.info("Skip old signals (> %dm) interval=%s: %d", fresh_minutes, interval, skipped_old)
+
+                        signals = sigs2
+
+                    if not signals:
+                        log.info("No fresh signals interval=%s", interval)
                         continue
 
                     for s in signals:

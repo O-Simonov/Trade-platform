@@ -1,4 +1,4 @@
-# src/platform/screeners/plotting.py
+# src/platform/screeners/plotting_liquidation.py
 from __future__ import annotations
 
 import os
@@ -29,6 +29,7 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 
 import matplotlib.dates as mdates
 from matplotlib.patches import Rectangle
+from matplotlib import transforms
 
 
 # ======================================================================
@@ -122,6 +123,83 @@ def _pct_to_level(level: Optional[float], base: float) -> Optional[float]:
         return (lv / float(base) - 1.0) * 100.0
     except Exception:
         return None
+
+def _fmt_compact(v: float) -> str:
+    """Human-friendly number formatting: 1.23K / 4.56M / 7.89B"""
+    try:
+        x = float(v)
+        ax = abs(x)
+        if ax >= 1e9:
+            return f"{x/1e9:.2f}B"
+        if ax >= 1e6:
+            return f"{x/1e6:.2f}M"
+        if ax >= 1e3:
+            return f"{x/1e3:.2f}K"
+        return f"{x:.0f}"
+    except Exception:
+        return str(v)
+
+
+def _label_bbox() -> dict:
+    # белая полупрозрачная подложка, чтобы текст не терялся на свечах
+    return dict(boxstyle="round,pad=0.20", fc="white", ec="none", alpha=0.72)
+
+
+def _place_side_labels(ax, fig: Figure, labels: list[dict]) -> None:
+    """
+    Размещает подписи уровней (UP/DOWN/TP/SL/ENTRY) так, чтобы они не перекрывались:
+    - x фиксирован (слева или справа) в координатах осей (0..1)
+    - y в координатах данных
+    - конфликт решаем вертикальными смещениями в пикселях -> переводим в points
+    """
+    if not labels:
+        return
+
+    dpi = getattr(fig, "dpi", 100) or 100
+
+    def _do_group(group: list[dict], x_ax: float, ha: str) -> None:
+        if not group:
+            return
+        blended = transforms.blended_transform_factory(ax.transAxes, ax.transData)
+        # сортируем по y в экранных координатах
+        items = []
+        for it in group:
+            try:
+                y = float(it["y"])
+            except Exception:
+                continue
+            y_disp = ax.transData.transform((0.0, y))[1]
+            items.append((y_disp, y, it))
+        items.sort(key=lambda t: t[0])
+
+        min_px = 14.0  # минимальный вертикальный зазор между подписями
+        prev = None
+        for y_disp, y, it in items:
+            y_adj = y_disp if prev is None else max(y_disp, prev + min_px)
+            dy_px = y_adj - y_disp
+            dy_pt = dy_px * 72.0 / float(dpi)
+
+            ax.annotate(
+                it["text"],
+                xy=(x_ax, y),
+                xycoords=blended,
+                xytext=(0, dy_pt),
+                textcoords="offset points",
+                ha=ha,
+                va="center",
+                color=it.get("color", "black"),
+                fontsize=9,
+                bbox=_label_bbox(),
+                clip_on=True,
+            )
+            prev = y_adj
+
+    left = [it for it in labels if it.get("side", "left") == "left"]
+    right = [it for it in labels if it.get("side") == "right"]
+
+    _do_group(left, x_ax=0.01, ha="left")
+    _do_group(right, x_ax=0.99, ha="right")
+
 
 
 def _plot_candles(ax, *, x_dt: list, o: list[float], h: list[float], l: list[float], c: list[float]) -> float:
@@ -246,16 +324,16 @@ def _fallback_liq_series(
 def _draw_level_zone(
     ax,
     *,
-    x0_dt,
     level: float,
     zone_pct: float,
     label: str,
     kind: str,
     pct_from_entry: Optional[float] = None,
-) -> None:
+) -> Optional[Dict[str, Any]]:
+    """Рисует линию/зону уровня и возвращает данные для подписи."""
     lv = _safe_float(level, 0.0)
     if lv <= 0:
-        return
+        return None
 
     z = abs(float(zone_pct)) if zone_pct else 0.003
     if z <= 0:
@@ -267,19 +345,20 @@ def _draw_level_zone(
     if kind == "up":
         c = "green"
         alpha = 0.10
-        va = "bottom"
     else:
         c = "blue"
         alpha = 0.10
-        va = "top"
 
     ax.axhspan(y0, y1, xmin=0.0, xmax=1.0, alpha=alpha)
     ax.axhline(lv, linestyle="--", color=c, alpha=0.85)
 
     if pct_from_entry is None:
-        ax.text(x0_dt, lv, f"{label}={lv:.6f}", va=va)
+        txt = f"{label}={lv:.6f}"
     else:
-        ax.text(x0_dt, lv, f"{label}={lv:.6f} ({pct_from_entry:+.2f}%)", va=va)
+        txt = f"{label}={lv:.6f} ({pct_from_entry:+.2f}%)"
+
+    return {"y": lv, "text": txt, "color": c}
+
 
 
 # ======================================================================
@@ -305,6 +384,15 @@ def save_signal_plot(
     liq_long_usdt: Optional[float] = None,
     funding_series: Optional[Sequence[Dict[str, Any]]] = None,
     funding_rate: Optional[float] = None,
+
+    # -------------------------
+    # Volume info (для отображения среднего и порога)
+    # -------------------------
+    volume_avg: Optional[float] = None,         # avg volume (как в расчёте сигнала)
+    volume_threshold: Optional[float] = None,   # avg * (1 + volume_change_pct/100)
+    volume_anchor: Optional[float] = None,      # volume(anchor candle)
+    volume_change_pct: Optional[float] = None,  # требуемый рост (в %)
+    anchor_ts: Any = None,                      # timestamp anchor candle (если есть)
     level_zone_pct: float = 0.003,  # 0.3%
     **_: Any,
 ) -> None:
@@ -359,44 +447,62 @@ def save_signal_plot(
     candle_w = _plot_candles(ax_price, x_dt=x, o=o, h=h, l=l, c=c_)
     ax_price.set_title(f"{symbol} [{timeframe}] {title_side} | entry={entry_p:.6f}{extra_pct}")
 
-    # уровни зонами
+    # уровни зонами + подписи (без наложений)
+    level_labels: list[dict] = []
+
     if up_level is not None:
-        _draw_level_zone(
+        info = _draw_level_zone(
             ax_price,
-            x0_dt=x[0],
             level=float(up_level),
             zone_pct=level_zone_pct,
             label="UP",
             kind="up",
             pct_from_entry=up_pct,
         )
+        if info:
+            info["side"] = "left"
+            level_labels.append(info)
 
     if down_level is not None:
-        _draw_level_zone(
+        info = _draw_level_zone(
             ax_price,
-            x0_dt=x[0],
             level=float(down_level),
             zone_pct=level_zone_pct,
             label="DOWN",
             kind="down",
             pct_from_entry=dn_pct,
         )
+        if info:
+            info["side"] = "left"
+            level_labels.append(info)
+
+    # ENTRY (горизонтальная линия и подпись)
+    if entry_p > 0:
+        ax_price.axhline(entry_p, linestyle="-", color="gray", alpha=0.30, linewidth=1.0)
+        level_labels.append({"y": entry_p, "text": f"ENTRY={entry_p:.6f}", "color": "black", "side": "right"})
 
     # SL / TP
     slv = _safe_float(stop_loss, 0.0) if stop_loss is not None else 0.0
     tpv = _safe_float(take_profit, 0.0) if take_profit is not None else 0.0
+
     if slv > 0:
         ax_price.axhline(slv, linestyle=":", color="red", alpha=0.7)
-        ax_price.text(x[0], slv, f"SL={slv:.6f}", va="bottom", color="red")
+        level_labels.append({"y": slv, "text": f"SL={slv:.6f}", "color": "red", "side": "left"})
 
     if tpv > 0:
         ax_price.axhline(tpv, linestyle=":", color="orange", alpha=0.7)
-        ax_price.text(x[0], tpv, f"TP={tpv:.6f}", va="bottom", color="orange")
+        level_labels.append({"y": tpv, "text": f"TP={tpv:.6f}", "color": "orange", "side": "left"})
+
+    # размещаем подписи уровней так, чтобы не перекрывались (UP/DOWN/TP/SL/ENTRY)
+    _place_side_labels(ax_price, fig, level_labels)
 
     idx_entry = _find_nearest_index(x, entry_ts)
     idx_touch = _find_nearest_index(x, touch_ts) if touch_ts is not None else None
 
-    # TOUCH marker (без подписей ликвидаций на цене — как ты просил)
+    # эвристика "правого края"
+    near_right_cut = max(0, int(len(x) * 0.94))
+
+    # TOUCH marker
     if idx_touch is not None:
         try:
             x_t = x[idx_touch]
@@ -409,7 +515,32 @@ def save_signal_plot(
 
             ax_price.axvline(x_t, linestyle=":", color="purple", alpha=0.9)
             ax_price.scatter([x_t], [y_t], marker="x", color="purple")
-            ax_price.text(x_t, y_t, " TOUCH", va="bottom", ha="left", color="purple")
+
+            # если рядом confirm — разводим по вертикали
+            close_to_entry = (idx_entry is not None) and (abs(int(idx_touch) - int(idx_entry)) <= 2)
+            near_right_touch = int(idx_touch) >= near_right_cut
+            near_right_entry = (idx_entry is not None) and (int(idx_entry) >= near_right_cut)
+
+            if near_right_touch or (near_right_entry and close_to_entry):
+                dx_t, ha_t = -55, "right"
+            else:
+                dx_t, ha_t = -55, "right"  # touch почти всегда лучше слева
+
+            dy_t = -14 if close_to_entry else 10
+            va_t = "top" if dy_t < 0 else "bottom"
+
+            ax_price.annotate(
+                "TOUCH",
+                xy=(x_t, y_t),
+                xytext=(dx_t, dy_t),
+                textcoords="offset points",
+                ha=ha_t,
+                va=va_t,
+                color="purple",
+                fontsize=10,
+                bbox=_label_bbox(),
+                clip_on=True,
+            )
         except Exception:
             pass
 
@@ -422,9 +553,31 @@ def save_signal_plot(
 
             ax_price.axvline(x_e, linestyle="--", color="blue", alpha=0.9)
             ax_price.scatter([x_e], [y_e], marker=marker, color="blue")
-            ax_price.text(x_e, y_e, f" {title_side} ", va="bottom", ha="left", color="blue")
+
+            close_to_touch = (idx_touch is not None) and (abs(int(idx_entry) - int(idx_touch)) <= 2)
+            near_right_entry = int(idx_entry) >= near_right_cut
+
+            if near_right_entry:
+                dx_e, ha_e = -55, "right"
+            else:
+                dx_e, ha_e = 55, "left"
+
+            dy_e = 14 if close_to_touch else 10
+            ax_price.annotate(
+                f"{title_side}",
+                xy=(x_e, y_e),
+                xytext=(dx_e, dy_e),
+                textcoords="offset points",
+                ha=ha_e,
+                va="bottom",
+                color="blue",
+                fontsize=10,
+                bbox=_label_bbox(),
+                clip_on=True,
+            )
         except Exception:
             pass
+
 
     ax_price.grid(True, alpha=0.15)
     _nice_time_axis(ax_price)
@@ -450,10 +603,61 @@ def save_signal_plot(
             linewidth=0.2,
         )
 
+        # --- AVG / THR / ANCH (как в логике сигнала) ---
+        avg_v = _safe_float(volume_avg, 0.0)
+        thr_v = _safe_float(volume_threshold, 0.0)
+        req_pct = _safe_float(volume_change_pct, 0.0)
+        if thr_v <= 0.0 and avg_v > 0.0 and req_pct > 0.0:
+            thr_v = avg_v * (1.0 + req_pct / 100.0)
+        anch_v = _safe_float(volume_anchor, 0.0)
+
+        if avg_v > 0.0:
+            ax_vol.axhline(avg_v, linestyle="--", color="black", alpha=0.25, linewidth=1.0)
+        if thr_v > 0.0:
+            ax_vol.axhline(thr_v, linestyle=":", color="orange", alpha=0.75, linewidth=1.2)
+
+        # отметим anchor свечу вертикальной линией (если передан anchor_ts)
+        try:
+            idx_a = _find_nearest_index(x, anchor_ts) if anchor_ts is not None else None
+            if idx_a is not None:
+                ax_vol.axvline(x[idx_a], linestyle=":", color="black", alpha=0.12)
+        except Exception:
+            pass
+
+        # подпись сверху слева
+        if avg_v > 0.0 or thr_v > 0.0 or anch_v > 0.0:
+            parts = []
+            if avg_v > 0.0:
+                parts.append(f"AVG={_fmt_compact(avg_v)}")
+            if thr_v > 0.0:
+                if req_pct > 0.0:
+                    parts.append(f"THR={_fmt_compact(thr_v)} (REQ=+{req_pct:.0f}%)")
+                else:
+                    parts.append(f"THR={_fmt_compact(thr_v)}")
+            if anch_v > 0.0:
+                if avg_v > 0.0:
+                    ratio = anch_v / avg_v
+                    delta = (ratio - 1.0) * 100.0
+                    parts.append(f"ANCH={_fmt_compact(anch_v)} | x{ratio:.2f} (Δ={delta:+.0f}%)")
+                else:
+                    parts.append(f"ANCH={_fmt_compact(anch_v)}")
+
+            ax_vol.text(
+                0.01,
+                0.97,
+                " | ".join(parts),
+                transform=ax_vol.transAxes,
+                va="top",
+                ha="left",
+                fontsize=9,
+                bbox=_label_bbox(),
+            )
+
         ax_vol.grid(True, alpha=0.15)
         ax_vol.set_ylabel("Vol")
     except Exception:
         pass
+
 
     # =========================================================
     # LIQUIDATIONS panel (СТОЛБИКИ ✅)

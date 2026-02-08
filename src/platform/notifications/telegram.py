@@ -186,6 +186,7 @@ def send_telegram_message(
     bot_token: Optional[str] = None,
     chat_id: Optional[str] = None,
     disable_preview: bool = True,
+    disable_notification: bool = False,
 ) -> bool:
     """
     Отправляет сообщение в Telegram.
@@ -215,6 +216,7 @@ def send_telegram_message(
         "chat_id": target.chat_id,
         "text": text,
         "disable_web_page_preview": bool(disable_preview),
+        "disable_notification": bool(disable_notification),
     }
 
     try:

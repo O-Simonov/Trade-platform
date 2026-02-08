@@ -822,8 +822,27 @@ def main() -> None:
                 seed_max_pages_per_symbol=int(md_cfg.get("seed_max_pages_per_symbol", 3)),
                 seed_symbols_per_cycle=int(md_cfg.get("seed_symbols_per_cycle", 5)),
                 per_request_sleep_sec=float(md_cfg.get("per_request_sleep_sec", 0.20)),
+                seed_overlap_minutes=int(md_cfg.get("seed_overlap_minutes", 60)),
                 use_ws=bool(md_cfg.get("use_ws", True)),
                 ws_max_streams_per_conn=int(md_cfg.get("ws_max_streams_per_conn", 120)),
+                ws_url_max_len=int(md_cfg.get("ws_url_max_len", 2600)),
+                ws_flush_sec=float(md_cfg.get("ws_flush_sec", 1.0)),
+                ws_max_buffer=int(md_cfg.get("ws_max_buffer", 2000)),
+                ws_ping_interval=int(md_cfg.get("ws_ping_interval", 60)),
+                ws_ping_timeout=int(md_cfg.get("ws_ping_timeout", 30)),
+
+                # REST tail catchup on WS connect
+                rest_catchup_on_connect=bool(md_cfg.get("rest_catchup_on_connect", True)),
+                rest_catchup_first_worker_only=bool(md_cfg.get("rest_catchup_first_worker_only", True)),
+                rest_catchup_overlap_minutes=int(md_cfg.get("rest_catchup_overlap_minutes", 120)),
+                rest_catchup_limit=int(md_cfg.get("rest_catchup_limit", 1500)),
+                rest_catchup_max_pages=int(md_cfg.get("rest_catchup_max_pages", 2)),
+                catchup_seed_days=int(md_cfg.get("catchup_seed_days", 2)),
+                catchup_max_symbols=int(md_cfg.get("catchup_max_symbols", 0)),
+
+                # WS supervisor config (optional dict)
+                ws_supervisor=md_cfg.get("ws_supervisor"),
+
             )
     else:
         log.warning("Candles disabled by config")

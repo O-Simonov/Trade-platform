@@ -1,4 +1,4 @@
-# src/platform/run_screeners.py
+# src/platform/run_screeners_liquidation.py
 from __future__ import annotations
 
 import os
@@ -28,7 +28,7 @@ from src.platform.notifications.telegram import (
 
 from src.platform.core.utils.candles import aggregate_candles, interval_to_timedelta, slice_window
 
-log = logging.getLogger("platform.run_screeners")
+log = logging.getLogger("platform.run_screeners_liquidation")
 
 _PLOTS_CLEANUP_LAST: Dict[str, datetime] = {}
 
@@ -151,7 +151,11 @@ def _cleanup_plots_dir(plots_dir: Path, *, keep_days: int, now: Optional[datetim
 # YAML helpers
 # -----------------------------
 def _load_cfg() -> Dict[str, Any]:
-    cfg_path = os.getenv("SCREENERS_CONFIG", "config/screeners.yaml")
+    cfg_path = (
+        os.getenv("SCREENERS_LIQUIDATION_CONFIG")
+        or os.getenv("SCREENERS_CONFIG")
+        or "config/screeners_liquidation.yaml"
+    )
     p = Path(cfg_path)
     if not p.exists():
         raise FileNotFoundError(f"Config not found: {cfg_path}")
@@ -405,9 +409,13 @@ def main() -> None:
     except OSError:
         pass
 
-    cfg_path = os.getenv("SCREENERS_CONFIG", "config/screeners.yaml")
-    log.info("=== RUN SCREENERS START ===")
-    log.info("SCREENERS_CONFIG=%s", cfg_path)
+    cfg_path = (
+        os.getenv("SCREENERS_LIQUIDATION_CONFIG")
+        or os.getenv("SCREENERS_CONFIG")
+        or "config/screeners_liquidation.yaml"
+    )
+    log.info("=== RUN SCREENERS LIQUIDATION START ===")
+    log.info("CONFIG=%s", cfg_path)
 
     cfg = _load_cfg()
     restart_interval_minutes = int(cfg.get("restart_interval_minutes", 5))
@@ -459,7 +467,7 @@ def main() -> None:
                 screener_id = store.ensure_screener(name=name, version=version)
                 scr = screener_registry[name]()
 
-                for interval, liq_limit in pairs:
+                for idx, (interval, liq_limit) in enumerate(pairs):
                     params_i = dict(params)
                     params_i["interval"] = interval
 
@@ -472,6 +480,21 @@ def main() -> None:
 
                     if liq_limit is not None:
                         params_i["volume_liquid_limit"] = float(liq_limit)
+
+                    # volume_change_pct can be scalar OR list mapped by intervals order OR dict {interval: pct}
+                    vcp = params.get("volume_change_pct")
+                    if isinstance(vcp, list):
+                        vlist = _normalize_float_list(vcp)
+                        if vlist:
+                            pick = float(vlist[idx]) if idx < len(vlist) else float(vlist[-1])
+                            params_i["volume_change_pct"] = pick
+                    elif isinstance(vcp, dict):
+                        key = str(interval)
+                        if key in vcp:
+                            try:
+                                params_i["volume_change_pct"] = float(vcp.get(key))
+                            except (ValueError, TypeError):
+                                pass
 
                     signals = scr.run(
                         storage=store,
@@ -546,6 +569,18 @@ def main() -> None:
                         signal_day = sig.signal_ts.date()
                         ctx = _jsonable(dict(sig.context or {}))
 
+                        # Optional fields for signals table (may be absent in screener Signal object)
+                        confidence = getattr(sig, "confidence", None)
+                        score = getattr(sig, "score", None)
+                        reason = getattr(sig, "reason", None)
+                        source = getattr(sig, "source", None) or str(name)
+
+                        # If reason not provided explicitly, try to take it from context
+                        if not reason:
+                            r0 = ctx.get("reason") or ctx.get("signal_reason")
+                            if isinstance(r0, str) and r0.strip():
+                                reason = r0.strip()
+
                         f = funding_map.get(int(sig.symbol_id), {}) or {}
                         ctx["funding_time"] = f.get("funding_time")
                         ctx["funding_rate"] = f.get("funding_rate")
@@ -578,6 +613,13 @@ def main() -> None:
                             "exit_price": sig.exit_price,
                             "stop_loss": sig.stop_loss,
                             "take_profit": sig.take_profit,
+
+                            # required placeholders in SQL insert_signals()
+                            "confidence": confidence,
+                            "score": score,
+                            "reason": reason,
+                            "source": source,
+
                             "context": ctx,
                         }
                         rows.append(row)
@@ -625,7 +667,7 @@ def main() -> None:
                             if dd or df:
                                 log.info("Plots cleanup: deleted_dirs=%d deleted_files=%d keep_days=%d", dd, df, plots_keep_days)
 
-                    from src.platform.screeners.plotting import save_signal_plot  # local import
+                    from src.platform.screeners.plotting_liquidation import save_signal_plot  # local import
 
                     lookback = int(params_i.get("plot_lookback", 120) or 120)
                     look_fwd = int(params_i.get("plot_lookforward", 40) or 40)
@@ -725,6 +767,11 @@ def main() -> None:
                                 liquidation_series=liq_series,
                                 liq_short_usdt=ctx_plot.get("liq_short_usdt"),
                                 liq_long_usdt=ctx_plot.get("liq_long_usdt"),
+                                volume_avg=ctx_plot.get("avg_vol"),
+                                volume_anchor=ctx_plot.get("volume"),
+                                volume_change_pct=ctx_plot.get("volume_change_pct"),
+                                volume_threshold=ctx_plot.get("volume_threshold"),
+                                anchor_ts=ctx_plot.get("anchor_ts"),
                             )
 
                             total_plots += 1

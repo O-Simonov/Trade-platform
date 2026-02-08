@@ -46,16 +46,16 @@ screeners:
       # BUY (рост относительно средней)
       # ==========================================================
       buy_window_minutes: 5
-      buy_price_change_pct: 3.0
+      buy_price_change_pct: 2.0
       buy_base_lookback_bars: 240
 
       # ==========================================================
       # SELL (памп + красная свеча)
       # ==========================================================
       sell_window_minutes: 15
-      sell_pump_pct: 10.0               # ⚠️ у тебя в логах top ~3.9% => при 10% будет редко/никогда
+      sell_pump_pct: 2.5               # ⚠️ у тебя в логах top ~3.9% => при 10% будет редко/никогда
       sell_base_lookback_bars: 240
-      sell_confirm_lookforward: 6       # сколько свечей после пампа ищем "красную" (внутри этого окна)
+      sell_confirm_lookforward: 3       # сколько свечей после пампа ищем "красную" (внутри этого окна)
 
       # ==========================================================
       # OI / CVD источники + дельты (prev->end)
@@ -128,7 +128,7 @@ screeners:
       # buy_cvd_slope_norm_min: 2.0
 
       # --- SELL пороги (мягко) ---
-      # ВАЖНО: это "максимум" (отрицательный), т.е. условие: value <= threshold
+      # ВАЖНО: это "максимум" (отрицательный), т.е., условие: value <= threshold
       sell_oi_slope_max_bps: -8.0
       sell_cvd_slope_norm_max: -1.34
 
@@ -174,7 +174,7 @@ screeners:
       telegram_enabled: true
       telegram_timezone: "Europe/Moscow"
       telegram_extras_enabled: true
-      telegram_max_friends: 2
+      telegram_max_friends: 5
 
       telegram_send_text: true
       telegram_mode: "batch"

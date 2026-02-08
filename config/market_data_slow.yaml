@@ -40,8 +40,8 @@ symbols_refresh:
 market_data:
   enabled: true
 
-  # ✅ WS только 15m (как и задумано)
-  candle_intervals: ["15m"]
+  # ✅ WS
+  candle_intervals: ["15m","1h", "4h"]
 
   seed_on_start: true
   seed_days: 30
@@ -77,7 +77,7 @@ market_data:
 
 open_interest:
   enabled: true
-  intervals: ["5m"]
+  intervals: ["5m","15m"]
 
   seed_on_start: false
   seed_days: 14
@@ -134,14 +134,14 @@ ticker_24h:
   rest_safety_poll: false
 
 market_state_5m:
-  enabled: true
+  enabled: false
   poll_sec: 15                     # было 10 (чуть разгружаем)
   symbols_per_cycle: 30            # было 40
   lookback_minutes: 180
   refresh_symbols_sec: 300
 
 market_trades_all:
-  enabled: true
+  enabled: false
   use_ws: true
 
   ws_max_streams_per_conn: 160

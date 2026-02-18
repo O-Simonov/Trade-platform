@@ -9,124 +9,129 @@ screeners:
       # ---------------------------
       # Базовые фильтры
       # ---------------------------
-      intervals: ["15m","1h"]       # Таймфреймы, которые скринер анализирует (для каждого будет отдельный прогон)
+      intervals: ["15m", "1h", "4h"]      # Таймфреймы, которые скринер анализирует (для каждого будет отдельный прогон)
       min_price: 0.0000001               # Отсечь слишком дешёвые монеты (фильтр по текущей цене)
       max_price: 1000                    # Отсечь слишком дорогие монеты (фильтр по текущей цене)
 
-      volume_liquid_limit: [15000,30000]  # Мин. объём ликвидаций в anchor-свече (USDT). Маппинг по intervals:
-                                                # 15m→7000, 1h→14000, 4h→21000.
-                                                # Если не проходит — сигнал по символу игнорируется.
+      # Мин. объём ликвидаций в anchor-свече (USDT). Маппинг по intervals:
+      #   15m→7000, 1h→14000, 4h→21000
+      # Если не проходит — сигнал по символу игнорируется.
+      volume_liquid_limit: [7000, 14000, 21000]
 
-      liq_dominance_pct: 10.0            # Требуемое доминирование ликвидаций в %:
-                                         # SELL: short_liq >= long_liq * (1 + pct/100)
-                                         # BUY : long_liq  >= short_liq * (1 + pct/100)
+      # Требуемое доминирование ликвидаций в %:
+      #   SELL: short_liq >= long_liq * (1 + pct/100)
+      #   BUY : long_liq  >= short_liq * (1 + pct/100)
+      liq_dominance_pct: 10.0
 
       # ==========================================================
       # ✅ LIVE CANDLES (без задержек)
       # ==========================================================
-      live_candles_enabled: true        # Включить режим "живых" старших ТФ: строим 1h/4h из базового интервала (обычно 15m)
-      live_base_interval: "15m"         # Базовый ТФ, из которого агрегируем старшие (должен стабильно собираться коллектором)
-      live_prefer_agg: true             # Предпочитать агрегацию (15m→1h/4h) вместо чтения "родных" 1h/4h свечей из БД
-      live_extra_base_bars: 64          # Запас базовых баров при агрегации (помогает при краях окна/дырках/смещениях)
+      live_candles_enabled: true          # Строим 1h/4h из базового интервала (обычно 15m)
+      live_base_interval: "15m"           # Базовый ТФ, из которого агрегируем старшие
+      live_prefer_agg: true               # Предпочитать агрегацию (15m→1h/4h) вместо чтения "родных" 1h/4h из БД
+      live_extra_base_bars: 64            # Запас базовых баров при агрегации
 
       # ==========================================================
       # ✅ RISK / POSITION SIZE
       # ==========================================================
-      risk_trade_pct: 1.0                # Риск на сделку в % от equity (например 1.0 = 1% от капитала)
-      risk_equity_usdt: 1000             # Equity в USDT для расчёта риска; null => брать equity из БД (account_state/account_balance_snapshots)
-      risk_account_id: 1                 # account_id, из которого читать equity в БД (если risk_equity_usdt=null)
+      risk_trade_pct: 2.0                 # Риск на сделку в % от equity (например 1.0 = 1% от капитала)
+      risk_equity_usdt: 500               # Equity в USDT для расчёта риска; null => брать equity из БД
+      risk_account_id: 1                  # account_id, из которого читать equity в БД (если risk_equity_usdt=null)
 
       # ==========================================================
       # ✅ STOP LOSS / TAKE PROFIT (ТОЛЬКО %)
       # ==========================================================
-      stop_loss_pct: 2.0                 # SL в % от entry (например 2.0 = 2%)
-      take_profit_mode: "pct"            # Режим TP (в проекте оставлен только percent-режим)
-      take_profit_pct: 6.0               # TP в % от entry (например 6.0 = 6%)
+      stop_loss_pct: 2.0                  # SL в % от entry (например 2.0 = 2%)
+      take_profit_mode: "pct"             # Режим TP (в проекте оставлен только percent-режим)
+      take_profit_pct: 6.0                # TP в % от entry (например 6.0 = 6%)
 
-      entry_price_mode: confirm_close    # Откуда брать цену входа (entry):
-                                         # current       -> текущая цена (ticker_24h.last_price, fallback close)
-                                         # anchor_close  -> close anchor-свечи (с крупной ликвидацией)
-                                         # confirm_close -> close свечи подтверждения (обычно самый "консервативный" entry)
+      # Откуда брать цену входа (entry):
+      #   "current"       -> текущая цена (ticker_24h.last_price, fallback close)
+      #   "anchor_close"  -> close anchor-свечи (с крупной ликвидацией)
+      #   "confirm_close" -> close свечи подтверждения (консервативный entry)
+      entry_price_mode: "confirm_close"
+
       # ---------------------------
       # Уровни / Логика
       # ---------------------------
-      period_levels: 240                 # Сколько свечей брать для поиска уровней S/R (чем больше — тем устойчивее уровни)
-      pivot_left: 4                      # Сколько свечей слева нужно для pivot (локальный экстремум)
-      pivot_right: 4                     # Сколько свечей справа нужно для pivot
-      level_cluster_tol_pct: 0.003       # Толеранс кластеризации уровней (0.003=0.3%): близкие уровни объединяются
-      max_level_candidates: 14           # Максимум уровней-кандидатов после кластеризации
-      level_tol_pct: 0.0075              # Допуск касания уровня (±0.75%) для проверки touch/cross
+      period_levels: 240                  # Сколько свечей брать для поиска уровней S/R
+      pivot_left: 4
+      pivot_right: 4
+      level_cluster_tol_pct: 0.003        # 0.003=0.3%: близкие уровни объединяются
+      max_level_candidates: 14
+      level_tol_pct: 0.0075               # Допуск касания уровня (±0.75%)
 
       # ==========================================================
-      # ✅ TOUCH / PRE-TOUCH
+      # ✅ TOUCH / CROSS
       # ==========================================================
-      touch_lookback_candles: 5          # Сколько последних свечей (включая anchor) проверять на касание/пробой уровня
-      touch_mode: "touch_or_cross"       # touch | cross | touch_or_cross
+      touch_lookback_candles: 5           # Сколько последних свечей проверять на касание/пробой уровня
+      touch_mode: "touch_or_cross"        # "touch" | "cross" | "touch_or_cross"
 
       # ==========================================================
-      # ✅ CONFIRMATION (ВАЖНО: убираем лаг на больших TF)
+      # ✅ CONFIRMATION (убираем лаг на больших TF)
       # ==========================================================
-      confirm_lookforward: 3             # Fallback: сколько свечей после anchor смотреть подтверждение направления (закрытые свечи)
+      confirm_lookforward: 3              # Fallback: сколько свечей после anchor смотреть подтверждение направления
 
-      confirm_lookforward_map:           # Карта per-TF: задаёт confirm_lookforward по каждому таймфрейму
+      confirm_lookforward_map:            # per-TF: confirm_lookforward
         "15m": 3
         "1h": 2
+        "4h": 1
 
+      # ==========================================================
+      # ✅ Фильтр "рост объёма" относительно среднего ДО ликвидации
+      # ==========================================================
+      volume_avg_window: 240              # Окно ДО anchor для расчёта avg_volume
+
+      # Требуемый рост объёма anchor относительно среднего (в %).
+      # Маппинг по intervals:
+      #   15m→25%  (volume_anchor >= avg_volume * 1.25)
+      #   1h →45%  (volume_anchor >= avg_volume * 1.45)
+      #   4h →90%  (volume_anchor >= avg_volume * 1.90)
+      # 0 или <=0 => отключить объёмный фильтр для этого TF.
+      volume_change_pct: [25, 45, 90]
 
       # ==========================================================
-      # ✅ Фильтр "изменения объёма" относительно среднего ДО ликвидации
+      # ✅ СВЕЖЕСТЬ СИГНАЛОВ (отбрасываем старые)
       # ==========================================================
-      volume_avg_window: 240            # Окно свечей ДО anchor для расчёта средней нормы объёма (avg_volume)
+      fresh_signal_minutes: 30            # Fallback: порог свежести (мин). 0/<=0 => отключить
 
-      volume_change_pct: [70,90]      # Требуемый рост объёма anchor относительно среднего (в %).
-      # На графике Volume будет показано: AVG (средний), THR (порог по volume_change_pct), ANCH (объём свечи-сигнала).
-                                         # Маппинг по intervals:
-                                         #   15m→25%  (volume_anchor >= avg_volume * 1.25)
-                                         #   1h →20%
-                                         # 0 или <=0 => отключить объёмный фильтр для этого TF.
-      # ==========================================================
-      # ✅ СВЕЖЕСТЬ СИГНАЛОВ (ОТБРАСЫВАЕМ СТАРЫЕ)
-      # ==========================================================
-      fresh_signal_minutes: 25           # Fallback: порог свежести (мин). 0/<=0 => отключить фильтр свежести.
       fresh_signal_minutes_map:
-        "15m": 25
-        "1h": 65
-
-
+        "15m": 20
+        "1h": 25
+        "4h": 30
       # Примечание: свежесть считается по close-time: signal_ts + длительность интервала.
 
       # ---------------------------
-      # Опциональные подтверждения
+      # Funding (опционально)
       # ---------------------------
-      enable_funding: true               # Учитывать funding-фильтр/подтягивать funding в контекст (если таблица funding есть)
-      kof_fund: 0.001                    # Порог funding (в %). 0.001% => 0.00001 (доля). Используется как фильтр.
+      enable_funding: true
+      kof_fund: 0.001                     # Порог funding (в %). 0.001% => 0.00001 (доля)
 
       # ---------------------------
       # ✅ Графики
       # ---------------------------
-      enable_plots: true                      # Генерировать PNG графики для сигналов
-      plots_dir: "artifacts/screener_plots"   # Папка, куда сохранять графики
-      plots_keep_days: 2                      # хранить графики только N дней
-      plots_cleanup_every_minutes: 60         # как часто запускать очистку (минуты)
-      plot_lookback: 120                      # Сколько свечей показать "назад" от центра окна графика
-      plot_lookforward: 40                    # Сколько свечей показать "вперёд" от центра окна графика
-      plot_max_signals: 50                    # Максимум графиков за прогон (ограничение CPU/диска)
+      enable_plots: true
+      plots_dir: "artifacts/screener_plots"
+      plots_keep_days: 2
+      plots_cleanup_every_minutes: 60
+      plot_lookback: 120
+      plot_lookforward: 40
+      plot_max_signals: 50                # Максимум графиков за прогон
 
       # ---------------------------
       # Дебаг
       # ---------------------------
-      debug: true                        # Включить расширенные логи "почему не прошёл фильтр"
-      debug_top: 10                      # Сколько символов выводить в DEBUG TOP
+      debug: true
+      debug_top: 10
 
       # ✅ TELEGRAM
       telegram_enabled: true
       telegram_timezone: "Europe/Moscow"
-
       telegram_extras_enabled: true
       telegram_max_friends: 5
 
       telegram_send_text: false
       telegram_send_plots: true
-      telegram_plot_mode: "photo"        # photo | document
+      telegram_plot_mode: "photo"         # "photo" | "document"
       telegram_max_plot_signals: 50
       telegram_send_plot_followup_text: false

@@ -473,7 +473,29 @@ class BinanceExchange(ExchangeAdapter):
         return out
 
     def fetch_account_state(self, *, account: str) -> dict:
-        raw = self._rest(account).account()
+        rest = self._rest(account)
+        try:
+            raw = rest.account()
+        except Exception:
+            # Fallback to /fapi/v2/balance if /fapi/v2/account is slow/unavailable.
+            # We approximate equity = wallet + upnl (upnl may be missing here -> 0).
+            bals = rest.balance() or []
+            usdt = None
+            for r in bals:
+                if str(r.get("asset") or "").upper() == "USDT":
+                    usdt = r
+                    break
+            wallet = float((usdt or {}).get("walletBalance") or 0.0)
+            available = float((usdt or {}).get("availableBalance") or 0.0)
+            unreal = float((usdt or {}).get("unrealizedProfit") or 0.0)
+            equity = wallet + unreal
+            return {
+                "wallet_balance": wallet,
+                "equity": equity,
+                "available_balance": available,
+                "margin_used": max(0.0, equity - available),
+                "unrealized_pnl": unreal,
+            }
 
         wallet = float(raw.get("totalWalletBalance") or 0.0)
         unreal = float(raw.get("totalUnrealizedProfit") or 0.0)

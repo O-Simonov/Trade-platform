@@ -304,7 +304,7 @@ class PostgreSQLStorage:
         return self._exec_one_fetchone(query, params=params)
 
     # ======================================================================
-    # IDS / REGISTRY (used by run_instances.py)
+    # IDS / REGISTRY (used by run_balance.py)
     # ======================================================================
 
     def ensure_exchange_account_symbol(
@@ -2356,6 +2356,65 @@ class PostgreSQLStorage:
     # ======================================================================
     # RAW SQL
     # ======================================================================
+
+
+    # ------------------------------------------------------------------
+    # Generic helpers (used by traders/screeners when нужен произвольный SQL)
+    # ------------------------------------------------------------------
+    def query(self, sql: str, params: Any = None) -> list[tuple]:
+        """Выполняет SELECT и возвращает list[tuple]."""
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                rows = cur.fetchall()
+        return rows
+
+    def query_one(self, sql: str, params: Any = None) -> tuple | None:
+        """Выполняет SELECT и возвращает одну строку или None."""
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                row = cur.fetchone()
+        return row
+
+    # ------------------------------------------------------------------
+    # Dict helpers (convenience)
+    # ------------------------------------------------------------------
+    def query_dict(self, sql: str, params: Any = None) -> list[dict[str, Any]]:
+        """Выполняет SELECT и возвращает список строк как dict (col -> value).
+
+        В проекте много мест, где удобнее работать с именованными колонками.
+        Базовые query/query_all возвращают tuple, поэтому этот хелпер нужен,
+        чтобы не плодить zip(description, row) в каждом модуле.
+        """
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                rows = cur.fetchall()
+                if not rows:
+                    return []
+                cols = [d.name for d in cur.description]
+        return [dict(zip(cols, r)) for r in rows]
+
+    def query_one_dict(self, sql: str, params: Any = None) -> dict[str, Any] | None:
+        """Выполняет SELECT и возвращает одну строку как dict или None."""
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                row = cur.fetchone()
+                if row is None:
+                    return None
+                cols = [d.name for d in cur.description]
+        return dict(zip(cols, row))
+
+    def execute(self, sql: str, params: Any = None) -> int:
+        """Выполняет INSERT/UPDATE/DELETE и возвращает rowcount."""
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                rc = cur.rowcount
+            conn.commit()
+        return int(rc)
 
     def execute_raw(self, query: str, *, log_sql: bool = False) -> None:
         """

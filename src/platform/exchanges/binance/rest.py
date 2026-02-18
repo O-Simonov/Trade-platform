@@ -440,6 +440,15 @@ class BinanceFuturesREST:
         url = f"{BASE_URL}{path}"
         params = params or {}
 
+        # Optional per-request debug (helps diagnose hangs/timeouts).
+        debug_requests = os.getenv("BINANCE_REST_DEBUG_REQUESTS", "0").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        )
+
         weight = _endpoint_weight(method, path)
         attempt = 0
         backoff = float(self.base_backoff)
@@ -466,6 +475,16 @@ class BinanceFuturesREST:
                 with self._session_lock:
                     sess = self.session
 
+                t_req0 = time.time()
+                if debug_requests:
+                    log.info(
+                        "[REST REQ] %s %s timeout=%s ctx=%s",
+                        method,
+                        path,
+                        self.timeout,
+                        _fmt_params(params),
+                    )
+
                 if method == "GET":
                     response = sess.get(url, params=send_params, timeout=self.timeout)
                 elif method == "POST":
@@ -476,6 +495,15 @@ class BinanceFuturesREST:
                     response = sess.delete(url, params=send_params, timeout=self.timeout)
                 else:
                     raise ValueError(f"Unknown method {method}")
+
+                if debug_requests:
+                    log.info(
+                        "[REST RES] %s %s status=%s dt=%.3fs",
+                        method,
+                        path,
+                        getattr(response, "status_code", None),
+                        time.time() - t_req0,
+                    )
 
             except Exception as e:
                 if _looks_like_dns_error(e) or isinstance(e, requests.exceptions.ConnectionError):
@@ -500,6 +528,14 @@ class BinanceFuturesREST:
                 raise BinanceRESTError(method=method, path=path, status=None, payload=None, message=str(e)) from e
 
             status = int(response.status_code)
+            if debug_requests:
+                log.info(
+                    "[REST RSP] %s %s status=%s dt=%.3fs",
+                    method,
+                    path,
+                    status,
+                    time.time() - t_req0,
+                )
 
             try:
                 data = self._safe_json(response)
@@ -768,6 +804,16 @@ class BinanceFuturesREST:
         data = self._get("/fapi/v2/account", params=None, signed=True)
         self._cache_put(cache_key, self.account_ttl_sec, data)
         return data
+
+    def balance(self) -> Any:
+        """GET /fapi/v2/balance (signed).
+
+        Returns per-asset futures balances. Useful as a fallback when
+        /fapi/v2/account is slow or fails.
+        """
+        # Intentionally do not cache too aggressively: balance can change fast.
+        # If needed, add a TTL similar to account_ttl_sec.
+        return self._get("/fapi/v2/balance", params=None, signed=True)
 
     # ============================================================
     # Public market data (collectors)

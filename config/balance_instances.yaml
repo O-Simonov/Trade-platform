@@ -1,0 +1,30 @@
+# Balance writer instances
+# Пишет:
+#   - account_state (текущий срез)
+#   - account_balance_snapshots (история)
+#
+# Ключи API берутся из .env по имени аккаунта:
+#   BINANCE_<ACCOUNT_UPPER>_API_KEY
+#   BINANCE_<ACCOUNT_UPPER>_API_SECRET
+#
+# Пример для account: base_main  =>
+#   BINANCE_BASE_MAIN_API_KEY=...
+#   BINANCE_BASE_MAIN_API_SECRET=...
+
+instances:
+  - exchange: binance
+    account: base_main
+
+    # Как часто опрашивать биржу и писать в БД (секунды)
+    poll_sec: 10
+
+    # Таймаут REST (сек) — это именно timeout для requests (read-timeout внутри HTTP)
+    # Если у тебя бывают “подвисания” на /fapi/v2/account — ставь 20-30.
+    timeout_sec: 20
+
+    # Сколько раз ретраить запрос (0..N). Для диагностики лучше 0-1.
+    retry_max: 1
+
+    # Если нужно — включи подробный лог каждого REST запроса/ответа:
+    # (будет писать [REST REQ] и [REST RSP])
+    debug_requests: true

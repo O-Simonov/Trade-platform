@@ -213,6 +213,48 @@ class PostgreSQLStorage:
                 }
             )
         return out
+
+
+
+    def fetch_all(self, sql: str, params: Optional[Mapping[str, Any]] = None) -> List[dict]:
+        """        Выполняет SELECT и возвращает список строк как list[dict].
+
+        - params: Mapping (для %(name)s) или последовательность (для %s / $1 в зависимости от стиля).
+        - Возвращаем dict, чтобы код уровня трейдера мог обращаться по именам колонок.
+        """
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params or {})
+                rows = cur.fetchall()
+                if not rows:
+                    return []
+                cols = [d.name for d in cur.description]
+        out: List[dict] = []
+        for r in rows:
+            out.append({cols[i]: r[i] for i in range(len(cols))})
+        return out
+
+
+    def fetch_one(self, sql: str, params: Optional[Mapping[str, Any]] = None) -> Optional[dict]:
+        """
+        Возвращает одну строку (dict) или None.
+        Удобно для SELECT ... LIMIT 1.
+        """
+        rows = self.fetch_all(sql, params)
+        return rows[0] if rows else None
+
+    def fetch_val(self, sql: str, params: Optional[Mapping[str, Any]] = None, col: str = "") -> Any:
+        """
+        Возвращает одно значение из первой строки.
+        Если col не указан — берёт первое поле.
+        """
+        row = self.fetch_one(sql, params)
+        if not row:
+            return None
+        if col:
+            return row.get(col)
+        # первое поле
+        return next(iter(row.values()))
     # ======================================================================
     # DB EXEC HELPERS
     # ======================================================================

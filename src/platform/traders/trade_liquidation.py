@@ -14,7 +14,7 @@ import hashlib
 import urllib.parse
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple, Set, Union
+from typing import Any, Dict, List, Optional, Tuple
 
 from concurrent.futures import ThreadPoolExecutor, Future
 
@@ -390,8 +390,8 @@ class BinanceUMFuturesRest:
         timeout_sec: int = 10,
         debug: bool = False,
         *,
-        connect_timeout_sec: Optional[float] = None,
-        read_timeout_sec: Optional[float] = None,
+        connect_timeout_sec: float | None = None,
+        read_timeout_sec: float | None = None,
         max_retries: int = 2,
         retry_backoff_sec: float = 1.0,
     ):
@@ -432,7 +432,7 @@ class BinanceUMFuturesRest:
         path: str,
         signed: bool = True,
         *,
-        timeout: Optional[Tuple[float, float]] = None,
+        timeout: tuple[float, float] | None = None,
         **params: Any,
     ) -> Any:
         url = self.base_url + path
@@ -451,7 +451,7 @@ class BinanceUMFuturesRest:
             except Exception:
                 pass
 
-        last_exc: Optional[Exception] = None
+        last_exc: Exception | None = None
         attempts = 1 + max(0, int(self.max_retries))
         for i in range(attempts):
             try:
@@ -581,7 +581,7 @@ class TradeLiquidation:
 
     STRATEGY_ID = "trade_liquidation"
 
-    def __init__(self, store: PostgreSQLStorage, params: Union[TradeLiquidationParams, Dict[str, Any]]):
+    def __init__(self, store: PostgreSQLStorage, params: TradeLiquidationParams | Dict[str, Any]):
         self.store = store
         self.p = params if isinstance(params, TradeLiquidationParams) else TradeLiquidationParams.from_dict(params or {})
 
@@ -1147,7 +1147,7 @@ class TradeLiquidation:
         # Open orders snapshot
         open_all = self._rest_snapshot_get("open_orders_all")
         open_rows = open_all if isinstance(open_all, list) else []
-        open_by_symbol: Dict[str, Set[str]] = {}
+        open_by_symbol: Dict[str, set[str]] = {}
         for oo in open_rows:
             sym = str(oo.get("symbol") or "").strip()
             if not sym:
@@ -1382,7 +1382,8 @@ class TradeLiquidation:
 
         # В order_events НЕТ event_time — используем ts_ms/recv_ts
         sql = """
-              WITH last_ev AS (SELECT DISTINCT ON (client_order_id)
+              WITH last_ev AS (SELECT DISTINCT \
+              ON (client_order_id)
                   client_order_id,
                   order_id,
                   symbol_id,
@@ -1402,7 +1403,7 @@ class TradeLiquidation:
               SELECT client_order_id, order_id, symbol_id, status, ts_ms, recv_ts
               FROM last_ev
               WHERE status = 'FILLED'
-              ORDER BY ts_ms DESC LIMIT 200;
+              ORDER BY ts_ms DESC LIMIT 200; \
               """
 
         rows = list(
@@ -1830,7 +1831,7 @@ class TradeLiquidation:
                             if str(it.get("asset") or "").upper() == "USDT":
                                 # Binance Futures /fapi/v2/balance returns keys like:
                                 # balance, availableBalance, crossWalletBalance, etc.
-                                for k in ("walletBalance", "availableBalance", "balance", "crossWalletBalance", "maxWithdrawAmount"):
+                                for k in ("walletBalance", "crossWalletBalance", "balance", "maxWithdrawAmount"):
                                     bal = _safe_float(it.get(k), default=0.0)
                                     if bal > 0:
                                         break
@@ -1865,7 +1866,7 @@ class TradeLiquidation:
         try:
             row = self.store.fetch_one(
                 """
-                SELECT wallet_balance_usdt
+                SELECT wallet_balance AS wallet_balance_usdt
                 FROM account_balance_snapshots
                 WHERE exchange_id=%(ex)s AND account_id=%(acc)s
                 ORDER BY ts DESC
@@ -1884,7 +1885,6 @@ class TradeLiquidation:
                 log.warning("[trade_liquidation] using cached wallet balance %.2f USDT (db failed)", float(self._last_wallet_balance_usdt))
                 return float(self._last_wallet_balance_usdt)
             return 0.0
-
     def _fetch_new_signals(self, limit: int = 50) -> List[Dict[str, Any]]:
         q = """
         SELECT
@@ -2051,7 +2051,7 @@ class TradeLiquidation:
         opened = 0
         considered = 0
         skipped = 0
-        seen_symbols: Set[int] = set()
+        seen_symbols: set[int] = set()
 
         for sig in signals:
             if opened >= capacity:

@@ -1,30 +1,53 @@
-# Balance writer instances
-# Пишет:
-#   - account_state (текущий срез)
-#   - account_balance_snapshots (история)
+# Balance writer instances (USDⓈ-M Futures / fstream)
 #
-# Ключи API берутся из .env по имени аккаунта:
-#   BINANCE_<ACCOUNT_UPPER>_API_KEY
-#   BINANCE_<ACCOUNT_UPPER>_API_SECRET
+# Пишет в БД:
+#   - account_state
+#   - account_balance_snapshots
 #
-# Пример для account: base_main  =>
-#   BINANCE_BASE_MAIN_API_KEY=...
-#   BINANCE_BASE_MAIN_API_SECRET=...
+# Ключи API берутся из .env (или окружения) по api_key_env / api_secret_env
+#
+# Запуск:
+#   $env:PG_DSN="host=localhost port=5432 dbname=trade_platform user=postgres sslmode=prefer connect_timeout=10"
+#   $env:INSTANCES_CONFIG="config/balance_instances.yaml"
+#   $env:DEBUG_BALANCE_WRITER="1"
+#   python -m src.platform.run_balance
 
 instances:
   - exchange: binance
     account: base_main
 
-    # Как часто опрашивать биржу и писать в БД (секунды)
+    # Актив, который читаем из /fapi/v2/balance (обычно USDT для USDⓈ-M)
+    asset: USDT
+
+    # Базовый tick цикла (сек). В WS режиме — это “частота обслуживания” (keepalive/таймеры),
+    # а не частота записи в БД.
     poll_sec: 10
 
-    # Таймаут REST (сек) — это именно timeout для requests (read-timeout внутри HTTP)
-    # Если у тебя бывают “подвисания” на /fapi/v2/account — ставь 20-30.
+    # REST таймаут и ретраи (на случай heartbeat/seed запросов)
     timeout_sec: 20
-
-    # Сколько раз ретраить запрос (0..N). Для диагностики лучше 0-1.
     retry_max: 1
 
-    # Если нужно — включи подробный лог каждого REST запроса/ответа:
-    # (будет писать [REST REQ] и [REST RSP])
+    # Логировать каждый REST запрос (для диагностики)
     debug_requests: true
+
+    # Режим работы:
+    #   ws     - основной источник обновлений: User Data Stream (fstream WS)
+    #   rest   - только REST /fapi/v2/balance по poll_sec
+    #   hybrid - WS + REST (seed/подстраховка)
+    mode: ws
+
+    # REST-heartbeat (сек):
+    # В ws/hybrid режиме: раз в N сек делаем REST запрос и ОБНОВЛЯЕМ КЭШ (cache_only=True),
+    # чтобы “оживлять” поля которые WS может не прислать/редко меняются (например available).
+    # В Варианте 3 — heartbeat НЕ пишет в БД, только обновляет кэш.
+    rest_heartbeat_sec: 60
+
+    # WRITE-heartbeat (сек):
+    # Раз в N сек ПИШЕМ В БД текущее состояние из кэша/последнего WS,
+    # даже если WS молчит (нет событий/изменений).
+    # Это дает “ровную” серию точек в account_state и account_balance_snapshots.
+    write_heartbeat_sec: 60
+
+    # Где лежат ключи в окружении/.env
+    api_key_env: "BINANCE_BASE_MAIN_API_KEY"
+    api_secret_env: "BINANCE_BASE_MAIN_API_SECRET"

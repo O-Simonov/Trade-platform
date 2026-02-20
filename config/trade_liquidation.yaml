@@ -29,7 +29,7 @@ traders:
       # ИСТОЧНИК СИГНАЛОВ (signals)
       # ======================================================
       exchange_id: 1                # ID биржи в БД (Binance = 1)
-      account_name: "BASE"          # Имя аккаунта в таблице accounts (если account_id не задан)
+      account_name: "base_main"     # Имя аккаунта в таблице accounts (если account_id не задан)
       account_id: 1                 # ID аккаунта (если задан — используется напрямую)
 
       screener_name: "scr_liquidation_binance"   # Из какого скринера берём сигналы (JOIN screeners)
@@ -78,7 +78,7 @@ traders:
       timeout_sec: 10                            # Таймаут HTTP запросов (сек)
 
       # Баланс:
-      use_exchange_balance: true                 # true => баланс берём напрямую с биржи (REST /fapi/v2/balance).
+      use_exchange_balance: false           # true => баланс берём напрямую с биржи (REST /fapi/v2/balance).
 
       # --- Binance REST stability ---
 
@@ -109,7 +109,7 @@ traders:
       # ЛИМИТЫ
       # ======================================================
       max_open_positions: 6                      # Макс. кол-во OPEN позиций по этой стратегии в position_ledger.
-      max_position_notional_pct_wallet: 20.0     # Максимальный номинал одной позиции как % от walletBalance.
+      max_position_notional_pct_wallet: 10.0     # Максимальный номинал одной позиции как % от walletBalance.
 
       # ======================================================
       # РИСК / SL / TP
@@ -149,7 +149,7 @@ traders:
       # TRAILING (используется, если sl_order_mode="trailing_stop_market")
       # ======================================================
       trailing_enabled: true
-      trailing_activation_pct: 5.0               # Активация трейлинга: на сколько % цена должна уйти в прибыль
+      trailing_activation_pct: 3.0               # Активация трейлинга: на сколько % цена должна уйти в прибыль
       trailing_trail_pct: 0.6                    # callbackRate Binance (%)
 
       # ==========================================================

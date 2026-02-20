@@ -43,7 +43,7 @@ screeners:
       # ==========================================================
       stop_loss_pct: 2.0                  # SL в % от entry (например 2.0 = 2%)
       take_profit_mode: "pct"             # Режим TP (в проекте оставлен только percent-режим)
-      take_profit_pct: 6.0                # TP в % от entry (например 6.0 = 6%)
+      take_profit_pct: 5.0                # TP в % от entry (например 6.0 = 6%)
 
       # Откуда брать цену входа (entry):
       #   "current"       -> текущая цена (ticker_24h.last_price, fallback close)

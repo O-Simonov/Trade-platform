@@ -4,7 +4,9 @@ from __future__ import annotations
 import json
 import logging
 import math
+from decimal import Decimal, ROUND_CEILING, ROUND_DOWN, ROUND_FLOOR, ROUND_HALF_UP, ROUND_UP, InvalidOperation
 import os
+import re
 import random
 import time
 import threading
@@ -12,7 +14,7 @@ import uuid
 import hmac
 import hashlib
 import urllib.parse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -33,6 +35,64 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+# -------------------------
+# precision helpers (Binance)
+# -------------------------
+
+def _dec(x: object) -> Decimal:
+    try:
+        if isinstance(x, Decimal):
+            return x
+        return Decimal(str(x))
+    except (InvalidOperation, ValueError, TypeError):
+        return Decimal("0")
+
+def _round_to_step(value: object, step: object, *, rounding="down") -> Decimal:
+    """Round `value` to an exchange `step` using a chosen rounding mode.
+
+    `rounding` may be either:
+      - a Decimal rounding constant (e.g. ROUND_FLOOR, ROUND_CEILING, ...)
+      - a string alias: 'down'/'floor', 'up'/'ceil', 'toward_zero', 'away_zero', 'half_up'
+    """
+    v = Decimal(str(value))
+    s = Decimal(str(step))
+    if s == 0:
+        return v
+
+    # Allow simple string aliases to avoid leaking Decimal rounding constants across the codebase.
+    if isinstance(rounding, str):
+        r = rounding.strip().lower()
+        if r in ("down", "floor"):
+            rounding = ROUND_FLOOR
+        elif r in ("up", "ceil", "ceiling"):
+            rounding = ROUND_CEILING
+        elif r in ("toward_zero", "trunc", "truncate"):
+            rounding = ROUND_DOWN
+        elif r in ("away_zero",):
+            rounding = ROUND_UP
+        elif r in ("half_up", "nearest", "round"):
+            rounding = ROUND_HALF_UP
+        else:
+            raise ValueError(f"Unsupported rounding alias: {rounding!r}")
+
+    q = (v / s).to_integral_value(rounding=rounding)
+    return q * s
+
+
+def _round_qty_to_step(qty: float, step: float, mode: str = "down") -> float:
+    """Round quantity to exchange LOT_SIZE step. mode: 'down' or 'up'."""
+    from decimal import Decimal, ROUND_DOWN, ROUND_UP
+    q = Decimal(str(qty))
+    s = Decimal(str(step))
+    rounding = ROUND_DOWN if str(mode).lower() == "down" else ROUND_UP
+    return float((q / s).to_integral_value(rounding=rounding) * s)
+
+
+def _as_float_clean(d: Decimal) -> float:
+    # avoid floats like 55.300000000000004 by going through str
+    return float(format(d.normalize(), "f"))
+
+
 def _safe_float(v: Any, default: float = 0.0) -> float:
     try:
         if v is None:
@@ -40,6 +100,57 @@ def _safe_float(v: Any, default: float = 0.0) -> float:
         return float(v)
     except Exception:
         return default
+
+
+def _ensure_tp_trail_side(level: float, entry: float, tick: float, pos_side: str, *, kind: str) -> float:
+    """Ensure TP / trailing activation are on the correct side of the *actual* entry.
+
+    For LONG: level must be > entry.
+    For SHORT: level must be < entry.
+    If violated, we move it by at least 1 tick.
+    """
+    try:
+        level = float(level)
+        entry = float(entry)
+        tick = float(tick)
+    except Exception:
+        return level
+
+    if level <= 0 or entry <= 0 or tick <= 0:
+        return level
+
+    s = str(pos_side or "").upper()
+    if s == "LONG":
+        if level <= entry:
+            return entry + tick
+    elif s == "SHORT":
+        if level >= entry:
+            return entry - tick
+    return level
+
+
+# -------------------------
+# Binance clientOrderId helpers
+# Binance requires: <= 36 chars and [0-9A-Za-z_-]
+# We keep deterministic ids based on pos_uid so recovery can recreate them.
+# -------------------------
+
+_COID_SAN_RE = re.compile(r"[^0-9A-Za-z_-]+")
+
+def _sanitize_coid_prefix(prefix: str) -> str:
+    p = (prefix or "TL").strip()
+    p = _COID_SAN_RE.sub("", p)
+    if not p:
+        p = "TL"
+    # keep it short so we always fit into 36 chars with suffixes
+    return p[:6]
+
+def _coid_token(pos_uid: str, n: int = 20) -> str:
+    try:
+        b = (pos_uid or "").encode("utf-8")
+    except Exception:
+        b = str(pos_uid).encode("utf-8", errors="ignore")
+    return hashlib.sha1(b).hexdigest()[: max(8, int(n))]
 
 
 
@@ -71,6 +182,28 @@ def _round_step_down(x: float, step: float) -> float:
     if step <= 0:
         return x
     return math.floor(x / step) * step
+
+
+def _round_price_to_tick(price: float, tick: float, *, mode: str = "nearest") -> float:
+    """Round price to tick size.
+
+    mode:
+      - 'down'    : floor to tick
+      - 'up'      : ceil to tick
+      - 'nearest' : round to nearest tick
+    """
+    if tick <= 0:
+        return float(price)
+    p = float(price)
+    t = float(tick)
+    if t <= 0:
+        return p
+    k = p / t
+    if mode == "down":
+        return math.floor(k) * t
+    if mode == "up":
+        return math.ceil(k) * t
+    return round(k) * t
 
 
 def _pct_to_mult(pct: float) -> float:
@@ -177,6 +310,10 @@ class TradeLiquidationParams:
     # Trail distance in percent for Binance callbackRate (0.1..10, where 1 = 1%)
     trailing_trail_pct: float = 0.6
 
+    # Safety buffer to prevent "Order would immediately trigger" on Binance.
+    trailing_activation_buffer_pct: float = 0.20
+    trailing_place_retries: int = 5
+
     # --- averaging/levels (paper only for now)
     averaging_enabled: bool = True
     averaging_add_notional_usdt: float = 0.0
@@ -203,6 +340,24 @@ class TradeLiquidationParams:
     paper_mode: bool = True  # compatibility
     debug: bool = True
     debug_top: int = 10
+
+    # --- backfill (CLOSED rows enrichment from exchange trades)
+    backfill_run_on_startup: bool = True
+    backfill_enabled: bool = True
+    backfill_interval_sec: int = 600
+    backfill_lookback_days: int = 14
+    backfill_batch_limit: int = 50
+    backfill_fill_fees: bool = True
+    backfill_overwrite: bool = False  # If True, refresh CLOSED even if already backfilled
+    # --- store unknown config keys here (so getattr(self, key) works)
+    extras: Dict[str, Any] = field(default_factory=dict, repr=False)
+
+    def __getattr__(self, name: str) -> Any:
+        ex = self.__dict__.get('extras')
+        if isinstance(ex, dict) and name in ex:
+            return ex[name]
+        raise AttributeError(name)
+
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "TradeLiquidationParams":
@@ -314,6 +469,11 @@ class TradeLiquidationParams:
 
         params["debug"] = _as_bool(params.get("debug", cls().debug), cls().debug)
         params["debug_top"] = int(_as_int(params.get("debug_top"), cls().debug_top) or cls().debug_top)
+        # 3) store unknown keys so strategy can read them via getattr
+        known = set(cls.__dataclass_fields__.keys())
+        extras = {k: v for k, v in (d or {}).items() if k not in known}
+        if extras:
+            params['extras'] = extras
 
         return cls(**params)
 
@@ -394,6 +554,7 @@ class BinanceUMFuturesRest:
         read_timeout_sec: float | None = None,
         max_retries: int = 2,
         retry_backoff_sec: float = 1.0,
+        symbol_filters_resolver: Any = None,
     ):
         self.api_key = api_key
         self.api_secret = api_secret
@@ -401,6 +562,8 @@ class BinanceUMFuturesRest:
         self.recv_window_ms = int(recv_window_ms)
         self.timeout_sec = int(timeout_sec)
         self.debug = bool(debug)
+
+        self._symbol_filters_resolver = symbol_filters_resolver
 
         # Requests timeout can be a tuple: (connect_timeout, read_timeout).
         # If not provided explicitly, derive from timeout_sec.
@@ -426,6 +589,54 @@ class BinanceUMFuturesRest:
         p["signature"] = sig
         return p
 
+    def _apply_symbol_precision(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Apply symbol-specific precision to REST parameters (best-effort).
+
+        Why this exists:
+          - Some parts of the strategy call REST endpoints (incl. positionRisk).
+          - Older versions of the client had this helper; when it's missing,
+            the whole reconciliation breaks (ledger shows stale OPEN positions).
+
+        For GET endpoints (like positionRisk) rounding is not required; so if we
+        can't resolve filters we simply return params unchanged.
+        """
+
+        try:
+            sym = str(params.get("symbol") or "").upper()
+            if not sym or not self._symbol_filters_resolver:
+                return params
+
+            flt = self._symbol_filters_resolver(sym)
+            if not isinstance(flt, dict) or not flt:
+                return params
+
+            price_tick = flt.get("price_tick") or flt.get("tickSize")
+            qty_step = flt.get("qty_step") or flt.get("stepSize")
+
+            def _floor_to_step(x: Any, step: Any) -> Any:
+                if x is None or step in (None, 0, "0", "0.0"):
+                    return x
+                try:
+                    dx = Decimal(str(x))
+                    ds = Decimal(str(step))
+                    if ds <= 0:
+                        return x
+                    return str((dx // ds) * ds)
+                except Exception:
+                    return x
+
+            # Standard Binance param names used by this strategy
+            for k in ("price", "stopPrice", "triggerPrice", "activatePrice"):
+                if k in params:
+                    params[k] = _floor_to_step(params[k], price_tick)
+            for k in ("quantity", "origQty"):
+                if k in params:
+                    params[k] = _floor_to_step(params[k], qty_step)
+
+            return params
+        except Exception:
+            return params
+
     def _request(
         self,
         method: str,
@@ -437,7 +648,11 @@ class BinanceUMFuturesRest:
     ) -> Any:
         url = self.base_url + path
         headers = {"X-MBX-APIKEY": self.api_key}
-        p = self._sign(params) if signed else {k: v for k, v in params.items() if v is not None}
+        # IMPORTANT: apply symbol precision BEFORE signing; otherwise rounding
+        # would mutate params after signature and Binance returns -1022.
+        raw = {k: v for k, v in params.items() if v is not None}
+        raw = self._apply_symbol_precision(dict(raw))
+        p = self._sign(raw) if signed else raw
 
         # Use per-call timeout override if provided; otherwise use client default.
         _timeout = timeout if timeout is not None else self._timeout
@@ -537,7 +752,79 @@ class BinanceUMFuturesRest:
         return self._request("POST", "/fapi/v1/marginType", symbol=symbol, marginType=str(marginType))
 
     def new_order(self, **kwargs: Any) -> Any:
+        """Place a new order.
+
+        NOTE: Binance USD-M Futures moved conditional order types to Algo endpoints.
+        If we send these types to `/fapi/v1/order`, Binance may return:
+          -4120: "Order type not supported for this endpoint. Please use the Algo Order API endpoints instead."
+
+        We auto-route conditional types to `/fapi/v1/algoOrder` with the required
+        parameter mapping.
+        """
+
+        order_type = str(kwargs.get("type") or "").upper()
+        conditional_types = {
+            "STOP",
+            "STOP_MARKET",
+            "TAKE_PROFIT",
+            "TAKE_PROFIT_MARKET",
+            "TRAILING_STOP_MARKET",
+        }
+        if order_type in conditional_types:
+            return self.new_algo_order(**kwargs)
+
         return self._request("POST", "/fapi/v1/order", **kwargs)
+
+    def new_algo_order(self, **kwargs: Any) -> Any:
+        """Place a new conditional (algo) order via POST /fapi/v1/algoOrder.
+
+        Parameter mapping:
+          newClientOrderId -> clientAlgoId
+          stopPrice        -> triggerPrice
+          activationPrice  -> activatePrice
+
+        See Binance docs: New Algo Order (USD-M Futures).
+        """
+
+        p = dict(kwargs)
+
+        # Required by endpoint
+        p["algoType"] = "CONDITIONAL"
+
+        # Rename fields to match algo endpoint
+        if "newClientOrderId" in p and "clientAlgoId" not in p:
+            p["clientAlgoId"] = p.pop("newClientOrderId")
+        if "stopPrice" in p and "triggerPrice" not in p:
+            p["triggerPrice"] = p.pop("stopPrice")
+        if "activationPrice" in p and "activatePrice" not in p:
+            p["activatePrice"] = p.pop("activationPrice")
+
+        # Algo endpoint expects closePosition as string "true"/"false".
+        if "closePosition" in p and isinstance(p.get("closePosition"), bool):
+            p["closePosition"] = "true" if bool(p["closePosition"]) else "false"
+
+        return self._request("POST", "/fapi/v1/algoOrder", **p)
+
+    def open_algo_orders(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
+        params: Dict[str, Any] = {}
+        if symbol:
+            params["symbol"] = symbol
+        res = self._request("GET", "/fapi/v1/openAlgoOrders", signed=True, **params)
+        return res if isinstance(res, list) else []
+
+    def cancel_algo_order(
+        self,
+        symbol: str,
+        *,
+        algoId: Optional[str] = None,
+        clientAlgoId: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        params: Dict[str, Any] = {"symbol": symbol}
+        if algoId:
+            params["algoId"] = str(algoId)
+        if clientAlgoId:
+            params["clientAlgoId"] = str(clientAlgoId)
+        return self._request("DELETE", "/fapi/v1/algoOrder", signed=True, **params)
 
     def open_orders(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
         params: Dict[str, Any] = {}
@@ -563,12 +850,55 @@ class BinanceUMFuturesRest:
     def cancel_all_open_orders(self, symbol: str) -> Dict[str, Any]:
         return self._request("DELETE", "/fapi/v1/allOpenOrders", signed=True, symbol=symbol)
 
+    def cancel_all_open_algo_orders(self, symbol: str) -> Dict[str, Any]:
+        """Cancel all open algo (conditional) orders for a symbol.
+
+        Prefer the bulk endpoint if available. If the endpoint is not supported
+        by the account/symbol/API version, we fall back to cancelling each algo
+        order one-by-one.
+        """
+        try:
+            res = self._request("DELETE", "/fapi/v1/allOpenAlgoOrders", signed=True, symbol=symbol)
+            return res if isinstance(res, dict) else {"result": res}
+        except Exception:
+            # fallback: cancel individually
+            canceled = 0
+            failed = 0
+            for o in self.open_algo_orders(symbol=symbol):
+                algo_id = o.get("algoId")
+                client_algo_id = o.get("clientAlgoId")
+                try:
+                    self.cancel_algo_order(symbol=symbol, algoId=algo_id, clientAlgoId=client_algo_id)
+                    canceled += 1
+                except Exception:
+                    failed += 1
+            return {"canceled": canceled, "failed": failed, "fallback": True}
+
     def balance(self) -> Any:
         return self._request("GET", "/fapi/v2/balance", signed=True)
 
     def position_risk(self) -> List[Dict[str, Any]]:
         """GET /fapi/v2/positionRisk (signed)."""
         res = self._request("GET", "/fapi/v2/positionRisk", signed=True)
+        return res if isinstance(res, list) else []
+
+
+    def user_trades(
+        self,
+        symbol: str,
+        start_time_ms: Optional[int] = None,
+        end_time_ms: Optional[int] = None,
+        limit: int = 1000,
+    ) -> List[Dict[str, Any]]:
+        """GET /fapi/v1/userTrades (signed).
+        Used for reconciliation: to infer close price and realized PnL when a ledger position is already flat on exchange.
+        """
+        params: Dict[str, Any] = {"symbol": symbol.upper(), "limit": int(limit)}
+        if start_time_ms is not None:
+            params["startTime"] = int(start_time_ms)
+        if end_time_ms is not None:
+            params["endTime"] = int(end_time_ms)
+        res = self._request("GET", "/fapi/v1/userTrades", signed=True, params=params)
         return res if isinstance(res, list) else []
 
 
@@ -583,7 +913,19 @@ class TradeLiquidation:
 
     def __init__(self, store: PostgreSQLStorage, params: TradeLiquidationParams | Dict[str, Any]):
         self.store = store
+
+        # cache symbol precision filters from DB (price_tick / qty_step)
         self.p = params if isinstance(params, TradeLiquidationParams) else TradeLiquidationParams.from_dict(params or {})
+        self._symbol_filters_map: Dict[str, Dict[str, Any]] = self._load_symbol_filters_map()
+
+        # --------------------------------------------------
+        # Backward-compatible aliases (some legacy methods use old names)
+        # --------------------------------------------------
+        self.exchange_id = int(getattr(self.p, "exchange_id", 1) or 1)
+        self.params = self.p
+        self.mode = getattr(self.p, "mode", "paper")
+        self.strategy_id = self.STRATEGY_ID
+
 
         _ensure_paper_tables(self.store)
 
@@ -597,6 +939,9 @@ class TradeLiquidation:
         self._pl_has_raw_meta = _has_column(self.store, "position_ledger", "raw_meta")
 
         self._is_live = str(self.p.mode or "paper").strip().lower() == "live"
+        # The Binance USD-M Futures REST client instance.
+        # (Some helper code paths historically referenced "_binance_rest"; we keep
+        # a compatible alias below.)
         self._binance: Optional[BinanceUMFuturesRest] = None
         if self._is_live:
             api_key = str(os.getenv(self.p.api_key_env) or "").strip()
@@ -616,7 +961,13 @@ class TradeLiquidation:
                 read_timeout_sec=float(getattr(self.p, "binance_read_timeout_sec", self.p.timeout_sec) or self.p.timeout_sec),
                 max_retries=int(getattr(self.p, "binance_max_retries", 2) or 2),
                 retry_backoff_sec=float(getattr(self.p, "binance_retry_backoff_sec", 1.0) or 1.0),
+                # let REST client round price/qty using DB filters (best-effort)
+                symbol_filters_resolver=lambda _sym: self._symbol_filters_map.get(str(_sym or "").upper()),
             )
+
+        # Backward compatible alias used by some newer helper functions.
+        # Prefer self._binance everywhere.
+        self._binance_rest = self._binance
 
         # --------------------------------------------------
         # Step 4: Async REST (ThreadPool)
@@ -668,6 +1019,51 @@ class TradeLiquidation:
         except Exception:
             return {}
 
+    def _load_symbol_filters_map(self) -> Dict[str, Dict[str, Any]]:
+        """Load per-symbol precision/limits from DB table public.symbol_filters.
+
+        Expected schema (confirmed in your DB):
+          exchange_id, symbol_id, price_tick, qty_step, min_qty, max_qty, min_notional, max_leverage, margin_type, updated_at
+
+        Returns dict keyed by symbol name (e.g. 'BTCUSDT') with raw DB values (Decimal/None).
+        """
+        ex_id = int(getattr(self.p, "exchange_id", 1) or 1)
+
+        sql = """
+        SELECT
+          s.symbol AS symbol,
+          sf.symbol_id AS symbol_id,
+          sf.price_tick,
+          sf.qty_step,
+          sf.min_qty,
+          sf.max_qty,
+          sf.min_notional,
+          sf.max_leverage,
+          sf.margin_type,
+          sf.updated_at
+        FROM public.symbol_filters sf
+        JOIN public.symbols s
+          ON s.exchange_id = sf.exchange_id
+         AND s.symbol_id   = sf.symbol_id
+        WHERE sf.exchange_id = %(ex_id)s
+        """
+
+        try:
+            rows = self.store.query_dict(sql, {"ex_id": ex_id}) or []
+        except Exception as e:
+            log.warning("[TL] failed to load symbol_filters from DB: %s", e)
+            return {}
+
+        out: Dict[str, Dict[str, Any]] = {}
+        for r in rows:
+            sym = (r.get("symbol") or "").strip()
+            if not sym:
+                continue
+            out[sym] = dict(r)
+
+        log.info("[TL] loaded symbol_filters rows=%s exchange_id=%s", len(out), ex_id)
+        return out
+
     def _dlog(self, msg: str, *args: Any) -> None:
         if getattr(self.p, "debug", False):
             if args:
@@ -679,6 +1075,21 @@ class TradeLiquidation:
     # Step 4: Async REST helpers
     # ----------------------------------------------------------
 
+
+    def _ilog(self, msg: str, *args: Any) -> None:
+        """Info-log helper used by some reconciliation/backfill paths.
+
+        Some builds historically referenced self._ilog; to avoid AttributeError we
+        provide a thin wrapper around the module logger.
+        """
+        try:
+            if args:
+                log.info(msg, *args)
+            else:
+                log.info(msg)
+        except Exception:
+            # Never let logging break trading loop
+            pass
     def _rest_submit(self, fn: Any, *args: Any, **kwargs: Any) -> Optional[Future]:
         """Submit a REST call into thread-pool if enabled."""
         pool = getattr(self, "_rest_pool", None)
@@ -698,6 +1109,81 @@ class TradeLiquidation:
         with self._rest_snapshot_lock:
             return self._rest_snapshot.get(key)
 
+
+    
+    def _get_mark_price(self, symbol: str, position_side: Optional[str] = None) -> float:
+        """Compat wrapper: always return a mark price even in hedge mode.
+
+        Binance premiumIndex is per-symbol; for mark we should *not* require positionSide.
+        """
+        try:
+            return float(self._get_mark_price_live(symbol, None))
+        except Exception:
+            return 0.0
+
+    def _get_mark_price_live(self, symbol: str, position_side: Optional[str] = None) -> float:
+        """Best-effort current markPrice for a symbol (LIVE).
+
+        Uses prefetched REST snapshot (position_risk) when available; falls back to direct REST call.
+        """
+        if not self._is_live or self._binance is None:
+            return 0.0
+        sym = (symbol or "").upper().strip()
+        if not sym:
+            return 0.0
+        ps_need = (position_side or "").upper().strip() if position_side else ""
+
+        rows = self._rest_snapshot_get("position_risk")
+        if not isinstance(rows, list):
+            try:
+                rows = self._binance.position_risk()
+            except Exception:
+                rows = []
+        for it in rows or []:
+            try:
+                if str(it.get("symbol") or "").upper().strip() != sym:
+                    continue
+                ps = str(it.get("positionSide") or "").upper().strip()
+                if ps_need and ps and ps != ps_need:
+                    continue
+                mp = _safe_float(it.get("markPrice"), 0.0)
+                if mp > 0:
+                    return float(mp)
+            except Exception:
+                continue
+        return 0.0
+
+    @staticmethod
+    def _safe_price_above_mark(price: float, mark: float, tick: float, buffer_pct: float) -> float:
+        """Force price to be ABOVE current mark by buffer_pct (percent)."""
+        p = float(price or 0.0)
+        m = float(mark or 0.0)
+        buf = max(0.0, float(buffer_pct or 0.0) / 100.0)
+        if m > 0 and buf > 0:
+            p = max(p, m * (1.0 + buf))
+        if tick and tick > 0:
+            p = _round_price_to_tick(p, float(tick), mode="up")
+        return float(p)
+
+    @staticmethod
+    @staticmethod
+    def _safe_price_below_mark(price: float, mark: float, tick: float, buffer_pct: float) -> float:
+        """Force price to be BELOW current mark by buffer_pct (percent)."""
+        p = float(price or 0.0)
+        m = float(mark or 0.0)
+        buf = max(0.0, float(buffer_pct or 0.0) / 100.0)
+        if m > 0 and buf > 0:
+            p = min(p, m * (1.0 - buf))
+        if tick and tick > 0:
+            p = _round_price_to_tick(p, float(tick), mode="down")
+        return float(p)
+
+    @staticmethod
+    def _is_immediate_trigger_error(e: Exception) -> bool:
+        s = str(e) if e is not None else ""
+        s_l = s.lower()
+        return ("immediately trigger" in s_l) or ("\"code\":-2021" in s_l) or ("code=-2021" in s_l)
+
     def _is_our_position_by_uid(self, pos_uid: str, open_orders_all: Any, raw_meta: Any) -> bool:
         """Heuristic: is this position created/managed by this trader.
 
@@ -706,8 +1192,8 @@ class TradeLiquidation:
           - raw_meta contains explicit marker that this trader created the position.
         Conservative by design: if unsure, returns False.
         """
-        uid = (pos_uid or "").strip()
-        if not uid:
+        pos_uid = (pos_uid or "").strip()
+        if not pos_uid:
             return False
 
         # 1) open orders marker (preferred)
@@ -715,7 +1201,7 @@ class TradeLiquidation:
             rows = open_orders_all if isinstance(open_orders_all, list) else []
             for o in rows:
                 coid = str((o or {}).get("clientOrderId") or "")
-                if uid and uid in coid:
+                if pos_uid and pos_uid in coid:
                     return True
         except Exception:
             pass
@@ -734,10 +1220,10 @@ class TradeLiquidation:
                     v = meta.get(k)
                     if isinstance(v, str) and v.strip().lower() in ("trade_liquidation", "tl", "trade-liquidation"):
                         return True
-                # sometimes we store uid inside meta
-                for k in ("pos_uid", "uid", "position_uid"):
+                # sometimes we store pos_uid inside meta
+                for k in ("pos_uid", "pos_uid", "position_uid"):
                     v = meta.get(k)
-                    if isinstance(v, str) and v.strip() == uid:
+                    if isinstance(v, str) and v.strip() == pos_uid:
                         return True
         except Exception:
             pass
@@ -768,6 +1254,11 @@ class TradeLiquidation:
             if f is not None:
                 futs["open_orders_all"] = f
 
+            # 1b) openAlgoOrders (all) — conditional orders live here
+            f2 = self._rest_submit(self._binance.open_algo_orders)
+            if f2 is not None:
+                futs["open_algo_orders_all"] = f2
+
         # 2) positionRisk
         if need_position_risk:
             f = self._rest_submit(self._binance.position_risk)
@@ -784,7 +1275,10 @@ class TradeLiquidation:
         if not futs:
             if need_open_orders:
                 try:
-                    self._rest_snapshot_set(open_orders_all=self._binance.open_orders())
+                    self._rest_snapshot_set(
+                        open_orders_all=self._binance.open_orders(),
+                        open_algo_orders_all=self._binance.open_algo_orders(),
+                    )
                 except Exception:
                     log.debug("[trade_liquidation] openOrders sync fetch failed", exc_info=True)
             if need_position_risk:
@@ -832,8 +1326,60 @@ class TradeLiquidation:
         if self._is_live and bool(getattr(self.p, "live_cleanup_remaining_orders", True)):
             canceled_leftovers = int(self._live_cleanup_remaining_brackets() or 0)
 
+        # LIVE: hard cleanup — if positionAmt==0 on exchange, cancel *all* orders for symbol
+        # (manual close / liquidation / reduce-only close / etc.)
+        if self._is_live and bool(getattr(self.p, "live_cancel_orders_when_flat", True)):
+            canceled_leftovers += int(self._live_cancel_all_orders_if_flat() or 0)
+
         # Step 1: auto-recovery (ensure SL/TP exist) using async snapshot (openOrders/positionRisk)
         recovered = 0
+
+        def _tl_safe_trigger_price(*, symbol: str, close_side: str, desired: float, mark: float, tick: float, buffer_pct: float) -> float:
+            """Ensure conditional trigger price won't immediately trigger.
+
+            For close_side=SELL (closing LONG): trigger/activation must be ABOVE current mark.
+            For close_side=BUY  (closing SHORT): trigger/activation must be BELOW current mark.
+            """
+            p = float(desired or 0.0)
+            m = float(mark or 0.0)
+            buf = float(buffer_pct or 0.0) / 100.0
+            if m > 0:
+                if str(close_side).upper() == "SELL":
+                    # must be above mark
+                    floor = m * (1.0 + max(buf, 0.0005))
+                    p = max(p, floor)
+                    # round UP so it stays above
+                    if tick and tick > 0:
+                        p = _round_price_to_tick(p, tick, mode="up")
+                else:
+                    # BUY: must be below mark
+                    ceil = m * (1.0 - max(buf, 0.0005))
+                    p = min(p if p > 0 else ceil, ceil)
+                    # round DOWN so it stays below
+                    if tick and tick > 0:
+                        p = _round_price_to_tick(p, tick, mode="down")
+            else:
+                # no mark -> just tick rounding in the safe direction
+                if tick and tick > 0:
+                    p = _round_price_to_tick(p, tick, mode="up" if str(close_side).upper() == "SELL" else "down")
+            return float(p)
+
+        def _tl_place_algo_with_retry(place_fn, *, max_tries: int = 3):
+            """Retry placing conditional orders when Binance says 'would immediately trigger' (-2021)."""
+            last = None
+            for i in range(int(max_tries or 1)):
+                try:
+                    return place_fn(i)
+                except Exception as e:
+                    last = e
+                    s = str(e)
+                    if ("-2021" in s) or ("immediately trigger" in s.lower()):
+                        continue
+                    raise
+            if last:
+                raise last
+            return None
+
         if self._is_live and bool(getattr(self.p, "auto_recovery_enabled", False)):
             recovered = int(self._auto_recovery_brackets() or 0)
 
@@ -841,6 +1387,19 @@ class TradeLiquidation:
         reconcile_stats: Dict[str, int] = {}
         if self._is_live and bool(getattr(self.p, "reconcile_enabled", False)):
             reconcile_stats = dict(self._reconcile_ledger_vs_exchange() or {})
+
+        # Step 2.5: backfill exit_price/realized_pnl for already CLOSED ledger rows (best-effort, rate-limited)
+        if self._is_live and bool(getattr(self.p, "backfill_enabled", True)):
+            try:
+                # Run once immediately on startup (then continue on interval inside the function).
+                if (not bool(getattr(self, "_backfill_startup_done", False))
+                        and bool(getattr(self.p, "backfill_run_on_startup", True))):
+                    self._backfill_closed_exit_pnl(force=True, log_empty=True)
+                    self._backfill_startup_done = True
+                else:
+                    self._backfill_closed_exit_pnl()
+            except Exception:
+                log.debug("[trade_liquidation] backfill_closed_exit_pnl failed", exc_info=True)
 
         open_positions = self._get_open_positions()
         self._dlog(
@@ -978,7 +1537,7 @@ class TradeLiquidation:
         led = list(
             self.store.query_dict(
                 """
-                SELECT symbol_id, pos_uid, side, status, qty_current, opened_at
+                SELECT symbol_id, pos_uid, side, status, qty_current, entry_price, avg_price, raw_meta, opened_at
                 FROM position_ledger
                 WHERE exchange_id=%(ex)s
                   AND account_id=%(acc)s
@@ -1007,7 +1566,7 @@ class TradeLiquidation:
             led_qty = abs(_safe_float(p.get("qty_current"), 0.0))
             ex_qty = abs(_safe_float(ex_pos.get((sym, side)), 0.0))
 
-            if ex_qty <= 0:
+            if self._is_flat_qty(sym, ex_qty):
                 missing_on_exchange += 1
                 if auto_close:
                     try:
@@ -1018,15 +1577,30 @@ class TradeLiquidation:
                                 closed_at=now(),
                                 qty_current=0,
                                 updated_at=now(),
-                                close_reason='reconcile_missing_on_exchange'
-                            WHERE exchange_id=%(ex)s
-                              AND account_id=%(acc)s
-                              AND pos_uid=%(uid)s
-                              AND status='OPEN'
+                                raw_meta = jsonb_set(
+                                    COALESCE(raw_meta, '{}'::jsonb),
+                                    '{close_reason}',
+                                    to_jsonb(%(reason)s::text),
+                                    true
+                                )
+                            WHERE exchange_id=%(exchange_id)s
+                              AND account_id=%(account_id)s
+                              AND pos_uid=%(pos_uid)s
                             """,
-                            {"ex": int(self.p.exchange_id), "acc": int(self.account_id), "uid": str(p.get("pos_uid") or "")},
+                            {
+                                "exchange_id": ex_id,
+                                "account_id": acc_id,
+                                "pos_uid": pos_uid,
+                                "reason": "reconcile_missing_on_exchange",
+                            },
                         )
                         closed_ledger += 1
+                        try:
+                            c = self._live_cancel_symbol_orders(sym)
+                            if c:
+                                self._dlog("reconcile: flat on exchange -> canceled %s orders for %s", c, sym)
+                        except Exception as _e:
+                            self._dlog("reconcile: failed to cancel orders for %s: %s", sym, _e)
                     except Exception:
                         log.exception("[trade_liquidation][RECONCILE] failed to auto-close ledger pos_uid=%s", str(p.get("pos_uid") or ""))
                 continue
@@ -1048,9 +1622,9 @@ class TradeLiquidation:
                 # and ledger qty_current became stale.
                 if auto_adjust_qty and ex_qty > 0:
                     try:
-                        uid = str(p.get("pos_uid") or "")
-                        if adjust_only_our and not self._is_our_position_by_uid(uid, oo_all, p.get("raw_meta")):
-                            log.info("[trade_liquidation][RECONCILE] skip auto-adjust qty_current for external pos_uid=%s (%s %s)", uid, sym, side)
+                        pos_uid = str(p.get("pos_uid") or "")
+                        if adjust_only_our and not self._is_our_position_by_uid(pos_uid, oo_all, p.get("raw_meta")):
+                            log.info("[trade_liquidation][RECONCILE] skip auto-adjust qty_current for external pos_uid=%s (%s %s)", pos_uid, sym, side)
                             continue
                         if self._pl_has_raw_meta:
                             meta = {"reconcile_adjust": {"old_qty": float(led_qty), "new_qty": float(ex_qty), "ts": _utc_now().isoformat()}}
@@ -1062,10 +1636,10 @@ class TradeLiquidation:
                                     raw_meta = COALESCE(raw_meta,'{}'::jsonb) || %(meta)s::jsonb
                                 WHERE exchange_id=%(ex)s
                                   AND account_id=%(acc)s
-                                  AND pos_uid=%(uid)s
+                                  AND pos_uid=%(pos_uid)s
                                   AND status='OPEN'
                                 """,
-                                {"q": float(ex_qty), "meta": json.dumps(meta), "ex": int(self.p.exchange_id), "acc": int(self.account_id), "uid": uid},
+                                {"q": float(ex_qty), "meta": json.dumps(meta), "ex": int(self.p.exchange_id), "acc": int(self.account_id), "pos_uid": pos_uid},
                             )
                         else:
                             self.store.execute(
@@ -1075,10 +1649,10 @@ class TradeLiquidation:
                                     updated_at=now()
                                 WHERE exchange_id=%(ex)s
                                   AND account_id=%(acc)s
-                                  AND pos_uid=%(uid)s
+                                  AND pos_uid=%(pos_uid)s
                                   AND status='OPEN'
                                 """,
-                                {"q": float(ex_qty), "ex": int(self.p.exchange_id), "acc": int(self.account_id), "uid": uid},
+                                {"q": float(ex_qty), "ex": int(self.p.exchange_id), "acc": int(self.account_id), "pos_uid": pos_uid},
                             )
                         log.info(
                             "[trade_liquidation][RECONCILE] adjusted ledger qty_current to exchange qty: %s %s old=%.8f new=%.8f (pos_uid=%s)",
@@ -1086,7 +1660,7 @@ class TradeLiquidation:
                             side,
                             float(led_qty),
                             float(ex_qty),
-                            uid,
+                            pos_uid,
                         )
                     except Exception:
                         log.exception("[trade_liquidation][RECONCILE] failed to auto-adjust ledger qty_current (pos_uid=%s)", str(p.get("pos_uid") or ""))
@@ -1137,7 +1711,7 @@ class TradeLiquidation:
             return 0
 
         sym_map = self._symbols_map()
-        prefix = str(getattr(self.p, "client_order_id_prefix", "TL") or "TL").strip() or "TL"
+        prefix = _sanitize_coid_prefix(str(getattr(self.p, "client_order_id_prefix", "TL") or "TL"))
 
         max_age_h = float(getattr(self.p, "recovery_max_age_hours", 48) or 48)
         place_sl = bool(getattr(self.p, "recovery_place_sl", True))
@@ -1154,6 +1728,26 @@ class TradeLiquidation:
                 continue
             open_by_symbol.setdefault(sym, set()).add(str(oo.get("clientOrderId") or ""))
 
+        # Algo open orders snapshot (conditional orders live here)
+        open_algo_all = self._rest_snapshot_get("open_algo_orders_all")
+        open_algo_rows = open_algo_all if isinstance(open_algo_all, list) else []
+        open_algo_by_symbol: Dict[str, List[Dict[str, Any]]] = {}
+        for ao in open_algo_rows:
+            sym = str((ao or {}).get("symbol") or "").strip()
+            if not sym:
+                continue
+            open_algo_by_symbol.setdefault(sym, []).append(dict(ao))
+
+        # Algo (conditional) orders snapshot: SL/TP/trailing live here
+        algo_all = self._rest_snapshot_get("open_algo_orders_all")
+        algo_rows = algo_all if isinstance(algo_all, list) else []
+        for ao in algo_rows:
+            sym = str(ao.get("symbol") or "").strip()
+            if not sym:
+                continue
+            # Binance returns clientAlgoId for algo orders
+            open_by_symbol.setdefault(sym, set()).add(str(ao.get("clientAlgoId") or ""))
+
         # Exchange positions snapshot (for positionSide in hedge, and to skip already-closed positions)
         pr = self._rest_snapshot_get("position_risk")
         pr_rows = pr if isinstance(pr, list) else []
@@ -1161,6 +1755,8 @@ class TradeLiquidation:
         # Current exchange quantity by (symbol, side) from positionRisk.
         # Used to place trailing stops / qty-based TP when ledger qty_current may be stale (partial close etc.).
         ex_qty_map: Dict[Tuple[str, str], float] = {}
+        ex_mark_map: Dict[Tuple[str, str], float] = {}
+        ex_entry_map: Dict[Tuple[str, str], float] = {}
         for it in pr_rows:
             sym = str(it.get("symbol") or "").strip()
             if not sym:
@@ -1175,12 +1771,20 @@ class TradeLiquidation:
                 side = "LONG" if amt > 0 else "SHORT"
             ex_has_pos.add((sym, side))
             ex_qty_map[(sym, side)] = abs(float(amt))
+            try:
+                ex_mark_map[(sym, side)] = abs(float(it.get('markPrice') or 0.0))
+            except Exception:
+                pass
+            try:
+                ex_entry_map[(sym, side)] = abs(float(it.get('entryPrice') or it.get('avgEntryPrice') or it.get('avgPrice') or 0.0))
+            except Exception:
+                pass
 
         # Ledger OPEN positions
         led = list(
             self.store.query_dict(
                 """
-                SELECT symbol_id, pos_uid, side, status, qty_current, entry_price, opened_at
+            SELECT symbol_id, pos_uid, side, status, qty_current, entry_price, avg_price, raw_meta, opened_at
                 FROM position_ledger
                 WHERE exchange_id=%(ex)s
                   AND account_id=%(acc)s
@@ -1194,6 +1798,53 @@ class TradeLiquidation:
 
         now = _utc_now()
         recovered = 0
+
+        def _tl_safe_trigger_price(*, symbol: str, close_side: str, desired: float, mark: float, tick: float, buffer_pct: float) -> float:
+            """Ensure conditional trigger price won't immediately trigger.
+
+            For close_side=SELL (closing LONG): trigger/activation must be ABOVE current mark.
+            For close_side=BUY  (closing SHORT): trigger/activation must be BELOW current mark.
+            """
+            p = float(desired or 0.0)
+            m = float(mark or 0.0)
+            buf = float(buffer_pct or 0.0) / 100.0
+            if m > 0:
+                if str(close_side).upper() == "SELL":
+                    # must be above mark
+                    floor = m * (1.0 + max(buf, 0.0005))
+                    p = max(p, floor)
+                    # round UP so it stays above
+                    if tick and tick > 0:
+                        p = _round_price_to_tick(p, tick, mode="up")
+                else:
+                    # BUY: must be below mark
+                    ceil = m * (1.0 - max(buf, 0.0005))
+                    p = min(p if p > 0 else ceil, ceil)
+                    # round DOWN so it stays below
+                    if tick and tick > 0:
+                        p = _round_price_to_tick(p, tick, mode="down")
+            else:
+                # no mark -> just tick rounding in the safe direction
+                if tick and tick > 0:
+                    p = _round_price_to_tick(p, tick, mode="up" if str(close_side).upper() == "SELL" else "down")
+            return float(p)
+
+        def _tl_place_algo_with_retry(place_fn, *, max_tries: int = 3):
+            """Retry placing conditional orders when Binance says 'would immediately trigger' (-2021)."""
+            last = None
+            for i in range(int(max_tries or 1)):
+                try:
+                    return place_fn(i)
+                except Exception as e:
+                    last = e
+                    s = str(e)
+                    if ("-2021" in s) or ("immediately trigger" in s.lower()):
+                        continue
+                    raise
+            if last:
+                raise last
+            return None
+
 
         for p in led:
             try:
@@ -1220,6 +1871,8 @@ class TradeLiquidation:
             # Use exchange qty for protective orders (especially important for TRAILING_STOP_MARKET and limit TP),
             # because ledger qty_current can lag after partial closes / external reduce-only fills.
             qty_ex = abs(_safe_float(ex_qty_map.get((sym, side)), 0.0))
+            avg_price = _safe_float(p.get("avg_price"), 0.0)
+            raw_meta = p.get("raw_meta") or {}
             qty_led = abs(_safe_float(p.get("qty_current"), 0.0))
             qty_use = float(qty_ex if qty_ex > 0 else qty_led)
             if qty_use <= 0:
@@ -1229,104 +1882,291 @@ class TradeLiquidation:
             if not pos_uid:
                 continue
 
-            cid_sl = f"{prefix}_{pos_uid}_SL"
-            cid_tp = f"{prefix}_{pos_uid}_TP"
+            tok = _coid_token(pos_uid, n=20)
+            cid_sl = f"{prefix}_{tok}_SL"
+            cid_tp = f"{prefix}_{tok}_TP"
+            cid_trl = f"{prefix}_{tok}_TRL"
 
+            close_side = "SELL" if side == "LONG" else "BUY"
+            position_side = side if hedge_mode else "BOTH"
+
+
+            
             existing = open_by_symbol.get(sym, set())
-            has_sl = cid_sl in existing
-            has_tp = cid_tp in existing
 
-            # compute protective prices from ledger entry
-            entry = _safe_float(p.get("entry_price"), 0.0)
+            # Also detect *any* existing protective orders on Binance for this symbol/side,
+            # even if their client ids are not ours. This prevents Binance error -4130
+            # ("An open stop or take profit order with GTE and closePosition ... is existing.")
+            def _to_bool(x: Any) -> bool:
+                if isinstance(x, bool):
+                    return bool(x)
+                if x is None:
+                    return False
+                s = str(x).strip().lower()
+                return s in {"1", "true", "yes", "y", "on"}
+
+            def _detect_existing_protection() -> tuple[bool, bool, bool]:
+                rows = open_algo_by_symbol.get(sym, []) if isinstance(open_algo_by_symbol, dict) else []
+                has_any_sl = False
+                has_any_tp = False
+                has_any_trl = False
+                for o in rows:
+                    try:
+                        otype = str(o.get("orderType") or o.get("type") or "").upper()
+                        oside = str(o.get("side") or "").upper()
+                        ops = str(o.get("positionSide") or "").upper()
+                        # In hedge mode positionSide is LONG/SHORT; otherwise it can be BOTH/empty.
+                        if hedge_mode:
+                            if ops and ops not in {position_side, "BOTH"}:
+                                continue
+                        # Make sure it's the close direction
+                        if oside and oside != close_side:
+                            continue
+
+                        close_pos = _to_bool(o.get("closePosition"))
+
+                        # TP: closePosition=true TP orders (Binance typically enforces one)
+                        if otype in {"TAKE_PROFIT_MARKET", "TAKE_PROFIT"} and close_pos:
+                            has_any_tp = True
+
+                        # SL: stop-market/stop with closePosition OR any trailing stop
+                        if otype in {"STOP_MARKET", "STOP"} and close_pos:
+                            has_any_sl = True
+                        if otype == "TRAILING_STOP_MARKET":
+                            has_any_trl = True
+                    except Exception:
+                        continue
+                return has_any_sl, has_any_tp, has_any_trl
+
+            any_sl, any_tp, any_trl = _detect_existing_protection()
+
+            has_sl = (cid_sl in existing) or bool(any_sl)
+            has_tp = (cid_tp in existing) or bool(any_tp)
+            has_trl = (cid_trl in existing) or bool(any_trl)
+
+
+            # Compute protective prices from the *actual* average entry.
+            # Prefer exchange-reported entryPrice (positionRisk) when available.
+            entry_ledger = _safe_float(p.get("entry_price"), 0.0)
+            entry = float(ex_entry_map.get((sym, side), entry_ledger) or 0.0)
+            # price tick for proper rounding (used for TP / trailing activation sanity checks)
+            try:
+                _tick_dec = self._price_tick_for_symbol(sym)
+                tick = float(_tick_dec) if (_tick_dec is not None and float(_tick_dec) > 0) else 0.0
+            except Exception:
+                tick = 0.0
+            if not tick or tick <= 0:
+                tick = 1e-8
             if entry <= 0:
                 continue
 
             if side == "LONG":
                 sl_price = entry * (1.0 - _pct_to_mult(self.p.stop_loss_pct))
                 tp_price = entry * (1.0 + _pct_to_mult(self.p.take_profit_pct))
-                close_side = "SELL"
-                position_side = "LONG"
             else:
                 sl_price = entry * (1.0 + _pct_to_mult(self.p.stop_loss_pct))
                 tp_price = entry * (1.0 - _pct_to_mult(self.p.take_profit_pct))
-                close_side = "BUY"
-                position_side = "SHORT"
+
+            # Hard guarantee: TP must be on the correct side of entry.
+            # (Some safety/rounding logic can otherwise push it across.)
+            tp_price = _ensure_tp_trail_side(tp_price, entry, tick, side, kind="tp")
 
             # place missing orders
+            
             if place_sl and (not has_sl) and sl_price > 0:
-                try:
-                    sl_mode = str(getattr(self.p, "sl_order_mode", "stop_market") or "stop_market").strip().lower()
-                    if sl_mode in {"trailing_stop_market", "trailing", "tsm"} and bool(getattr(self.p, "trailing_enabled", True)):
-                        callback_rate = float(getattr(self.p, "trailing_trail_pct", 0.6) or 0.6)
-                        activation_pct = float(getattr(self.p, "trailing_activation_pct", 1.2) or 1.2)
-                        if close_side.upper() == "SELL":
-                            activation_price = entry * (1.0 + activation_pct / 100.0)
-                        else:
-                            activation_price = entry * (1.0 - activation_pct / 100.0)
-                        params = dict(
-                            symbol=sym,
-                            side=close_side,
-                            type="TRAILING_STOP_MARKET",
-                            quantity=float(qty_use),
-                            activationPrice=float(activation_price),
-                            callbackRate=float(callback_rate),
-                            workingType=str(getattr(self.p, "working_type", "MARK_PRICE")),
-                            newClientOrderId=cid_sl,
-                            positionSide=position_side if hedge_mode else None,
-                        )
-                        if (not hedge_mode) and bool(self.p.reduce_only):
-                            params["reduceOnly"] = True
-                        resp = self._binance.new_order(**params)
-                    else:
-                        params = dict(
-                            symbol=sym,
-                            side=close_side,
-                            type="STOP_MARKET",
-                            stopPrice=float(sl_price),
-                            closePosition=True,
-                            workingType=str(getattr(self.p, "working_type", "MARK_PRICE")),
-                            newClientOrderId=cid_sl,
-                            positionSide=position_side if hedge_mode else None,
-                        )
-                        if (not hedge_mode) and bool(self.p.reduce_only):
-                            params["reduceOnly"] = True
-                        resp = self._binance.new_order(**params)
+                # Defer STOP_MARKET SL until last averaging add (if enabled)
+                defer_sl = bool(getattr(self.p, "defer_stop_loss_until_last_add", False))
+                avg_enabled = bool(getattr(self.p, "averaging_enabled", False))
+                cfg_max_adds = int(getattr(self.p, "averaging_max_adds", 0) or 0)
+                allow_place_sl = True
+                if avg_enabled and defer_sl and cfg_max_adds > 0:
+                    try:
+                        rm = p.get("raw_meta") or {}
+                        st = (rm.get("avg_state") or {}) if isinstance(rm, dict) else {}
+                        adds_done = int(st.get("adds_done", 0) or 0)
+                        max_adds = int(st.get("max_adds", cfg_max_adds) or cfg_max_adds)
+                        scale_in = int(p.get("scale_in_count", 0) or 0)
+                        if max_adds > 0 and min(adds_done, scale_in) < max_adds:
+                            allow_place_sl = False
+                    except Exception:
+                        allow_place_sl = False
+                if allow_place_sl:
+                    try:
+                        sl_mode = str(getattr(self.p, "sl_order_mode", "stop_market") or "stop_market").strip().lower()
+                        if sl_mode in {"trailing_stop_market", "trailing", "tsm"} and bool(getattr(self.p, "trailing_enabled", True)):
+                            callback_rate = float(getattr(self.p, "trailing_trail_pct", 0.6) or 0.6)
+                            activation_pct = float(getattr(self.p, "trailing_activation_pct", 1.2) or 1.2)
+                            buffer_pct = float(getattr(self.p, "trailing_activation_buffer_pct", 0.25) or 0.25)
 
-                    if isinstance(resp, dict):
-                        self._upsert_order_shadow(
-                            pos_uid=pos_uid,
-                            order_id=resp.get("orderId") or resp.get("order_id") or "",
-                            client_order_id=cid_sl,
-                            symbol_id=symbol_id,
-                            side=close_side,
-                            order_type=str(resp.get("type") or "STOP_MARKET"),
-                            qty=float(qty_use),
-                            price=None,
-                            reduce_only=True,
-                            status=str(resp.get("status") or "NEW"),
-                        )
-                    recovered += 1
-                    log.info("[trade_liquidation][RECOVERY] placed missing SL %s %s pos_uid=%s", sym, side, pos_uid)
-                except Exception:
-                    log.exception("[trade_liquidation][RECOVERY] failed to place SL %s %s pos_uid=%s", sym, side, pos_uid)
+                            # Get markPrice from exchange snapshot if available (best-effort).
+                            mark = _safe_float(ex_mark_map.get((sym, side)), 0.0)
+
+                            # For SELL trailing stop, activation must be ABOVE current mark.
+                            # For BUY trailing stop, activation must be BELOW current mark.
+                            if close_side.upper() == "SELL":
+                                desired_act = entry * (1.0 + activation_pct / 100.0)
+                            else:
+                                desired_act = entry * (1.0 - activation_pct / 100.0)
+
+                            # Ensure activation is on correct side of the *actual* entry.
+                            desired_act = _ensure_tp_trail_side(desired_act, entry, tick, side, kind="trail_activate")
+
+                            tick_dec = self._price_tick_for_symbol(sym)
+                            tick = float(tick_dec) if tick_dec is not None else 0.0
+
+                            def _place(i_try: int):
+                                # increase buffer a bit on each retry
+                                buf = buffer_pct * (1.0 + 0.7 * float(i_try))
+                                activation_price = _tl_safe_trigger_price(
+                                    symbol=sym,
+                                    close_side=close_side,
+                                    desired=desired_act,
+                                    mark=mark,
+                                    tick=tick,
+                                    buffer_pct=buf,
+                                )
+
+                                # Round and enforce side vs actual entry.
+                                activation_price = _round_price_to_tick(
+                                    activation_price,
+                                    tick,
+                                    mode="up" if close_side.upper() == "SELL" else "down",
+                                )
+                                activation_price = _ensure_tp_trail_side(
+                                    activation_price,
+                                    entry,
+                                    tick,
+                                    side,
+                                    kind="trail_activate",
+                                )
+                                params = dict(
+                                    symbol=sym,
+                                    side=close_side,
+                                    type="TRAILING_STOP_MARKET",
+                                    quantity=float(qty_use),
+                                    activationPrice=float(activation_price),
+                                    callbackRate=float(callback_rate),
+                                    workingType=str(getattr(self.p, "working_type", "MARK_PRICE")),
+                                    newClientOrderId=cid_trl,
+                                    positionSide=position_side if hedge_mode else None,
+                                )
+                                if (not hedge_mode) and bool(self.p.reduce_only):
+                                    params["reduceOnly"] = True
+                                return self._binance.new_order(**params)
+
+                            resp = _tl_place_algo_with_retry(_place, max_tries=int(getattr(self.p, "trailing_place_retries", 3) or 3))
+
+                        else:
+                            params = dict(
+                                symbol=sym,
+                                side=close_side,
+                                type="STOP_MARKET",
+                                stopPrice=float(sl_price),
+                                closePosition=True,
+                                workingType=str(getattr(self.p, "working_type", "MARK_PRICE")),
+                                newClientOrderId=cid_trl,
+                                positionSide=position_side if hedge_mode else None,
+                            )
+                            if (not hedge_mode) and bool(self.p.reduce_only):
+                                params["reduceOnly"] = True
+                            def _place_sl2(i: int):
+                                p2 = dict(params)
+                                try:
+                                    px = float(p2.get("stopPrice") or p2.get("triggerPrice") or 0.0)
+                                    # Mark-based protection from -2021: force stop further away from current mark.
+                                    mark_sl = 0.0
+                                    try:
+                                        mark_sl = float(self._get_mark_price(symbol) or 0.0)
+                                    except Exception:
+                                        mark_sl = 0.0
+                                    if mark_sl <= 0:
+                                        try:
+                                            mark_sl = float(self._get_last_price(symbol) or 0.0)
+                                        except Exception:
+                                            mark_sl = 0.0
+
+                                    buf = float(getattr(self.p, "tp_trigger_buffer_pct", 0.25) or 0.25)
+                                    # Increase buffer on retries so we actually move away if Binance says -2021.
+                                    eff_buf = buf * (1.0 + float(i))
+                                    tick = float(tick_size) if tick_size else 0.0
+
+                                    if mark_sl > 0:
+                                        if close_side == "SELL":
+                                            # long SL: SELL stop must be BELOW mark
+                                            px = min(px, mark_sl * (1.0 - eff_buf / 100.0))
+                                            # push one more tick down each retry (if tick known)
+                                            if tick > 0:
+                                                px = px - tick
+                                                px = _round_price_to_tick(px, tick, mode="down")
+                                        else:
+                                            # short SL: BUY stop must be ABOVE mark
+                                            px = max(px, mark_sl * (1.0 + eff_buf / 100.0))
+                                            if tick > 0:
+                                                px = px + tick
+                                                px = _round_price_to_tick(px, tick, mode="up")
+
+                                    # Ensure numeric and set both keys (some wrappers drop stopPrice if triggerPrice is present)
+                                    p2["triggerPrice"] = float(px)
+                                    p2["stopPrice"] = float(px)
+                                except Exception:
+                                    pass
+                                return self._binance.new_order(**p2)
+
+                            resp = _tl_place_algo_with_retry(_place_sl2, max_tries=int(getattr(self.p, "trailing_place_retries", 3) or 3))
+
+                        if isinstance(resp, dict):
+                            self._upsert_order_shadow(
+                                pos_uid=pos_uid,
+                                order_id=resp.get("orderId") or resp.get("order_id") or "",
+                                client_order_id=cid_sl,
+                                symbol_id=symbol_id,
+                                side=close_side,
+                                order_type=str(resp.get("type") or "STOP_MARKET"),
+                                qty=float(qty_use),
+                                price=None,
+                                reduce_only=True,
+                                status=str(resp.get("status") or "NEW"),
+                            )
+                        recovered += 1
+                        log.info("[trade_liquidation][RECOVERY] placed missing SL %s %s pos_uid=%s", sym, side, pos_uid)
+                    except Exception:
+                        log.exception("[trade_liquidation][RECOVERY] failed to place SL %s %s pos_uid=%s", sym, side, pos_uid)
 
             if place_tp and (not has_tp) and tp_price > 0:
                 try:
                     tp_mode = str(getattr(self.p, "tp_order_mode", "take_profit_market") or "take_profit_market").strip().lower()
                     if tp_mode in {"take_profit_market", "takeprofit_market", "tp_market", "market"}:
-                        params = dict(
-                            symbol=sym,
-                            side=close_side,
-                            type="TAKE_PROFIT_MARKET",
-                            stopPrice=float(tp_price),
-                            closePosition=True,
-                            workingType=str(getattr(self.p, "working_type", "MARK_PRICE")),
-                            newClientOrderId=cid_tp,
-                            positionSide=position_side if hedge_mode else None,
-                        )
-                        if (not hedge_mode) and bool(self.p.reduce_only):
-                            params["reduceOnly"] = True
-                        resp = self._binance.new_order(**params)
+                        buffer_pct = float(getattr(self.p, "tp_trigger_buffer_pct", 0.25) or 0.25)
+                        mark = _safe_float(ex_mark_map.get((sym, side)), 0.0)
+                        tick_dec = self._price_tick_for_symbol(sym)
+                        tick = float(tick_dec) if tick_dec is not None else 0.0
+
+                        def _place(i_try: int):
+                            buf = buffer_pct * (1.0 + 0.7 * float(i_try))
+                            trigger_price = _tl_safe_trigger_price(
+                                symbol=sym,
+                                close_side=close_side,
+                                desired=float(tp_price),
+                                mark=mark,
+                                tick=tick,
+                                buffer_pct=buf,
+                            )
+                            params = dict(
+                                symbol=sym,
+                                side=close_side,
+                                type="TAKE_PROFIT_MARKET",
+                                stopPrice=float(trigger_price),
+                                closePosition=True,
+                                workingType=str(getattr(self.p, "working_type", "MARK_PRICE")),
+                                newClientOrderId=cid_tp,
+                                positionSide=position_side if hedge_mode else None,
+                            )
+                            if (not hedge_mode) and bool(self.p.reduce_only):
+                                params["reduceOnly"] = True
+                            return self._binance.new_order(**params)
+
+                        resp = _tl_place_algo_with_retry(_place, max_tries=int(getattr(self.p, "tp_place_retries", 3) or 3))
+
                     else:
                         params = dict(
                             symbol=sym,
@@ -1341,7 +2181,27 @@ class TradeLiquidation:
                         )
                         if (not hedge_mode) and bool(self.p.reduce_only):
                             params["reduceOnly"] = True
-                        resp = self._binance.new_order(**params)
+                        def _place_tp2(i: int):
+                            p2 = dict(params)
+                            try:
+                                px = float(p2.get("stopPrice") or p2.get("triggerPrice") or 0.0)
+                                if i > 0 and tick_size:
+                                    # move one tick away from immediate trigger
+                                    if close_side == "SELL":
+                                        px = px + float(tick_size) * i
+                                        px = _round_price_to_tick(px, float(tick_size), mode="up")
+                                    else:
+                                        px = px - float(tick_size) * i
+                                        px = _round_price_to_tick(px, float(tick_size), mode="down")
+                                # Binance uses triggerPrice for algo orders, stopPrice for normal - keep both
+                                p2["triggerPrice"] = float(px)
+                                p2["stopPrice"] = float(px)
+                                p2["triggerPrice"] = float(px)
+                            except Exception:
+                                pass
+                            return self._binance.new_order(**p2)
+
+                        resp = _tl_place_algo_with_retry(_place_tp2, max_tries=int(getattr(self.p, "tp_place_retries", 3) or 3))
 
                     if isinstance(resp, dict):
                         self._upsert_order_shadow(
@@ -1356,12 +2216,222 @@ class TradeLiquidation:
                             reduce_only=True,
                             status=str(resp.get("status") or "NEW"),
                         )
-                    recovered += 1
+                        recovered += 1
                     log.info("[trade_liquidation][RECOVERY] placed missing TP %s %s pos_uid=%s", sym, side, pos_uid)
                 except Exception:
                     log.exception("[trade_liquidation][RECOVERY] failed to place TP %s %s pos_uid=%s", sym, side, pos_uid)
 
+            # Trailing stop recovery (independent from SL deferral): ensure TRAILING is present if enabled
+            try:
+                trailing_enabled = bool(getattr(self.p, "trailing_enabled", False))
+                if trailing_enabled and (not has_trl):
+                    # reference price: before any averaging adds -> entry_price, after adds -> avg_price
+                    try:
+                        avg_state = (raw_meta or {}).get("avg_state") or {}
+                        adds_done = int(avg_state.get("adds_done") or 0)
+                    except Exception:
+                        adds_done = 0
+                    ref_price = float(avg_price or 0) if adds_done > 0 and avg_price else float(entry or 0)
+                    if ref_price and qty_use and float(qty_use) > 0:
+                        mark = self._get_mark_price(sym, position_side if hedge_mode else None)
+                        tick = float(getattr(self, "_symbol_tick", {}).get(sym, 0) or 0) or float(getattr(self, "_symbol_tick_size", {}).get(sym, 0) or 0) or 0.0
+                        if tick <= 0:
+                            # fallback: reuse ticks from symbol meta if present
+                            tick = float((raw_meta or {}).get("tick_size") or 0) or 0.0
+                        act_pct = float(getattr(self.p, "trailing_activation_pct", 0.5) or 0.5)
+                        act_des = ref_price * (1 + act_pct / 100.0) if side == "LONG" else ref_price * (1 - act_pct / 100.0)
+                        act = _round_to_tick(act_des, tick_size=tick, mode="nearest") if tick > 0 else act_des
+                        buf = float(getattr(self.p, "trailing_activation_buffer_pct", 0.15) or 0.15)
+                        if side == "LONG":
+                            act = self._safe_price_above_mark(act, mark, tick, buf)
+                        else:
+                            act = self._safe_price_below_mark(act, mark, tick, buf)
+                        cb = float(getattr(self.p, "trailing_callback_rate", 0.5) or 0.5)
+                        def _place_trl(i_try: int):
+                            p_trl = dict(
+                                symbol=sym,
+                                side=close_side,
+                                type="TRAILING_STOP_MARKET",
+                                quantity=str(qty_use),
+                                callbackRate=cb,
+                                workingType="MARK_PRICE",
+                                positionSide=position_side if hedge_mode else None,
+                                algoType="CONDITIONAL",
+                                activatePrice=str(act),
+                                newClientOrderId=cid_trl,
+                            )
+                            return self._binance.new_order(**p_trl)
+                        resp_trl = _tl_place_algo_with_retry(_place_trl, max_tries=int(getattr(self.p, "trailing_place_retries", 3) or 3))
+                        self._upsert_order_shadow(
+                            symbol_id=int(symbol_id),
+                            order_id=str(resp_trl.get("algoId") or resp_trl.get("orderId") or ""),
+                            client_order_id=cid_trl,
+                            side=close_side,
+                            order_type="TRAILING_STOP_MARKET",
+                            status=str(resp_trl.get("algoStatus") or resp_trl.get("status") or "NEW"),
+                            qty=float(qty_use),
+                            price=float(act) if act is not None else None,
+                            reduce_only=True,
+                            pos_uid=pos_uid,
+                        )
+                        recovered += 1
+                        log.info("[trade_liquidation][RECOVERY] placed missing TRAILING %s %s pos_uid=%s", sym, side, pos_uid)
+            except Exception:
+                log.exception("[trade_liquidation][RECOVERY] failed trailing recovery for %s %s pos_uid=%s", sym, side, pos_uid)
+
+            # Averaging ADD recovery: after restart ADD orders may be missing because they were previously
+            # placed only at ENTRY time. If averaging is enabled, ensure at least ADD1 exists.
+            try:
+                averaging_enabled = bool(getattr(self.p, "averaging_enabled", False) or getattr(self.p, "avg_enabled", False))
+                if averaging_enabled:
+                    self._recovery_ensure_add1(
+                        sym=sym,
+                        side=side,
+                        position_side=position_side,
+                        pos_uid=pos_uid,
+                        symbol_id=int(symbol_id),
+                        entry_price=Decimal(str(avg_price or entry or 0)),
+        mark_price=_dec(ex_mark_map.get((sym, side)) or "0"),
+                        pos_qty=Decimal(str(qty_use or 0)),
+                        existing_client_ids=existing,
+                    )
+            except Exception:
+                log.exception("[trade_liquidation][RECOVERY] failed ADD recovery for %s %s pos_uid=%s", sym, side, pos_uid)
+
         return int(recovered)
+
+    def _recovery_ensure_add1(
+        self,
+        *,
+        sym: str,
+        side: str,
+        position_side: str,
+        pos_uid: str,
+        symbol_id: int,
+        entry_price: Decimal,
+        mark_price: Decimal | None = None,
+        pos_qty: Decimal,
+        existing_client_ids: set,
+    ) -> None:
+        """Ensure the first averaging add order exists.
+
+        If there is no significant level available (we don't have it during recovery), we place a
+        fallback add level at least `min_level_distance_pct` away from the average entry.
+        Default min is 5%.
+        """
+
+        tok = _coid_token(pos_uid)
+        sym_u = (sym or "").upper()
+
+        # If any ADD exists, do nothing
+        for cid in (existing_client_ids or set()):
+            if isinstance(cid, str) and (f"TL_{tok}_ADD" in cid):
+                return
+
+        if entry_price is None or entry_price <= 0 or pos_qty is None or pos_qty <= 0:
+            return
+
+        # Min distance (default 5%)
+        min_pct = Decimal(str(getattr(self.p, "min_level_distance_pct", 5) or 5))
+        if min_pct < 0:
+            min_pct = Decimal("0")
+
+        if str(side).upper() == "LONG":
+            add_price = entry_price * (Decimal("1") - (min_pct / Decimal("100")))
+            add_side = "BUY"
+        else:
+            add_price = entry_price * (Decimal("1") + (min_pct / Decimal("100")))
+            add_side = "SELL"
+
+        tick = self._price_tick_for_symbol(sym_u) or Decimal("0")
+        if tick and tick > 0:
+            # for LONG BUY add we want to be conservative: round down; for SHORT SELL add round up
+            # NOTE: _round_to_step uses keyword-only arg `rounding` (not `mode`).
+            add_price = _round_to_step(add_price, tick, rounding=("floor" if add_side == "BUY" else "ceiling"))
+
+        # Qty sizing: default = position qty / max_adds, unless averaging_add_qty_pct is specified
+        max_adds = int(getattr(self.p, "averaging_max_adds", 1) or 1)
+        add_qty_pct = Decimal(str(getattr(self.p, "averaging_add_qty_pct", 0) or 0))
+        if add_qty_pct > 0:
+            add_qty = pos_qty * (add_qty_pct / Decimal("100"))
+        else:
+            add_qty = (pos_qty / Decimal(str(max_adds))) if max_adds > 0 else pos_qty
+
+        qty_step = self._qty_step_for_symbol(sym_u) or Decimal("0")
+        if qty_step and qty_step > 0:
+            add_qty = _round_qty_to_step(add_qty, qty_step, mode="down")
+
+        if add_qty <= 0:
+            return
+
+        cid_add = f"TL_{tok}_ADD1"
+        # Ensure ADD trigger price is on the correct side of current mark price to avoid immediate-trigger (Binance -2021).
+        # For LONG we add with BUY when price falls; for SHORT we add with SELL when price rises.
+        try:
+            tick = _dec(tick)
+        except Exception:
+            tick = _dec('0')
+        if mark_price is not None and mark_price > 0 and tick and tick > 0:
+            if add_side == 'BUY':
+                # must be strictly below mark
+                if add_price >= mark_price:
+                    add_price = mark_price - tick
+            else:
+                # must be strictly above mark
+                if add_price <= mark_price:
+                    add_price = mark_price + tick
+
+        # If price already moved beyond the first add level, push trigger further away in steps of min_pct from entry.
+        min_pct = _dec(str(getattr(self.p, 'averaging_min_level_pct', getattr(self.p, 'min_level_pct', 5)) or 5)) / _dec('100')
+        if entry_price and min_pct > 0 and mark_price is not None and mark_price > 0 and tick and tick > 0:
+            for i in range(1, 26):
+                if add_side == 'BUY':
+                    cand = entry_price * (_dec('1') - (min_pct * _dec(i)))
+                    cand = _round_to_step(cand, tick, rounding='down')
+                    if cand < (mark_price - tick):
+                        add_price = cand
+                        break
+                else:
+                    cand = entry_price * (_dec('1') + (min_pct * _dec(i)))
+                    cand = _round_to_step(cand, tick, rounding='up')
+                    if cand > (mark_price + tick):
+                        add_price = cand
+                        break
+
+        params = dict(
+            symbol=sym_u,
+            side=add_side,
+            # Conditional market order for averaging (trigger -> market)
+            type='TAKE_PROFIT_MARKET',
+            stopPrice=float(add_price),
+            quantity=float(add_qty),
+            workingType="MARK_PRICE",
+            priceProtect=True,
+            newClientOrderId=cid_add,
+            positionSide=position_side,
+        )
+
+        resp = self._binance.new_order(**params)
+
+        # Shadow insert with supported args only
+        try:
+            if isinstance(resp, dict):
+                self._upsert_order_shadow(
+                    pos_uid=pos_uid,
+                    order_id=str(resp.get("orderId") or resp.get("order_id") or ""),
+                    client_order_id=cid_add,
+                    symbol_id=int(symbol_id),
+                    side=add_side,
+                    order_type=params.get("type"),
+                    qty=float(add_qty),
+                    price=float(add_price),
+                    reduce_only=False,
+                    status=str(resp.get("status") or "NEW"),
+                )
+        except Exception:
+            pass
+
+        log.info("[trade_liquidation][RECOVERY] placed missing ADD1 %s %s pos_uid=%s price=%s qty=%s", sym_u, side, pos_uid, add_price, add_qty)
 
     # ----------------------------------------------------------
     # LIVE: cleanup leftover SL/TP based on order-events/fills
@@ -1378,7 +2448,7 @@ class TradeLiquidation:
         if not bool(getattr(self.p, "live_cleanup_remaining_orders", True)):
             return 0
 
-        prefix = str(getattr(self.p, "client_order_id_prefix", "TL") or "TL").strip() or "TL"
+        prefix = _sanitize_coid_prefix(str(getattr(self.p, "client_order_id_prefix", "TL") or "TL"))
 
         # В order_events НЕТ event_time — используем ts_ms/recv_ts
         sql = """
@@ -1437,8 +2507,30 @@ class TradeLiquidation:
             if not (coid.endswith("_SL") or coid.endswith("_TP")):
                 continue
 
-            # TL_{pos_uid}_SL  / TL_{pos_uid}_TP
-            pos_uid = coid[len(prefix) + 1: -3]
+            # TL_<token>_SL  / TL_<token>_TP
+            tok = coid[len(prefix) + 1: -3]
+
+            # Resolve real pos_uid via shadow orders table (because clientOrderId stores only token)
+            pos_uid = None
+            try:
+                rr = list(
+                    self.store.query_dict(
+                        """
+                        SELECT pos_uid
+                        FROM orders
+                        WHERE exchange_id=%(ex)s
+                          AND account_id=%(acc)s
+                          AND client_order_id=%(coid)s
+                        ORDER BY updated_at DESC
+                        LIMIT 1
+                        """,
+                        {"ex": int(self.p.exchange_id), "acc": int(self.account_id), "coid": coid},
+                    )
+                )
+                if rr and rr[0].get("pos_uid"):
+                    pos_uid = str(rr[0]["pos_uid"])
+            except Exception:
+                pos_uid = None
 
             symbol_id = int(r.get("symbol_id") or 0)
             symbol = sym_map.get(symbol_id)
@@ -1446,10 +2538,11 @@ class TradeLiquidation:
                 continue
 
             other_suffix = "TP" if coid.endswith("_SL") else "SL"
-            other_coid = f"{prefix}_{pos_uid}_{other_suffix}"
+            other_coid = f"{prefix}_{tok}_{other_suffix}"
 
             # 1) отменяем второй ордер, если он есть в openOrders
             try:
+                canceled_this = False
                 # If we already fetched openOrders (async snapshot), reuse it.
                 open_all = self._rest_snapshot_get("open_orders_all")
                 if isinstance(open_all, list):
@@ -1460,6 +2553,7 @@ class TradeLiquidation:
                     if str(oo.get("clientOrderId") or "") == other_coid:
                         self._binance.cancel_order(symbol=symbol, origClientOrderId=other_coid)
                         canceled += 1
+                        canceled_this = True
                         log.info(
                             "[trade_liquidation][LIVE] cancel leftover %s (pos_uid=%s symbol=%s)",
                             other_suffix,
@@ -1467,6 +2561,26 @@ class TradeLiquidation:
                             symbol,
                         )
                         break
+
+                # Binance conditional orders may live in Algo endpoints.
+                # If we don't find it in openOrders, try openAlgoOrders.
+                if not canceled_this:
+                    try:
+                        algo_open = self._binance.open_algo_orders(symbol=symbol)
+                        for ao in algo_open:
+                            if str(ao.get("clientAlgoId") or "") == other_coid:
+                                self._binance.cancel_algo_order(symbol=symbol, clientAlgoId=other_coid)
+                                canceled += 1
+                                canceled_this = True
+                                log.info(
+                                    "[trade_liquidation][LIVE] cancel leftover(algo) %s (pos_uid=%s symbol=%s)",
+                                    other_suffix,
+                                    pos_uid,
+                                    symbol,
+                                )
+                                break
+                    except Exception:
+                        pass
             except Exception:
                 log.exception(
                     "[trade_liquidation][LIVE] failed to cancel leftover order (pos_uid=%s symbol=%s)",
@@ -1524,36 +2638,974 @@ class TradeLiquidation:
 
         return canceled
 
+    def _live_cancel_all_orders_if_flat(self) -> int:
+        """If exchange shows position is flat (positionAmt == 0) — cancel all orders.
+
+        Covers manual closes, liquidation, reduce-only closes, etc. If the position
+        is already 0 on the exchange, we should not leave TP/SL/trailing orders
+        hanging around.
+
+        Uses the current REST snapshot (open_orders_all/open_algo_orders_all/position_risk).
+        Returns the number of symbols for which we attempted cleanup.
+        """
+
+        if not self._is_live:
+            return 0
+
+        pos_risk = self._rest_snapshot_get("position_risk") or []
+        if not isinstance(pos_risk, list) or not pos_risk:
+            return 0
+
+        open_orders = self._rest_snapshot_get("open_orders_all") or []
+        open_algos = self._rest_snapshot_get("open_algo_orders_all") or []
+
+        # Build symbol -> counts
+        oo_cnt: Dict[str, int] = {}
+        for o in open_orders if isinstance(open_orders, list) else []:
+            sym = str(o.get("symbol") or "").strip()
+            if sym:
+                oo_cnt[sym] = oo_cnt.get(sym, 0) + 1
+
+        ao_cnt: Dict[str, int] = {}
+        for o in open_algos if isinstance(open_algos, list) else []:
+            sym = str(o.get("symbol") or "").strip()
+            if sym:
+                ao_cnt[sym] = ao_cnt.get(sym, 0) + 1
+
+        cleaned_syms = 0
+        EPS = 1e-12
+
+        # In hedge mode, positionRisk returns one row per (symbol, positionSide).
+        # A symbol can have LONG!=0 and SHORT==0 at the same time.
+        # We must treat the *symbol* as open if ANY side is non-zero; otherwise we might
+        # incorrectly cancel protective orders for a still-open position.
+        sym_has_pos: Dict[str, bool] = {}
+        for _pr in pos_risk:
+            if not isinstance(_pr, dict):
+                continue
+            _sym = str(_pr.get('symbol') or '').strip()
+            if not _sym:
+                continue
+            try:
+                _amt = float(_pr.get('positionAmt') or 0.0)
+            except Exception:
+                _amt = 0.0
+            if abs(_amt) > EPS:
+                sym_has_pos[_sym] = True
+            else:
+                sym_has_pos.setdefault(_sym, False)
+
+        for pr in pos_risk:
+            if not isinstance(pr, dict):
+                continue
+            sym = str(pr.get("symbol") or "").strip()
+            if not sym:
+                continue
+            # If ANY side for this symbol is non-zero, the position is still open -> do not cancel orders.
+            if sym_has_pos.get(sym, False):
+                continue
+            try:
+                pos_amt = float(pr.get("positionAmt") or 0.0)
+            except Exception:
+                pos_amt = 0.0
+            if abs(pos_amt) > EPS:
+                continue
+
+            if oo_cnt.get(sym, 0) == 0 and ao_cnt.get(sym, 0) == 0:
+                continue
+
+            cleaned_syms += 1
+            try:
+                if oo_cnt.get(sym, 0) > 0:
+                    self._binance.cancel_all_open_orders(sym)
+                if ao_cnt.get(sym, 0) > 0:
+                    self._binance.cancel_all_open_algo_orders(sym)
+                self._dlog(
+                    "[trade_liquidation][LIVE] flat-position cleanup: symbol=%s openOrders=%s openAlgoOrders=%s",
+                    sym,
+                    oo_cnt.get(sym, 0),
+                    ao_cnt.get(sym, 0),
+                )
+            except Exception:
+                log.exception("[trade_liquidation][LIVE] flat-position cleanup failed for %s", sym)
+
+        return cleaned_syms
+
     # ----------------------------------------------------------
     # Positions
     # ----------------------------------------------------------
 
-    def _get_open_positions(self) -> List[Dict[str, Any]]:
-        q = """
-        SELECT
-          pl.exchange_id, pl.account_id, pl.symbol_id, pl.pos_uid, pl.side,
-          pl.avg_price, pl.qty_current, pl.opened_at, pl.strategy_id,
-          s.symbol,
-          COALESCE(sf.qty_step, 0) AS qty_step
-        FROM position_ledger pl
-        JOIN symbols s ON s.symbol_id = pl.symbol_id
-        LEFT JOIN symbol_filters sf
-          ON sf.exchange_id = pl.exchange_id
-         AND sf.symbol_id = pl.symbol_id
-        WHERE pl.exchange_id=%(ex)s
-          AND pl.account_id=%(acc)s
-          AND pl.strategy_id=%(sid)s
-          AND pl.status='OPEN'
-          AND pl.source=%(src)s
-        ORDER BY pl.opened_at ASC;
+
+# ---------------------------------------------------------------------
+# Live: helpers for "position became 0" => cancel all orders by symbol
+    # ---------------------------------------
+    # Helpers for symbol precision / cleanup
+    # ---------------------------------------
+
+    def _qty_step_for_symbol(self, symbol: str):
+        """Return Binance LOT_SIZE step for quantity rounding, if known."""
+        f = self._symbol_filters_map.get((symbol or "").upper())
+        if not f:
+            return None
+        v = f.get("qty_step")
+        if v is None:
+            return None
+        try:
+            return Decimal(str(v))
+        except Exception:
+            return None
+
+    def _price_tick_for_symbol(self, symbol: str):
+        """Return Binance PRICE_FILTER tickSize for price rounding, if known."""
+        f = self._symbol_filters_map.get((symbol or "").upper())
+        if not f:
+            return None
+        v = f.get("price_tick")
+        if v is None:
+            return None
+        try:
+            return Decimal(str(v))
+        except Exception:
+            return None
+
+    def _is_flat_qty(self, qty: Any, symbol: str) -> bool:
         """
-        src = "live" if self._is_live else "paper"
-        return list(
-            self.store.query_dict(
-                q,
-                {"ex": int(self.p.exchange_id), "acc": int(self.account_id), "sid": self.STRATEGY_ID, "src": src},
+        True if position amount is effectively zero for the symbol.
+
+        Binance positionAmt can be very small residual; we treat anything below qty_step as flat.
+        """
+        try:
+            q = abs(Decimal(str(qty)))
+        except Exception:
+            try:
+                q = abs(Decimal(qty))
+            except Exception:
+                return False
+        step = self._qty_step_for_symbol(symbol) or Decimal("0")
+        if step > 0:
+            return q < step
+        return q == 0
+
+    def _live_cancel_symbol_orders(self, symbol: str) -> int:
+        """Cancel ALL open regular+algo orders for a symbol. Returns number of canceled items (best-effort)."""
+        symbol = (symbol or "").upper()
+        canceled_total = 0
+
+        # Regular open orders
+        try:
+            resp = self._binance.cancel_all_open_orders(symbol=symbol)
+            if isinstance(resp, list):
+                canceled_total += len(resp)
+            elif isinstance(resp, dict) and resp:
+                # Binance may return dict for single cancel responses; count as 1
+                canceled_total += 1
+            self._dlog("[live] canceled openOrders symbol=%s total=%s", symbol, canceled_total)
+        except Exception as e:
+            log.warning("[live] cancel_all_open_orders failed symbol=%s: %s", symbol, e)
+
+        # Algo / conditional orders
+        try:
+            resp = self._binance.cancel_all_open_algo_orders(symbol=symbol)
+            if isinstance(resp, list):
+                canceled_total += len(resp)
+            elif isinstance(resp, dict) and resp:
+                canceled_total += 1
+            self._dlog("[live] canceled openAlgoOrders symbol=%s total=%s", symbol, canceled_total)
+        except Exception as e:
+            log.warning("[live] cancel_all_open_algo_orders failed symbol=%s: %s", symbol, e)
+
+        return canceled_total
+    @staticmethod
+    def _to_epoch_ms(v: Any) -> Optional[int]:
+        if v is None:
+            return None
+        try:
+            import datetime as _dt
+            if isinstance(v, (_dt.datetime, _dt.date)):
+                if isinstance(v, _dt.date) and not isinstance(v, _dt.datetime):
+                    v = _dt.datetime(v.year, v.month, v.day)
+                # if tz-naive, assume UTC to avoid local-time surprises
+                if getattr(v, "tzinfo", None) is None:
+                    v = v.replace(tzinfo=_dt.timezone.utc)
+                return int(v.timestamp() * 1000)
+        except Exception:
+            pass
+        if isinstance(v, (int, float)):
+            # heuristics: seconds vs ms
+            return int(v * 1000) if v < 10_000_000_000 else int(v)
+        if isinstance(v, str):
+            s = v.strip()
+            try:
+                import datetime as _dt
+                # tolerate 'Z'
+                if s.endswith("Z"):
+                    s = s[:-1] + "+00:00"
+                dt = _dt.datetime.fromisoformat(s)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=_dt.timezone.utc)
+                return int(dt.timestamp() * 1000)
+            except Exception:
+                return None
+        return None
+
+    def _fetch_exchange_exit_stats(
+        self,
+        symbol: str,
+        pos_side: str,
+        opened_at: Any,
+        closed_at: Any,
+        qty_expected: float,
+    ) -> Dict[str, Any]:
+        """Fetch best-effort exit_price / realized_pnl / fees / close_time_ms from Binance futures trade history.
+
+        Strategy:
+          - Query userTrades in a bounded window [opened_at-60s, closed_at+60s] when closed_at is known.
+            This avoids the "last 1000 trades" truncation when the account is active.
+          - Paginate forward if Binance returns exactly `limit` trades.
+          - Aggregate closing-side fills (SELL for LONG, BUY for SHORT) with matching positionSide (or BOTH).
+          - Return fees (USDT + other assets) even if we can't infer exit fills (so we can at least backfill fees/marker).
+        """
+        ps = str(pos_side or "").upper()
+        close_order_side = "SELL" if ps == "LONG" else "BUY"
+
+        # time window
+        opened_ms = self._to_epoch_ms(opened_at)
+        closed_ms = self._to_epoch_ms(closed_at)
+        if opened_ms is None:
+            opened_ms = int(time.time() * 1000) - 7 * 24 * 3600 * 1000  # fallback: last 7d
+        start_ms = max(0, opened_ms - 60_000)
+        end_ms = (closed_ms + 60_000) if closed_ms is not None else None
+
+        limit = 1000
+        trades_all: List[Dict[str, Any]] = []
+        page_start = start_ms
+        # paginate forward (Binance returns trades within [startTime,endTime] up to limit)
+        for _ in range(20):  # hard safety cap
+            batch = self._binance_rest.user_trades(
+                symbol=symbol,
+                start_time_ms=page_start,
+                end_time_ms=end_ms,
+                limit=limit,
             )
+            if not batch:
+                break
+            trades_all.extend(batch)
+            if len(batch) < limit:
+                break
+            # move start to just after last trade time to avoid duplicates
+            try:
+                last_t = max(int(x.get("time") or 0) for x in batch)
+            except Exception:
+                break
+            if last_t <= 0:
+                break
+            page_start = last_t + 1
+            # if we already passed end_ms, stop
+            if end_ms is not None and page_start >= end_ms:
+                break
+
+        if not trades_all:
+            return {"fees_usdt": 0.0, "fees_other": {}, "exit_qty": 0.0}
+
+        # Aggregate
+        qty_target = abs(float(qty_expected or 0.0))
+        qty_target_tol = qty_target * 0.995 if qty_target > 0 else 0.0
+
+        exit_qty = 0.0
+        exit_notional = 0.0
+        realized = 0.0
+        fees_usdt = 0.0
+        fees_other: Dict[str, float] = {}
+        last_time_ms: Optional[int] = None
+
+        try:
+            trades_sorted = sorted(trades_all, key=lambda x: int(x.get("time") or 0))
+        except Exception:
+            trades_sorted = trades_all
+
+        for t in trades_sorted:
+            try:
+                # fees (collect for ALL trades in window for that positionSide/BOTH)
+                if "positionSide" in t and str(t.get("positionSide") or "").upper() not in ("", ps, "BOTH"):
+                    continue
+                ca = str(t.get("commissionAsset") or "").upper()
+                cval = float(t.get("commission") or 0.0)
+                if ca == "USDT":
+                    fees_usdt += cval
+                elif cval:
+                    fees_other[ca] = fees_other.get(ca, 0.0) + cval
+
+                # closing side fills for exit VWAP/pnl
+                if str(t.get("side") or "").upper() != close_order_side:
+                    continue
+                q = float(t.get("qty") or 0.0)
+                p = float(t.get("price") or 0.0)
+                if q <= 0 or p <= 0:
+                    continue
+                exit_qty += q
+                exit_notional += q * p
+                realized += float(t.get("realizedPnl") or 0.0)
+                last_time_ms = int(t.get("time") or 0) or last_time_ms
+
+                if qty_target_tol > 0 and exit_qty >= qty_target_tol:
+                    # we've likely covered the closing quantity; keep collecting fees already done
+                    break
+            except Exception:
+                continue
+
+        out: Dict[str, Any] = {
+            "fees_usdt": float(fees_usdt),
+            "fees_other": fees_other,
+                        "fees_done": True,
+                            "fees_done": True,
+            "exit_qty": float(exit_qty),
+        }
+        if exit_qty > 0:
+            out.update(
+                {
+                    "exit_price": (exit_notional / exit_qty) if exit_qty else None,
+                    "realized_pnl": float(realized),
+                    "close_time_ms": int(last_time_ms) if last_time_ms else None,
+                }
+            )
+        return out
+
+    def _close_position_exchange(
+        self,
+        pos: Dict[str, Any],
+        exit_price: float,
+        realized_pnl: float,
+        close_time_ms: Optional[int],
+        reason: str,
+        timeframe: str,
+    ) -> None:
+        """Close a ledger position using exchange-derived exit price and realized PnL."""
+        meta = {
+            "exchange_exit": {
+                "reason": reason,
+                "timeframe": timeframe,
+                "exit_price": float(exit_price),
+                "realized_pnl": float(realized_pnl),
+                "close_time_ms": int(close_time_ms) if close_time_ms else None,
+            }
+        }
+
+        closed_at_sql = "now()"
+        closed_at_param = None
+        if close_time_ms:
+            closed_at_sql = "to_timestamp(%(closed_ts)s)"
+            closed_at_param = float(close_time_ms) / 1000.0
+
+        if self._pl_has_raw_meta:
+            q = f"""
+            UPDATE position_ledger
+            SET
+              status='CLOSED',
+              closed_at={closed_at_sql},
+              qty_closed=qty_current,
+              qty_current=0,
+              exit_price=%(exit)s,
+              realized_pnl=%(pnl)s,
+              updated_at=now(),
+              raw_meta = COALESCE(raw_meta,'{{}}'::jsonb) || %(meta)s::jsonb
+            WHERE exchange_id=%(ex)s AND account_id=%(acc)s AND symbol_id=%(sym)s AND pos_uid=%(pos_uid)s;
+            """
+            params = {
+                "exit": float(exit_price),
+                "pnl": float(realized_pnl),
+                "meta": json.dumps(meta),
+                "ex": int(self.p.exchange_id),
+                "acc": int(self.account_id),
+                "sym": int(pos["symbol_id"]),
+                "pos_uid": str(pos["pos_uid"]),
+            }
+            if closed_at_param is not None:
+                params["closed_ts"] = closed_at_param
+        else:
+            q = f"""
+            UPDATE position_ledger
+            SET
+              status='CLOSED',
+              closed_at={closed_at_sql},
+              qty_closed=qty_current,
+              qty_current=0,
+              exit_price=%(exit)s,
+              realized_pnl=%(pnl)s,
+              updated_at=now()
+            WHERE exchange_id=%(ex)s AND account_id=%(acc)s AND symbol_id=%(sym)s AND pos_uid=%(pos_uid)s;
+            """
+            params = {
+                "exit": float(exit_price),
+                "pnl": float(realized_pnl),
+                "ex": int(self.p.exchange_id),
+                "acc": int(self.account_id),
+                "sym": int(pos["symbol_id"]),
+                "pos_uid": str(pos["pos_uid"]),
+            }
+            if closed_at_param is not None:
+                params["closed_ts"] = closed_at_param
+
+        self.store.execute(q, params)
+
+        # log in LIVE style (avoid confusing [PAPER])
+        self._ilog(
+            "[trade_liquidation][LIVE] CLOSE %s %s qty=%.8f entry=%.8f exit=%.8f pnl=%.8f reason=%s",
+            str(pos.get("symbol") or "").upper(),
+            str(pos.get("side") or "").upper(),
+            float(pos.get("qty_current") or 0.0),
+            float(pos.get("avg_price") or pos.get("entry_price") or 0.0),
+            float(exit_price),
+            float(realized_pnl),
+            reason,
         )
+
+    def _get_open_positions(self):
+        """Возвращает OPEN позиции стратегии.
+
+        В LIVE режиме считаем "открыто" по факту на бирже:
+          - если в ledger позиция OPEN, но на Binance qty уже 0 (закрыли руками/по SL/TP/ликвидации),
+            то (если включено reconcile_auto_close_ledger) помечаем её CLOSED и снимаем все ордера по символу.
+          - для расчёта open_positions в логах возвращаем только те позиции, у которых qty на бирже != 0.
+
+        Это нужно, чтобы open_positions=... отражал реальность и не блокировал новые входы,
+        когда позиции уже закрылись на бирже.
+        """
+        sql = """
+        SELECT
+          pl.exchange_id,
+          pl.account_id,
+          pl.pos_uid,
+          pl.symbol_id,
+          pl.strategy_id,
+          pl.strategy_name,
+          pl.side,
+          pl.status,
+          pl.opened_at,
+          pl.closed_at,
+          pl.entry_price,
+          pl.avg_price,
+          pl.exit_price,
+          pl.qty_opened,
+          pl.qty_current,
+          pl.qty_closed,
+          pl.position_value_usdt,
+          pl.scale_in_count,
+          pl.realized_pnl,
+          pl.fees,
+          pl.updated_at,
+          pl.source,
+          pl.raw_meta,
+          s.symbol
+        FROM public.position_ledger pl
+        JOIN public.symbols s
+          ON s.exchange_id = pl.exchange_id
+         AND s.symbol_id   = pl.symbol_id
+        WHERE pl.exchange_id = %(exchange_id)s
+          AND pl.account_id  = %(account_id)s
+          AND pl.strategy_id = %(strategy_id)s
+          AND pl.status      = 'OPEN'
+        ORDER BY pl.opened_at ASC
+        """
+        pos = self.store.query_dict(sql, dict(
+            exchange_id=int(self.exchange_id),
+            account_id=int(self.account_id),
+            strategy_id=str(self.strategy_id),
+        ))
+
+        # PAPER: просто считаем по ledger
+        if str(self.mode).lower() != "live":
+            return pos
+
+        # LIVE: сверяемся с биржей, чтобы OPEN отражал реальность
+        try:
+            pr = self._binance.position_risk()
+        except Exception as e:
+            # если не смогли получить snapshot, не ломаем цикл — вернём ledger как есть
+            self._dlog("positionRisk fetch failed in _get_open_positions: %s", e)
+            return pos
+
+        # build map (symbol, positionSide) -> abs(positionAmt) and markPrice
+        qty_map = {}
+        mark_map = {}
+        for r in pr or []:
+            sym = (r.get("symbol") or "").upper()
+            ps = (r.get("positionSide") or "").upper()
+            if not sym or not ps:
+                continue
+            try:
+                amt = float(r.get("positionAmt") or 0.0)
+            except Exception:
+                amt = 0.0
+            try:
+                mp = float(r.get("markPrice") or 0.0)
+            except Exception:
+                mp = 0.0
+            qty_map[(sym, ps)] = abs(amt)
+            mark_map[(sym, ps)] = mp
+
+        tol = float(getattr(self.params, "reconcile_qty_tolerance", 1e-8) or 1e-8)
+        auto_close = bool(getattr(self.params, "reconcile_auto_close_ledger", True))
+        closed_now = 0
+        open_real = []
+
+        for p in pos:
+            sym = (p.get("symbol") or "").upper()
+            side = (p.get("side") or "").upper()  # LONG/SHORT
+            exch_qty = float(qty_map.get((sym, side), 0.0) or 0.0)
+
+            if abs(exch_qty) <= tol:
+                # На бирже позиции уже нет, но в ledger ещё OPEN
+                if auto_close:
+                    try:
+                        exit_price = float(mark_map.get((sym, side), 0.0) or 0.0)
+                        # Try to get real exit stats from exchange trade history (close price + realized pnl)
+                        stats = self._fetch_exchange_exit_stats(
+                            symbol=sym,
+                            pos_side=side,
+                            opened_at=p.get("opened_at"),
+                            closed_at=_utc_now(),
+                            qty_expected=_safe_float(p.get("qty_current"), default=0.0),
+                        )
+                        ex_exit = stats.get("exit_price")
+                        ex_pnl = stats.get("realized_pnl")
+                        ex_close_ms = stats.get("close_time_ms")
+
+                        if ex_exit is None:
+                            ex_exit = exit_price
+                        if not ex_exit:
+                            # fallback: если markPrice не пришёл, используем avg_price/entry_price
+                            ex_exit = float(p.get("avg_price") or p.get("entry_price") or 0.0)
+
+                        if ex_pnl is None:
+                            # last resort: approximate (still better than missing)
+                            entry = _safe_float(p.get("avg_price"), default=_safe_float(p.get("entry_price"), default=0.0))
+                            qty = _safe_float(p.get("qty_current"), default=0.0)
+                            ex_pnl = (float(ex_exit) - entry) * qty if str(side).upper() == "LONG" else (entry - float(ex_exit)) * qty
+
+                        self._close_position_exchange(
+                            p,
+                            exit_price=float(ex_exit),
+                            realized_pnl=float(ex_pnl),
+                            close_time_ms=ex_close_ms,
+                            reason="exchange_qty_zero",
+                            timeframe="reconcile",
+                        )
+                        # снимаем все ордера по символу (обычные + algo)
+                        self._live_cancel_symbol_orders(sym)
+                        closed_now += 1
+                    except Exception as e:
+                        self._dlog("auto-close ledger failed pos_uid=%s sym=%s side=%s: %s",
+                                   p.get("pos_uid"), sym, side, e)
+                continue
+
+            # позиция реально открыта
+            open_real.append(p)
+
+        if closed_now:
+            log.info("[TL] ledger auto-closed (exchange qty=0): closed_now=%s", closed_now)
+
+        return open_real
+
+
+    def _backfill_closed_exit_pnl(self, force: bool = False, log_empty: bool = False) -> Dict[str, int]:
+        """Background backfill for CLOSED ledger rows missing exit_price/realized_pnl.
+
+        Goal: if a position is already CLOSED in DB but exit_price/realized_pnl are NULL (e.g. old runs),
+        fetch Binance userTrades to infer close VWAP and realized PnL and write them into position_ledger.
+
+        Runs in LIVE mode only. Rate-limited by backfill_interval_sec (default 600s).
+        """
+        # rate limit
+        interval = float(getattr(self.p, "backfill_interval_sec", 600) or 600)
+        now_ts = time.time()
+        if not force:
+            last_ts = float(getattr(self, "_last_backfill_ts", 0.0) or 0.0)
+            if interval > 0 and (now_ts - last_ts) < interval:
+                return {"checked": 0, "updated": 0, "skipped": 1}
+
+        self._last_backfill_ts = now_ts
+
+        lookback_days = int(getattr(self.p, "backfill_lookback_days", 14) or 14)
+        batch = int(getattr(self.p, "backfill_batch_limit", 50) or 50)
+
+        overwrite = bool(getattr(self.p, 'backfill_overwrite', False))
+        if overwrite:
+            q = """
+                SELECT
+                  pl.pos_uid, pl.symbol_id, pl.side, pl.qty_closed,
+                  pl.opened_at, pl.closed_at, pl.exit_price, pl.realized_pnl, pl.fees, pl.raw_meta
+                FROM public.position_ledger pl
+                WHERE pl.exchange_id = %(exchange_id)s
+                  AND pl.account_id = %(account_id)s
+                  AND pl.strategy_id = %(strategy_id)s
+                  AND pl.status = 'CLOSED'
+                  AND COALESCE(pl.closed_at, pl.updated_at) >= (now() - (%(lookback_days)s || ' days')::interval)
+                  AND (
+                        %(overwrite)s
+                        OR pl.exit_price IS NULL
+                        OR pl.realized_pnl IS NULL
+                        OR pl.fees IS NULL
+                        OR pl.fees = 0
+                        OR NOT (pl.raw_meta ? 'exchange_exit_backfill')
+                      )
+                ORDER BY pl.updated_at DESC
+                LIMIT %(batch)s
+            """
+        else:
+            q = """
+                SELECT
+                  pl.pos_uid, pl.symbol_id, pl.side, pl.qty_closed,
+                  pl.opened_at, pl.closed_at, pl.exit_price, pl.realized_pnl, pl.fees, pl.raw_meta
+                FROM public.position_ledger pl
+                WHERE pl.exchange_id = %(exchange_id)s
+                  AND pl.account_id = %(account_id)s
+                  AND pl.strategy_id = %(strategy_id)s
+                  AND pl.status = 'CLOSED'
+                  AND COALESCE(pl.closed_at, pl.updated_at) >= (now() - (%(lookback_days)s || ' days')::interval)
+                  AND (
+                        pl.exit_price IS NULL
+                     OR pl.realized_pnl IS NULL
+                     OR (%(fill_fees)s AND (pl.fees IS NULL OR pl.fees = 0))
+                     OR NOT (pl.raw_meta ? 'exchange_exit_backfill')
+                  )
+                ORDER BY pl.updated_at DESC
+                LIMIT %(batch)s
+            """
+        rows = self.store.query_dict(q, {
+            "exchange_id": int(self.p.exchange_id),
+            "account_id": int(self.account_id),
+            "strategy_id": str(self.STRATEGY_ID),
+            "lookback_days": int(lookback_days),
+            "batch": int(batch),
+            "fill_fees": bool(getattr(self.p, "backfill_fill_fees", True)),
+        }) or []
+
+        updated = 0
+        checked = 0
+
+        for r in rows:
+            checked += 1
+            sym = (r.get("symbol") or "").upper()
+            side = (r.get("side") or "").upper()  # LONG/SHORT
+            qty_expected = _safe_float(r.get("qty_closed"), default=_safe_float(r.get("qty_opened"), default=0.0))
+            if not sym or qty_expected <= 0:
+                continue
+
+            opened_ms = self._to_epoch_ms(r.get("opened_at"))
+            closed_ms = self._to_epoch_ms(r.get("closed_at"))
+            start_ms = (opened_ms - 60_000) if opened_ms else None
+            end_ms = (closed_ms + 60_000) if closed_ms else None
+
+            if getattr(self.p, "debug", False):
+                log.info("[TL][debug] backfill candidate symbol=%s side=%s qty_expected=%.8f opened_ms=%s closed_ms=%s", sym, side, qty_expected, opened_ms, closed_ms)
+
+            try:
+                trades = self._binance_rest.user_trades(symbol=sym, start_time_ms=start_ms, end_time_ms=end_ms, limit=1000)
+                if getattr(self.p, "debug", False):
+                    log.info("[TL][debug] backfill userTrades fetched=%s symbol=%s window_ms=[%s,%s]", len(trades) if trades else 0, sym, start_ms, end_ms)
+                # Retry with a wider window if nothing returned (closed_at may be set long after fills)
+                if (not trades) and closed_ms:
+                    start2 = max(int(closed_ms) - 3 * 24 * 60 * 60 * 1000, 0)
+                    end2 = int(time.time() * 1000)
+                    trades = self._binance_rest.user_trades(symbol=sym, start_time_ms=start2, end_time_ms=end2, limit=1000)
+                    if getattr(self.p, "debug", False):
+                        log.info("[TL][debug] backfill userTrades retry fetched=%s symbol=%s window_ms=[%s,%s]", len(trades) if trades else 0, sym, start2, end2)
+                ps = str(side or "").upper()
+                close_order_side = "SELL" if ps == "LONG" else "BUY"
+
+
+                trades_sorted = sorted(trades or [], key=lambda t: int(t.get("time") or t.get("timestamp") or t.get("tradeTime") or 0))
+                qty_target = abs(float(qty_expected or 0.0))
+                qty_target_tol = qty_target * 0.995 if qty_target else 0.0
+
+                # Collect only *closing* fills for this symbol/positionSide within the window.
+                # In hedge-mode Binance may return BOTH; we allow BOTH or exact match.
+                close_fills = []
+                for t in trades_sorted:
+                    try:
+                        sym_t = str(t.get("symbol") or t.get("s") or "").upper()
+                        if sym_t and sym_t != str(sym).upper():
+                            continue
+
+                        if "positionSide" in t and str(t.get("positionSide") or "").upper() not in ("", ps, "BOTH"):
+                            continue
+
+                        t_side = str(t.get("side") or t.get("order_side") or "").upper()
+                        if not t_side or t_side != close_order_side:
+                            continue
+
+                        # Extract numeric fields robustly (wrappers sometimes rename keys)
+                        def _f(keys, default=0.0):
+                            for k in keys:
+                                if k in t and t.get(k) not in (None, ""):
+                                    try:
+                                        return float(t.get(k))
+                                    except Exception:
+                                        pass
+                            return default
+
+                        def _i(keys, default=0):
+                            for k in keys:
+                                if k in t and t.get(k) not in (None, ""):
+                                    try:
+                                        return int(t.get(k))
+                                    except Exception:
+                                        pass
+                            return default
+
+                        qty = _f(["qty", "quantity", "executedQty", "executed_qty", "origQty", "orig_qty"], 0.0)
+                        price = _f(["price", "avgPrice", "avg_price"], 0.0)
+
+                        # Guard against buggy wrappers where 'qty' accidentally contains trade id / order id
+                        if qty_target > 0:
+                            too_big = max(qty_target * 10.0, 1000.0)
+                            if qty > too_big:
+                                # try alternatives
+                                found_alt = False
+                                for alt_k in ["quantity", "executedQty", "executed_qty", "origQty", "orig_qty"]:
+                                    if alt_k in t and t.get(alt_k) not in (None, ""):
+                                        try:
+                                            alt = float(t.get(alt_k))
+                                            if 0 < alt <= too_big:
+                                                qty = alt
+                                                found_alt = True
+                                                break
+                                        except Exception:
+                                            pass
+                                if (not found_alt) and qty > too_big:
+                                    # still absurd -> skip this fill
+                                    continue
+
+                        if qty <= 0 or price <= 0:
+                            continue
+
+                        ca = str(t.get("commissionAsset") or t.get("commission_asset") or "").upper()
+                        cv = _f(["commission", "commissionAmount", "commission_amount"], 0.0)
+
+                        order_id = t.get("orderId") or t.get("order_id") or t.get("orderID") or None
+                        trade_time = _i(["time", "timestamp", "tradeTime", "trade_time"], 0)
+
+                        close_fills.append({
+                            "order_id": str(order_id) if order_id is not None else "",
+                            "qty": float(qty),
+                            "price": float(price),
+                            "realized": _f(["realizedPnl", "realized_pnl"], 0.0),
+                            "commission_asset": ca,
+                            "commission": float(cv),
+                            "time_ms": int(trade_time) if trade_time else 0,
+                        })
+                    except Exception:
+                        continue
+
+                # Aggregate closing fills. If the position was closed by multiple orders, we sum all of them.
+                # Additionally, we try to avoid mixing unrelated closes by preferring the most recent orders first
+                # until we reach expected qty (if expected qty is known).
+                order_agg = {}
+                for f in close_fills:
+                    key = f["order_id"] or "_no_order_id"
+                    a = order_agg.get(key)
+                    if not a:
+                        a = {
+                            "exit_qty": 0.0,
+                            "exit_notional": 0.0,
+                            "realized": 0.0,
+                            "fees_usdt": 0.0,
+                            "fees_other": {},
+                            "last_time_ms": 0,
+                        }
+                        order_agg[key] = a
+                    a["exit_qty"] += f["qty"]
+                    a["exit_notional"] += f["qty"] * f["price"]
+                    a["realized"] += f["realized"]
+                    a["last_time_ms"] = max(a["last_time_ms"], int(f["time_ms"] or 0))
+
+                    if f["commission"]:
+                        if f["commission_asset"] == "USDT":
+                            a["fees_usdt"] += f["commission"]
+                        elif f["commission_asset"]:
+                            a["fees_other"][f["commission_asset"]] = float(a["fees_other"].get(f["commission_asset"], 0.0)) + f["commission"]
+
+                # Choose which order groups to use:
+                # - if we know expected qty: take the newest groups until qty >= expected (tolerance)
+                # - else: take all groups
+                groups = list(order_agg.values())
+                groups.sort(key=lambda g: int(g.get("last_time_ms") or 0), reverse=True)
+
+                use_groups = []
+                total_qty = 0.0
+                if qty_target > 0:
+                    for g in groups:
+                        use_groups.append(g)
+                        total_qty += float(g.get("exit_qty") or 0.0)
+                        if total_qty >= qty_target_tol:
+                            break
+                else:
+                    use_groups = groups
+
+                # reset per-position accumulators (IMPORTANT: do not carry between symbols)
+                exit_qty = 0.0
+                exit_notional = 0.0
+                realized = 0.0
+                fees_usdt = 0.0
+                fees_other = {}
+                last_time_ms = 0
+
+                for g in use_groups:
+                    exit_qty += float(g.get("exit_qty") or 0.0)
+                    exit_notional += float(g.get("exit_notional") or 0.0)
+                    realized += float(g.get("realized") or 0.0)
+                    fees_usdt += float(g.get("fees_usdt") or 0.0)
+                    for k, v in (g.get("fees_other") or {}).items():
+                        fees_other[k] = float(fees_other.get(k, 0.0)) + float(v or 0.0)
+                    last_time_ms = max(last_time_ms, int(g.get("last_time_ms") or 0))
+
+                have_exit = exit_qty > 0
+                exit_price = (exit_notional / exit_qty) if exit_qty else None
+
+                # If we couldn't infer exit fills (e.g. API window/limit issues), we can still backfill fees + marker
+                if (not have_exit) or (exit_price is None):
+                    # Even if fees are not available, write a marker so we don't re-check forever.
+                    meta = {
+                        "exchange_exit_backfill": {
+                            "note": "no_exit_fills_in_window" if (fees_usdt > 0.0 or fees_other) else "no_exit_fills_or_fees",
+                            "fees_usdt": float(fees_usdt),
+                            "fees_other": fees_other,
+                        }
+                    }
+                    # fees-only update (do not touch exit_price/realized_pnl)
+                    if self._pl_has_raw_meta:
+                        uq_fees = """
+                        UPDATE position_ledger
+                        SET
+                          fees = COALESCE(NULLIF(fees, 0), %(fees)s),
+                          raw_meta = COALESCE(raw_meta,'{}'::jsonb) || %(meta)s::jsonb,
+                          updated_at = now()
+                        WHERE exchange_id = %(ex)s
+                          AND account_id  = %(acc)s
+                          AND pos_uid     = %(pos_uid)s
+                          AND opened_at   = %(opened_at)s
+                        """
+                    else:
+                        uq_fees = """
+                        UPDATE position_ledger
+                        SET
+                          fees = COALESCE(NULLIF(fees, 0), %(fees)s),
+                          updated_at = now()
+                        WHERE exchange_id = %(ex)s
+                          AND account_id  = %(acc)s
+                          AND pos_uid     = %(pos_uid)s
+                          AND opened_at   = %(opened_at)s
+                        """
+                    self.store.execute(
+                        uq_fees,
+                        dict(
+                            ex=int(self.exchange_id),
+                            acc=int(self.p.account_id),
+                            pos_uid=r.get("pos_uid"),
+                            opened_at=r.get("opened_at"),
+                            fees=float(fees_usdt),
+                            meta=json.dumps(meta) if isinstance(meta, dict) else "{}",
+                        ),
+                    )
+                    updated += 1
+                    continue
+
+                # have_exit == True and exit_price is known -> full backfill
+                meta = {
+                    "exchange_exit_backfill": {
+                        "exit_price": float(exit_price),
+                        "realized_pnl": float(realized),
+                        "close_time_ms": int(last_time_ms) if last_time_ms else None,
+                        "exit_qty": float(exit_qty),
+                        "fees_usdt": float(fees_usdt),
+                        "fees_other": fees_other,
+                    }
+                }
+
+                closed_at_param = float(last_time_ms) / 1000.0 if last_time_ms else None
+                closed_at_sql = ("CASE WHEN %(closed_ts)s IS NOT NULL AND (%(overwrite)s = true OR closed_at IS NULL OR (opened_at IS NOT NULL AND closed_at < opened_at)) "
+                               "THEN to_timestamp(%(closed_ts)s) ELSE closed_at END")
+
+                if self._pl_has_raw_meta:
+                    uq = f"""
+                    UPDATE position_ledger
+                    SET
+                      exit_price = CASE WHEN %(overwrite)s = true THEN %(exit)s ELSE COALESCE(NULLIF(exit_price, 0), %(exit)s) END,
+                      realized_pnl = CASE WHEN %(overwrite)s = true THEN %(pnl)s ELSE COALESCE(NULLIF(realized_pnl, 0), %(pnl)s) END,
+                      fees = CASE WHEN %(overwrite)s = true THEN %(fees)s ELSE COALESCE(NULLIF(fees, 0), %(fees)s) END,
+                      closed_at = {closed_at_sql},
+                      updated_at = now(),
+                      raw_meta = COALESCE(raw_meta,'{{}}'::jsonb) || %(meta)s::jsonb
+                    WHERE exchange_id=%(ex)s AND account_id=%(acc)s AND symbol_id=%(sym)s AND pos_uid=%(pos_uid)s
+                      AND status='CLOSED';
+                    """
+                    params = {
+                        "exit": float(exit_price),
+                        "pnl": float(realized),
+                        "fees": float(fees_usdt),
+                        "overwrite": bool(overwrite),
+                        "meta": json.dumps(meta),
+                        "ex": int(self.p.exchange_id),
+                        "acc": int(self.account_id),
+                        "sym": int(r["symbol_id"]),
+                        "pos_uid": str(r["pos_uid"]),
+                    }
+                    params["closed_ts"] = closed_at_param
+                else:
+                    uq = f"""
+                    UPDATE position_ledger
+                    SET
+                      exit_price = COALESCE(exit_price, %(exit)s),
+                      realized_pnl = CASE WHEN %(overwrite)s = true THEN %(pnl)s ELSE COALESCE(NULLIF(realized_pnl, 0), %(pnl)s) END,
+                      fees = CASE WHEN %(overwrite)s = true THEN %(fees)s ELSE COALESCE(NULLIF(fees, 0), %(fees)s) END,
+                      closed_at = {closed_at_sql},
+                      updated_at = now()
+                    WHERE exchange_id=%(ex)s AND account_id=%(acc)s AND symbol_id=%(sym)s AND pos_uid=%(pos_uid)s
+                      AND status='CLOSED';
+                    """
+                    params = {
+                        "exit": float(exit_price),
+                        "pnl": float(realized),
+                        "fees": float(fees_usdt),
+                        "overwrite": bool(overwrite),
+                        "ex": int(self.p.exchange_id),
+                        "acc": int(self.account_id),
+                        "sym": int(r["symbol_id"]),
+                        "pos_uid": str(r["pos_uid"]),
+                    }
+                    if closed_at_param is not None:
+                        params["closed_ts"] = closed_at_param
+
+                self.store.execute(uq, params)
+                updated += 1
+            except Exception:
+                log.info("[TL] backfill failed sym=%s pos_uid=%s (will mark as attempted)", sym, r.get("pos_uid"), exc_info=True)
+                try:
+                    if self._pl_has_raw_meta:
+                        meta = {"exchange_exit_backfill": {"note": "exception", "error": "userTrades_or_update_failed"}}
+                        uqm = """
+                        UPDATE position_ledger
+                        SET raw_meta = COALESCE(raw_meta,'{}'::jsonb) || %(meta)s::jsonb
+                        WHERE exchange_id=%(ex)s AND account_id=%(acc)s AND pos_uid=%(pos_uid)s AND opened_at=%(opened_at)s;
+                        """
+                        self.store.execute(
+                            uqm,
+                            {
+                                "ex": int(r["exchange_id"]),
+                                "acc": int(r["account_id"]),
+                                "pos_uid": str(r["pos_uid"]),
+                                "opened_at": r["opened_at"],
+                                "meta": json.dumps(meta),
+                            },
+                        )
+                        updated += 1
+                except Exception:
+                    pass
+
+        if updated or log_empty:
+            log.info("[TL] backfill CLOSED exit/pnl updated=%s checked=%s (lookback_days=%s)", updated, checked, lookback_days)
+
+        return {"checked": checked, "updated": updated, "skipped": 0}
 
     def _get_last_price(self, symbol_id: int, timeframe: str) -> Optional[float]:
         q = """
@@ -1628,7 +3680,7 @@ class TradeLiquidation:
               realized_pnl=%(pnl)s,
               updated_at=now(),
               raw_meta = COALESCE(raw_meta,'{}'::jsonb) || %(meta)s::jsonb
-            WHERE exchange_id=%(ex)s AND account_id=%(acc)s AND symbol_id=%(sym)s AND pos_uid=%(uid)s;
+            WHERE exchange_id=%(ex)s AND account_id=%(acc)s AND symbol_id=%(sym)s AND pos_uid=%(pos_uid)s;
             """
             params = {
                 "exit": float(exit_price),
@@ -1637,7 +3689,7 @@ class TradeLiquidation:
                 "ex": int(self.p.exchange_id),
                 "acc": int(self.account_id),
                 "sym": int(pos["symbol_id"]),
-                "uid": str(pos["pos_uid"]),
+                "pos_uid": str(pos["pos_uid"]),
             }
         else:
             q = """
@@ -1650,7 +3702,7 @@ class TradeLiquidation:
               exit_price=%(exit)s,
               realized_pnl=%(pnl)s,
               updated_at=now()
-            WHERE exchange_id=%(ex)s AND account_id=%(acc)s AND symbol_id=%(sym)s AND pos_uid=%(uid)s;
+            WHERE exchange_id=%(ex)s AND account_id=%(acc)s AND symbol_id=%(sym)s AND pos_uid=%(pos_uid)s;
             """
             params = {
                 "exit": float(exit_price),
@@ -1658,7 +3710,7 @@ class TradeLiquidation:
                 "ex": int(self.p.exchange_id),
                 "acc": int(self.account_id),
                 "sym": int(pos["symbol_id"]),
-                "uid": str(pos["pos_uid"]),
+                "pos_uid": str(pos["pos_uid"]),
             }
 
         self.store.execute(q, params)
@@ -1887,6 +3939,7 @@ class TradeLiquidation:
             return 0.0
     def _fetch_new_signals(self, limit: int = 50) -> List[Dict[str, Any]]:
         q = """
+
         SELECT
           sig.id AS signal_id,
           sig.signal_ts,
@@ -1899,6 +3952,7 @@ class TradeLiquidation:
           sig.take_profit,
           sym.symbol,
           COALESCE(sf.qty_step, 0) AS qty_step,
+          COALESCE(sf.price_tick, 0) AS price_tick,
           sig.context
         FROM signals sig
         JOIN screeners sc ON sc.screener_id = sig.screener_id
@@ -1912,6 +3966,7 @@ class TradeLiquidation:
           AND sig.signal_ts >= now() - (%(age)s::text || ' minutes')::interval
         ORDER BY sig.signal_ts DESC
         LIMIT %(lim)s;
+        
         """
         return list(
             self.store.query_dict(
@@ -2118,6 +4173,7 @@ class TradeLiquidation:
 
         qty = notional / entry
         qty_step = _safe_float(sig.get("qty_step"), default=0.0)
+        tick_size = _safe_float(sig.get("price_tick"), default=0.0)
         if qty_step > 0:
             qty = _round_step_down(qty, qty_step)
         if qty <= 0:
@@ -2135,6 +4191,21 @@ class TradeLiquidation:
             sl_price = _safe_float(sig.get("stop_loss"), default=0.0)
             tp_price = _safe_float(sig.get("take_profit"), default=0.0)
 
+        # Round SL/TP to tick size to avoid Binance precision errors (-1111).
+        if tick_size > 0:
+            if ledger_side == "LONG":
+                # SL below entry => round down; TP above => round up
+                if sl_price > 0:
+                    sl_price = _round_price_to_tick(sl_price, tick_size, mode="down")
+                if tp_price > 0:
+                    tp_price = _round_price_to_tick(tp_price, tick_size, mode="up")
+            else:
+                # SHORT: SL above => round up; TP below => round down
+                if sl_price > 0:
+                    sl_price = _round_price_to_tick(sl_price, tick_size, mode="up")
+                if tp_price > 0:
+                    tp_price = _round_price_to_tick(tp_price, tick_size, mode="down")
+
         # LIVE: place real orders first
         if self._is_live:
             return self._open_live_from_signal(
@@ -2151,6 +4222,7 @@ class TradeLiquidation:
                 risk_usdt=float(risk_usdt),
                 notional_usdt=float(notional),
                 qty_step=float(qty_step),
+                tick_size=float(tick_size),
             )
 
         # PAPER: create position_ledger + paper_position_risk
@@ -2184,7 +4256,7 @@ class TradeLiquidation:
               raw_meta,
               updated_at
             ) VALUES (
-              %(ex)s, %(acc)s, %(sym)s, %(uid)s,
+              %(ex)s, %(acc)s, %(sym)s, %(pos_uid)s,
               %(sid)s, 'paper',
               %(side)s, 'OPEN',
               now(),
@@ -2200,7 +4272,7 @@ class TradeLiquidation:
                 "ex": int(self.p.exchange_id),
                 "acc": int(self.account_id),
                 "sym": int(symbol_id),
-                "uid": pos_uid,
+                "pos_uid": pos_uid,
                 "sid": self.STRATEGY_ID,
                 "side": ledger_side,
                 "qty": float(qty),
@@ -2221,7 +4293,7 @@ class TradeLiquidation:
               scale_in_count,
               updated_at
             ) VALUES (
-              %(ex)s, %(acc)s, %(sym)s, %(uid)s,
+              %(ex)s, %(acc)s, %(sym)s, %(pos_uid)s,
               %(sid)s, 'paper',
               %(side)s, 'OPEN',
               now(),
@@ -2236,7 +4308,7 @@ class TradeLiquidation:
                 "ex": int(self.p.exchange_id),
                 "acc": int(self.account_id),
                 "sym": int(symbol_id),
-                "uid": pos_uid,
+                "pos_uid": pos_uid,
                 "sid": self.STRATEGY_ID,
                 "side": ledger_side,
                 "qty": float(qty),
@@ -2259,7 +4331,7 @@ class TradeLiquidation:
               trailing_enabled, trail_activation_pct, trail_pct, trail_armed, best_price,
               additions_count
             ) VALUES (
-              %(ex)s, %(acc)s, %(sym)s, %(uid)s, %(sid)s,
+              %(ex)s, %(acc)s, %(sym)s, %(pos_uid)s, %(sid)s,
               %(tf)s,
               %(sl)s, %(tp)s,
               %(ten)s, %(tap)s, %(trp)s, %(armed)s, %(best)s,
@@ -2282,7 +4354,7 @@ class TradeLiquidation:
                 "ex": int(self.p.exchange_id),
                 "acc": int(self.account_id),
                 "sym": int(symbol_id),
-                "uid": pos_uid,
+                "pos_uid": pos_uid,
                 "sid": self.STRATEGY_ID,
                 "tf": tf,
                 "sl": float(sl_price) if sl_price > 0 else None,
@@ -2401,6 +4473,7 @@ class TradeLiquidation:
         risk_usdt: float,
         notional_usdt: float,
         qty_step: float,
+        tick_size: float,
     ) -> bool:
         """Open real position + place SL/TP (market entry)."""
 
@@ -2414,10 +4487,11 @@ class TradeLiquidation:
 
         # pos_uid is the join-key for all 3 orders + ledger
         pos_uid = str(uuid.uuid4())
-        prefix = str(getattr(self.p, "client_order_id_prefix", "TL") or "TL").strip() or "TL"
-        cid_entry = f"{prefix}_{pos_uid}_ENTRY"
-        cid_sl = f"{prefix}_{pos_uid}_SL"
-        cid_tp = f"{prefix}_{pos_uid}_TP"
+        prefix = _sanitize_coid_prefix(str(getattr(self.p, "client_order_id_prefix", "TL") or "TL"))
+        tok = _coid_token(pos_uid, n=20)
+        cid_entry = f"{prefix}_{tok}_ENTRY"
+        cid_sl = f"{prefix}_{tok}_SL"
+        cid_tp = f"{prefix}_{tok}_TP"
 
         hedge_mode = bool(getattr(self.p, "hedge_enabled", False))
         position_side = "LONG" if entry_side == "BUY" else "SHORT"  # for dual-side
@@ -2456,6 +4530,19 @@ class TradeLiquidation:
         if avg_price <= 0:
             avg_price = entry_estimate
 
+        # Re-anchor precomputed bracket prices to the *actual* average entry.
+        # This keeps the same distance (delta) that was computed from the estimated entry.
+        try:
+            if avg_price > 0 and entry_estimate > 0 and sl_price > 0:
+                sl_price = float(avg_price) + (float(sl_price) - float(entry_estimate))
+        except Exception:
+            pass
+        try:
+            if avg_price > 0 and entry_estimate > 0 and tp_price > 0:
+                tp_price = float(avg_price) + (float(tp_price) - float(entry_estimate))
+        except Exception:
+            pass
+
         # shadow order row (entry)
         try:
             self._upsert_order_shadow(
@@ -2492,38 +4579,78 @@ class TradeLiquidation:
 
                 callback_rate = float(getattr(self.p, "trailing_trail_pct", 0.6) or 0.6)
                 activation_pct = float(getattr(self.p, "trailing_activation_pct", 1.2) or 1.2)
+                buffer_pct = float(getattr(self.p, "trailing_activation_buffer_pct", 0.20) or 0.20)
+                retries = int(getattr(self.p, "trailing_place_retries", 5) or 5)
+                retries = max(1, min(10, retries))
 
-                # For SELL trailing stop: activationPrice must be ABOVE current/latest price.
-                # For BUY trailing stop: activationPrice must be BELOW current/latest price.
-                if close_side.upper() == "SELL":
-                    activation_price = avg_price * (1.0 + activation_pct / 100.0)
-                else:
-                    activation_price = avg_price * (1.0 - activation_pct / 100.0)
+                # Prefer current mark price to avoid immediate-trigger (-2021).
+                mark = self._get_mark_price_live(symbol, position_side if hedge_mode else None)
+                if mark <= 0:
+                    mark = avg_price
 
-                params = dict(
-                    symbol=symbol,
-                    side=close_side,
-                    type="TRAILING_STOP_MARKET",
-                    quantity=float(qty),
-                    activationPrice=float(activation_price),
-                    callbackRate=float(callback_rate),
-                    workingType=str(getattr(self.p, "working_type", "MARK_PRICE")),
-                    newClientOrderId=cid_sl,
-                    positionSide=position_side if hedge_mode else None,
-                )
-                if (not hedge_mode) and bool(self.p.reduce_only):
-                    params["reduceOnly"] = True
-                return self._binance.new_order(**params)
+                last_err: Exception | None = None
+                for k in range(retries):
+                    extra = buffer_pct * float(k + 1)
+
+                    # Direction rules for Binance trailing:
+                    #  - SELL trailing stop: activationPrice must be ABOVE current mark.
+                    #  - BUY  trailing stop: activationPrice must be BELOW current mark.
+                    if close_side.upper() == "SELL":
+                        base_activation = avg_price * (1.0 + activation_pct / 100.0)
+                        activation_price = self._safe_price_above_mark(base_activation, mark, tick_size, extra)
+                    else:
+                        base_activation = avg_price * (1.0 - activation_pct / 100.0)
+                        activation_price = self._safe_price_below_mark(base_activation, mark, tick_size, extra)
+
+                    # Round and enforce side vs actual avg entry (Binance is sensitive to triggers).
+                    activation_price = _round_price_to_tick(
+                        activation_price,
+                        tick_size,
+                        mode="up" if close_side.upper() == "SELL" else "down",
+                    )
+                    activation_price = _ensure_tp_trail_side(
+                        activation_price,
+                        avg_price,
+                        tick_size,
+                        side,
+                        kind="trail_activate",
+                    )
+
+                    params = dict(
+                        symbol=symbol,
+                        side=close_side,
+                        type="TRAILING_STOP_MARKET",
+                        quantity=float(qty),
+                        activationPrice=float(activation_price),
+                        callbackRate=float(callback_rate),
+                        workingType=str(getattr(self.p, "working_type", "MARK_PRICE")),
+                        newClientOrderId=cid_trl,
+                        positionSide=position_side if hedge_mode else None,
+                    )
+                    if (not hedge_mode) and bool(self.p.reduce_only):
+                        params["reduceOnly"] = True
+
+                    try:
+                        return self._binance.new_order(**params)
+                    except Exception as e:
+                        last_err = e
+                        if self._is_immediate_trigger_error(e) and k < retries - 1:
+                            continue
+                        raise
+
+                if last_err is not None:
+                    raise last_err
+                return None
 
             if sl_mode in {"stop_market", "stopmarket", "market"}:
                 params = dict(
                     symbol=symbol,
                     side=close_side,
                     type="STOP_MARKET",
-                    stopPrice=float(sl_price),
+                    stopPrice=float(_round_price_to_tick(sl_price, tick_size, mode="down" if ledger_side == "LONG" else "up")),
                     closePosition=True,
                     workingType=str(getattr(self.p, "working_type", "MARK_PRICE")),
-                    newClientOrderId=cid_sl,
+                    newClientOrderId=cid_trl,
                     positionSide=position_side if hedge_mode else None,
                 )
                 if (not hedge_mode) and bool(self.p.reduce_only):
@@ -2539,7 +4666,7 @@ class TradeLiquidation:
                 quantity=float(qty),
                 price=float(sl_price),
                 stopPrice=float(sl_price),
-                newClientOrderId=cid_sl,
+                newClientOrderId=cid_trl,
                 positionSide=position_side if hedge_mode else None,
             )
             if (not hedge_mode) and bool(self.p.reduce_only):
@@ -2550,20 +4677,56 @@ class TradeLiquidation:
             if tp_price <= 0:
                 return None
 
+            # TP must be on correct side of *actual* avg entry
+            base_tp = tp_price
+            try:
+                base_tp = _ensure_tp_trail_side(base_tp, avg_price, tick_size, ledger_side, kind="tp")
+            except Exception:
+                base_tp = tp_price
+
             if tp_mode in {"take_profit_market", "takeprofit_market", "tp_market", "market"}:
-                params = dict(
-                    symbol=symbol,
-                    side=close_side,
-                    type="TAKE_PROFIT_MARKET",
-                    stopPrice=float(tp_price),
-                    closePosition=True,
-                    workingType=str(getattr(self.p, "working_type", "MARK_PRICE")),
-                    newClientOrderId=cid_tp,
-                    positionSide=position_side if hedge_mode else None,
-                )
-                if (not hedge_mode) and bool(self.p.reduce_only):
-                    params["reduceOnly"] = True
-                return self._binance.new_order(**params)
+                buffer_pct = float(getattr(self.p, "trailing_activation_buffer_pct", 0.20) or 0.20)
+                retries = int(getattr(self.p, "trailing_place_retries", 5) or 5)
+                retries = max(1, min(10, retries))
+
+                mark = self._get_mark_price_live(symbol, position_side if hedge_mode else None)
+                if mark <= 0:
+                    mark = avg_price
+
+                last_err: Exception | None = None
+                for k in range(retries):
+                    extra = buffer_pct * float(k + 1)
+
+                    # TP trigger must be on the profitable side of current mark, otherwise Binance returns -2021.
+                    if ledger_side == "LONG":
+                        trig = self._safe_price_above_mark(base_tp, mark, tick_size, extra)
+                    else:
+                        trig = self._safe_price_below_mark(base_tp, mark, tick_size, extra)
+
+                    params = dict(
+                        symbol=symbol,
+                        side=close_side,
+                        type="TAKE_PROFIT_MARKET",
+                        stopPrice=float(trig),
+                        closePosition=True,
+                        workingType=str(getattr(self.p, "working_type", "MARK_PRICE")),
+                        newClientOrderId=cid_tp,
+                        positionSide=position_side if hedge_mode else None,
+                    )
+                    if (not hedge_mode) and bool(self.p.reduce_only):
+                        params["reduceOnly"] = True
+
+                    try:
+                        return self._binance.new_order(**params)
+                    except Exception as e:
+                        last_err = e
+                        if self._is_immediate_trigger_error(e) and k < retries - 1:
+                            continue
+                        raise
+
+                if last_err is not None:
+                    raise last_err
+                return None
 
             # tp-limit (TAKE_PROFIT)
             params = dict(
@@ -2572,8 +4735,8 @@ class TradeLiquidation:
                 type="TAKE_PROFIT",
                 timeInForce=str(getattr(self.p, "time_in_force", "GTC")),
                 quantity=float(qty),
-                price=float(tp_price),
-                stopPrice=float(tp_price),
+                price=float(base_tp),
+                stopPrice=float(base_tp),
                 newClientOrderId=cid_tp,
                 positionSide=position_side if hedge_mode else None,
             )
@@ -2582,7 +4745,13 @@ class TradeLiquidation:
             return self._binance.new_order(**params)
 
         try:
-            sl_resp = _place_sl()
+            # If averaging (scale-in) is enabled and we defer SL until the last add,
+            # do NOT place STOP_MARKET SL on initial entry. Trailing (if enabled) is handled separately.
+            avg_enabled = bool(getattr(self.p, "averaging_enabled", False)) and int(getattr(self.p, "averaging_max_adds", 0) or 0) > 0
+            defer_sl = bool(getattr(self.p, "defer_stop_loss_until_last_add", False))
+            if bool(getattr(self.p, "enable_stop_loss", True)) and (not (avg_enabled and defer_sl)):
+                sl_resp = _place_sl()
+
         except Exception:
             log.exception("[trade_liquidation][LIVE] failed to place SL for %s", symbol)
 
@@ -2596,7 +4765,7 @@ class TradeLiquidation:
             if isinstance(sl_resp, dict):
                 self._upsert_order_shadow(
                     pos_uid=pos_uid,
-                    order_id=sl_resp.get("orderId") or sl_resp.get("order_id") or "",
+                    order_id=sl_resp.get("orderId") or sl_resp.get("order_id") or sl_resp.get("algoId") or "",
                     client_order_id=cid_sl,
                     symbol_id=symbol_id,
                     side=close_side,
@@ -2609,7 +4778,7 @@ class TradeLiquidation:
             if isinstance(tp_resp, dict):
                 self._upsert_order_shadow(
                     pos_uid=pos_uid,
-                    order_id=tp_resp.get("orderId") or tp_resp.get("order_id") or "",
+                    order_id=tp_resp.get("orderId") or tp_resp.get("order_id") or tp_resp.get("algoId") or "",
                     client_order_id=cid_tp,
                     symbol_id=symbol_id,
                     side=close_side,
@@ -2621,6 +4790,121 @@ class TradeLiquidation:
                 )
         except Exception:
             pass
+
+        # 3.5) Averaging add (conditional MARKET) right after entry (if enabled)
+        add_resp: Optional[dict] = None
+        try:
+            if bool(getattr(self.p, "averaging_enabled", False)) and int(getattr(self.p, "averaging_max_adds", 0) or 0) > 0:
+                mult = float(getattr(self.p, "averaging_add_position_multiplier", 1.0) or 1.0)
+                if mult > 1.0:
+                    # pick a significant level from candles (support/resistance)
+                    lv_tf = str(getattr(self.p, "averaging_levels_tf", timeframe) or timeframe)
+                    lookback_h = int(getattr(self.p, "averaging_levels_lookback_hours", 168) or 168)
+                    left = int(getattr(self.p, "averaging_pivot_left", 3) or 3)
+                    right = int(getattr(self.p, "averaging_pivot_right", 3) or 3)
+                    tol_pct = float(getattr(self.p, "averaging_level_tolerance_pct", 0.15) or 0.15)
+                    min_dist_pct = float(getattr(self.p, "averaging_min_level_distance_pct", 5.0) or 5.0)
+                    dist_limit_pct = max(5.0, float(min_dist_pct))
+
+                    # load candles
+                    q = """
+                    SELECT open_time, high, low, close, volume
+                    FROM candles
+                    WHERE exchange_id=%(ex)s AND symbol_id=%(sym)s AND interval=%(tf)s
+                      AND open_time >= (NOW() AT TIME ZONE 'UTC') - (%(h)s || ' hours')::interval
+                    ORDER BY open_time ASC;
+                    """
+                    rows = list(self.store.query_dict(q, {"ex": int(self.p.exchange_id), "sym": int(symbol_id), "tf": lv_tf, "h": int(lookback_h)}))
+                    lows = [float(r.get("low") or 0) for r in rows]
+                    highs = [float(r.get("high") or 0) for r in rows]
+
+                    entry_ref = float(avg_price or entry_estimate or 0)
+                    level = 0.0
+                    if entry_ref > 0 and len(lows) >= (left + right + 5):
+                        piv_lows = []
+                        piv_highs = []
+                        for i in range(left, len(lows) - right):
+                            w = lows[i-left:i+right+1]
+                            if lows[i] == min(w):
+                                piv_lows.append(lows[i])
+                            w2 = highs[i-left:i+right+1]
+                            if highs[i] == max(w2):
+                                piv_highs.append(highs[i])
+
+                        if ledger_side == "LONG":
+                            # nearest support below entry
+                            below = [x for x in piv_lows if x > 0 and x < entry_ref * (1.0 - dist_limit_pct/100.0)]
+                            if below:
+                                level = max(below)
+                            else:
+                                # fallback: 1% below entry
+                                level = entry_ref * (1.0 - (dist_limit_pct / 100.0))
+                        else:
+                            above = [x for x in piv_highs if x > entry_ref * (1.0 + dist_limit_pct/100.0)]
+                            if above:
+                                level = min(above)
+                            else:
+                                level = entry_ref * (1.0 + (dist_limit_pct / 100.0))
+
+                    if level > 0:
+                        # compute add qty via multiplier: new_qty = cur_qty * mult => add = cur*(mult-1)
+                        add_qty = float(qty) * (mult - 1.0)
+                        add_qty = _round_qty_to_step(add_qty, qty_step, mode="down")
+                        if add_qty >= float(qty_step):
+                            cid_add = f"{prefix}_{tok}_ADD1"
+                            # Use TAKE_PROFIT_MARKET as conditional entry: BUY triggers when mark <= stopPrice; SELL triggers when mark >= stopPrice
+                            add_side = entry_side
+                            add_type = "TAKE_PROFIT_MARKET"
+                            stop_px = _round_price_to_tick(level, tick_size, mode="down" if add_side == "BUY" else "up")
+                            # Protect from -2021 (would immediately trigger): ensure trigger is on the correct side of mark
+                            mark_add = 0.0
+                            try:
+                                mark_add = float(self._get_mark_price(symbol, position_side if hedge_mode else None) or 0.0)
+                            except Exception:
+                                mark_add = 0.0
+                            extra_buf = float(getattr(self.p, "tp_trigger_buffer_pct", 0.25) or 0.25)
+                            if add_side == "BUY":
+                                stop_px = self._safe_price_below_mark(float(stop_px), float(mark_add), float(tick_size), extra_buf)
+                            else:
+                                stop_px = self._safe_price_above_mark(float(stop_px), float(mark_add), float(tick_size), extra_buf)
+
+                            def _place_add(i: int):
+                                # On retry, push trigger one more tick away from mark
+                                px = float(stop_px)
+                                if i > 0 and tick_size:
+                                    px = px - float(tick_size) * i if add_side == "BUY" else px + float(tick_size) * i
+                                    px = _round_price_to_tick(px, float(tick_size), mode="down" if add_side == "BUY" else "up")
+                                return self._binance.new_order(
+                                    symbol=symbol,
+                                    side=add_side,
+                                    type=add_type,
+                                    stopPrice=float(px),
+                                    quantity=float(add_qty),
+                                    workingType=str(getattr(self.p, "working_type", "MARK_PRICE")),
+                                    newClientOrderId=cid_add,
+                                    positionSide=position_side if hedge_mode else None,
+                                )
+
+                            add_resp = _tl_place_algo_with_retry(_place_add, max_tries=int(getattr(self.p, "tp_place_retries", 3) or 3))
+
+                            try:
+                                self._upsert_order_shadow(
+                                    pos_uid=pos_uid,
+                                    order_id=add_resp.get("orderId") or add_resp.get("algoId") or "",
+                                    client_order_id=cid_add,
+                                    symbol_id=symbol_id,
+                                    side=add_side,
+                                    order_type=str(add_resp.get("type") or add_type),
+                                    qty=float(add_qty),
+                                    price=None,
+                                    reduce_only=False,
+                                    status=str(add_resp.get("status") or "NEW"),
+                                )
+                            except Exception:
+                                pass
+        except Exception:
+            log.exception("[trade_liquidation][LIVE] failed to place averaging add for %s", symbol)
+
 
         # 4) ledger row (journal)
         meta = {
@@ -2637,6 +4921,7 @@ class TradeLiquidation:
                 "entry_order": resp,
                 "sl_order": sl_resp,
                 "tp_order": tp_resp,
+                "add_order": add_resp,
             }
         }
 
@@ -2663,7 +4948,7 @@ class TradeLiquidation:
             "%(ex)s",
             "%(acc)s",
             "%(sym)s",
-            "%(uid)s",
+            "%(pos_uid)s",
             "%(sid)s",
             "%(sname)s",
             "%(side)s",
@@ -2690,7 +4975,7 @@ class TradeLiquidation:
                     "ex": int(self.p.exchange_id),
                     "acc": int(self.account_id),
                     "sym": int(symbol_id),
-                    "uid": str(pos_uid),
+                    "pos_uid": str(pos_uid),
                     "sid": self.STRATEGY_ID,
                     "sname": self.STRATEGY_ID,
                     "side": str(ledger_side),
@@ -2721,3 +5006,122 @@ class TradeLiquidation:
             str(pos_uid),
         )
         return True
+
+### --- TL HOTFIX: list screeners/timeframes + ensure methods bound ---
+# This section ensures that list-based config params work reliably and that
+# methods exist on the TradeLiquidation class even if an earlier edit moved them
+# out of the class scope by accident.
+def _tl_norm_list(v):
+    if v is None:
+        return []
+    if isinstance(v, (list, tuple, set)):
+        return [str(x).strip() for x in v if str(x).strip()]
+    s = str(v).strip()
+    return [s] if s else []
+
+def _tl_fetch_new_signals(self, limit: int = 50):
+    scr = _tl_norm_list(getattr(self.p, "screener_name", None))
+    tfs = _tl_norm_list(getattr(self.p, "allowed_timeframes", None))
+    q = """
+    SELECT
+      sig.id AS signal_id,
+      sig.signal_ts,
+      sig.side,
+      sig.exchange_id,
+      sig.symbol_id,
+      sig.timeframe,
+      sig.entry_price,
+      sig.stop_loss,
+      sig.take_profit,
+      sym.symbol,
+      COALESCE(sf.qty_step, 0) AS qty_step,
+      COALESCE(sf.price_tick, 0) AS price_tick,
+      sig.context
+    FROM signals sig
+    JOIN screeners sc
+      ON sc.screener_id = sig.screener_id
+    JOIN symbols sym
+      ON sym.exchange_id = sig.exchange_id
+     AND sym.symbol_id   = sig.symbol_id
+    LEFT JOIN symbol_filters sf
+      ON sf.exchange_id = sig.exchange_id
+     AND sf.symbol_id   = sig.symbol_id
+    WHERE sig.exchange_id=%(ex)s
+      AND sc.name = ANY(%(scr)s::text[])
+      AND sig.timeframe = ANY(%(tfs)s::text[])
+      AND sig.status=%(st)s
+      AND sig.signal_ts >= now() - (%(age)s::text || ' minutes')::interval
+    ORDER BY sig.signal_ts DESC
+    LIMIT %(lim)s;
+    """
+    return list(self.store.query_dict(q, {
+        "ex": int(self.p.exchange_id),
+        "scr": scr if scr else [str(getattr(self.p, "screener_name", "")).strip()],
+        "tfs": tfs if tfs else [str(x) for x in (self.p.allowed_timeframes or [])],
+        "st": str(self.p.signal_status_new),
+        "age": int(self.p.max_signal_age_minutes),
+        "lim": int(limit),
+    }))
+
+def _tl_expire_old_new_signals(self) -> int:
+    age = self.p.expire_max_age_minutes if getattr(self.p, "expire_max_age_minutes", None) not in (None, 0, "0") else self.p.max_signal_age_minutes
+    age = int(age) if age else int(self.p.max_signal_age_minutes)
+    limit = int(getattr(self.p, "expire_batch_limit", 0) or 0)
+    status_exp = str(getattr(self.p, "expire_status", "EXPIRED") or "EXPIRED").strip().upper()
+
+    scr = _tl_norm_list(getattr(self.p, "screener_name", None))
+    tfs = _tl_norm_list(getattr(self.p, "allowed_timeframes", None))
+
+    q = """
+    WITH cte AS (
+      SELECT sig.id
+      FROM signals sig
+      JOIN screeners sc ON sc.screener_id = sig.screener_id
+      WHERE sig.exchange_id=%(ex)s
+        AND sc.name = ANY(%(scr)s::text[])
+        AND sig.timeframe = ANY(%(tfs)s::text[])
+        AND sig.status=%(st)s
+        AND sig.signal_ts < now() - (%(age)s::text || ' minutes')::interval
+      ORDER BY sig.signal_ts ASC
+      LIMIT %(lim)s
+    )
+    UPDATE signals s
+    SET status=%(newst)s,
+        updated_at=now()
+    FROM cte
+    WHERE s.id = cte.id
+    RETURNING s.id;
+    """
+    rows = list(self.store.query_dict(q, {
+        "ex": int(self.p.exchange_id),
+        "scr": scr if scr else [str(getattr(self.p, "screener_name", "")).strip()],
+        "tfs": tfs if tfs else [str(x) for x in (self.p.allowed_timeframes or [])],
+        "st": str(self.p.signal_status_new),
+        "age": int(age),
+        "lim": int(limit) if limit > 0 else 1000000000,
+        "newst": status_exp,
+    }))
+    n = len(rows)
+    if n > 0:
+        try:
+            log.info(
+                "[trade_liquidation] expired old signals: %d (age>%dmin, screeners=%s, limit=%s)",
+                int(n), int(age), ",".join(scr), str(limit if limit > 0 else "ALL"),
+            )
+        except Exception:
+            pass
+    return int(n)
+
+# Bind / override methods on the class (idempotent).
+try:
+    TradeLiquidation._norm_list = staticmethod(_tl_norm_list)  # optional helper
+except Exception:
+    pass
+try:
+    TradeLiquidation._fetch_new_signals = _tl_fetch_new_signals
+except Exception:
+    pass
+try:
+    TradeLiquidation._expire_old_new_signals = _tl_expire_old_new_signals
+except Exception:
+    pass

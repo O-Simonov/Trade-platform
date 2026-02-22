@@ -1,212 +1,279 @@
-# config/trade_liquidation.yaml
-# ==========================================================
-# TRADE LIQUIDATION (trader по сигналам scr_liquidation_binance)
-#
-# Назначение:
-#   - Берёт свежие сигналы из таблицы signals (по скринеру scr_liquidation_binance)
-#   - В LIVE режиме открывает позицию на Binance USDⓈ-M Futures
-#   - Ставит защитные ордера SL/TP (если включено)
-#   - Поддерживает добор позиции (DCA) на значимых уровнях HTF (1h/4h)
-#   - При включённом DCA может отложить постановку SL до последнего добора
-#
-# Запуск (PowerShell):
-#   $env:PG_DSN="host=localhost port=5432 dbname=trade_platform user=postgres sslmode=prefer connect_timeout=10"
-#   $env:TRADE_LIQUIDATION_CONFIG="config/trade_liquidation.yaml"
-#   $env:DRY_RUN="0"
-#   python -m src.platform.run_trade_liquidation
-# ==========================================================
+# ============================================================
+# Trade Platform — конфиг трейдера trade_liquidation
+# ============================================================
 
-restart_interval_minutes: 0.2      # Интервал между циклами run_once (в минутах).
-                                   # 0.25 = 15 секунд. Чем меньше — тем быстрее реакция, но выше нагрузка.
+# Как часто перезапускать цикл трейдеров (в минутах).
+# 0.25 = 15 секунд.
+restart_interval_minutes: 0.25
 
 traders:
-  - name: trade_liquidation         # Имя трейдера (как будет отображаться в логах)
-    enabled: true                   # Включить/выключить запуск этого трейдера
-    version: "1.0"                  # Версия конфига/бота (для логов и контроля изменений)
+  - name: trade_liquidation            # Имя трейдера (используется в логах/идентификации)
+    enabled: true                      # Включен ли трейдер
+    version: "1.0"                     # Версия логики трейдера (информативно)
 
     params:
-      # ======================================================
-      # ИСТОЧНИК СИГНАЛОВ (signals)
-      # ======================================================
-      exchange_id: 1                # ID биржи в БД (Binance = 1)
-      account_name: "base_main"     # Имя аккаунта в таблице accounts (если account_id не задан)
-      account_id: 1                 # ID аккаунта (если задан — используется напрямую)
+      # ----------------------------
+      # Идентификация биржи/аккаунта
+      # ----------------------------
 
-      screener_name: "scr_liquidation_binance"   # Из какого скринера берём сигналы (JOIN screeners)
-      signal_status_new: "NEW"                   # Берём только сигналы с этим статусом
+      exchange_id: 1                   # ID биржи в БД (таблица exchanges)
+      account_name: base_main          # Человеко-читаемое имя аккаунта (для логов/маркировки)
+      account_id: 1                    # ID аккаунта (внутренний ID системы)
 
-      allowed_timeframes: ["15m", "1h", "4h"]     # Разрешённые ТФ сигнала. Если сигнал другого ТФ — пропускаем.
+      # ------------------------------------------------
+      # Источник сигналов (скринеры) и фильтры по сигналам
+      # ------------------------------------------------
 
-      # Свежесть сигнала:
-      max_signal_age_minutes: 30                 # Берём сигналы, которым не больше N минут (строгий фильтр).
-                                                 # В коде может учитываться close-time свечи: signal_ts + TF.
+      # Имена скринеров (таблица screeners.name). Поддерживается список.
+      screener_name: ["scr_liquidation_binance", "scr_oi_binance"]
 
-      # Анти-спам по символу:
-      per_symbol_cooldown_minutes: 90            # Если по этому symbol уже открывали позицию недавно (по position_ledger),
-                                                 # то повторно не открываем до истечения N минут.
+      signal_status_new: NEW           # Какой статус сигнала считать "новым" (обычно NEW)
 
-      # ======================================================
-      # АНТИ-БЕСКОНЕЧНЫЕ ПОВТОРЫ ОДНОГО СИГНАЛА (через signals.context)
-      # ======================================================
-      max_attempts_per_signal: 3                 # Сколько раз максимум пытаться открыть один и тот же сигнал.
-      retry_cooldown_minutes: 5                  # Пауза между попытками по одному сигналу (мин).
-      attempts_context_key: "trade_liquidation"  # Ключ в signals.context (jsonb) для attempts/last_attempt_ts.
+      # Разрешённые таймфреймы для сигналов. Поддерживается список.
+      allowed_timeframes: ["5m","15m","1h","4h"]
 
-      expire_on_attempts_exceeded: true          # true => если attempts >= max_attempts_per_signal, то сигнал помечаем expire_status.
-      expire_status: "EXPIRED"                   # NEW / TAKEN / CANCELLED / EXPIRED / LOCKED
+      # Максимальный возраст сигнала (в минутах) от signal_ts.
+      # Сигналы старше этого значения игнорируются.
+      max_signal_age_minutes: 60
 
-      # ======================================================
-      # АВТО-ЭКСПИРАЦИЯ СТАРЫХ NEW СИГНАЛОВ (ЧИСТКА)
-      # ======================================================
-      expire_old_signals: true                   # true => в каждом цикле помечаем старые NEW сигналы как EXPIRED.
-      expire_max_age_minutes: 240                # 0/null => используем max_signal_age_minutes.
-      expire_batch_limit: 5000                   # Лимит обновляемых строк за цикл (0 => без лимита; не рекомендую).
+      # Кулдаун по символу (в минутах): не открывать новую сделку по символу,
+      # если недавно уже была попытка/сделка по этому же символу.
+      per_symbol_cooldown_minutes: 120
 
-      # ======================================================
-      # РЕЖИМ РАБОТЫ
-      # ======================================================
-      mode: "live"                               # "paper" = эмуляция, "live" = реальные ордера на бирже.
+      # Максимум попыток открыть сделку по одному сигналу
+      max_attempts_per_signal: 3
 
-      # ======================================================
-      # LIVE: API KEYS (берём из ENV/.env)
-      # ======================================================
-      api_key_env: "BINANCE_BASE_MAIN_API_KEY"       # Имя переменной окружения с API Key
-      api_secret_env: "BINANCE_BASE_MAIN_API_SECRET" # Имя переменной окружения с API Secret
+      # Пауза (в минутах) между повторными попытками по одному и тому же сигналу
+      retry_cooldown_minutes: 5
 
-      base_url: "https://fapi.binance.com"       # Базовый URL Binance Futures (USD-M)
-      recv_window_ms: 5000                       # recvWindow для Binance (мс)
-      timeout_sec: 10                            # Таймаут HTTP запросов (сек)
+      # Ключ в context (jsonb) для хранения/учёта попыток
+      attempts_context_key: trade_liquidation
 
-      # Баланс:
-      use_exchange_balance: false           # true => баланс берём напрямую с биржи (REST /fapi/v2/balance).
+      # Если превышены max_attempts_per_signal — переводить сигнал в expire_status
+      expire_on_attempts_exceeded: true
 
-      # --- Binance REST stability ---
+      # Статус, который ставить сигналу при экспирации (истечении/выбраковке)
+      expire_status: EXPIRED
 
-      binance_connect_timeout_sec: 3.0      # таймаут на установку соединения
-      binance_read_timeout_sec: 15.0        # таймаут на чтение ответа (у тебя было 10, лучше 15)
-      binance_max_retries: 3                # сколько ретраев на transient ошибки
-      binance_retry_backoff_sec: 1.0        # base задержка (экспоненциально растёт)
+      # Включить автоматическую экспирацию старых NEW-сигналов
+      expire_old_signals: true
 
-      # --- Wallet balance retries + cache ---
-      wallet_balance_retries: 2             # доп. ретраи именно для баланса (поверх клиента)
-      wallet_balance_retry_backoff_sec: 1.0
-      wallet_balance_cache_ttl_sec: 180     # 3 минуты использовать последний удачный баланс при сбое сети
+      # Экспирировать сигналы NEW, если они старше этого возраста (в минутах)
+      expire_max_age_minutes: 240
 
-      # ВАЖНО (ускорение цикла):
-      # Даже если сеть хорошая, не дергай /fapi/v2/balance каждый цикл.
-      # Баланс почти не меняется каждую секунду, а сам REST вызов может занимать 0.8-1.2s.
-      wallet_balance_poll_sec: 10           # Минимальный интервал между успешными запросами баланса.
+      # Сколько сигналов максимум обрабатывать за один проход экспирации
+      expire_batch_limit: 5000
 
+      # ----------------------------
+      # Режим работы
+      # ----------------------------
 
-      # Плечо/маржа (best-effort):
-      leverage: 10                               # Плечо (если биржа позволяет изменить через API). null => не трогаем.
-      margin_type: "CROSSED"                     # "ISOLATED" | "CROSSED" | null (null => не меняем)
+      mode: live            # Режим: live (реальные ордера) / "paper" или dry-run (симуляция, если поддерживается)
 
-      # Режим позиции:
-      hedge_enabled: true                        # true => Hedge Mode (positionSide=LONG/SHORT)
+      # ----------------------------
+      # Binance API / сеть
+      # ----------------------------
 
-      # ======================================================
-      # ЛИМИТЫ
-      # ======================================================
-      max_open_positions: 6                      # Макс. кол-во OPEN позиций по этой стратегии в position_ledger.
-      max_position_notional_pct_wallet: 10.0     # Максимальный номинал одной позиции как % от walletBalance.
+      api_key_env: BINANCE_BASE_MAIN_API_KEY        # Имя переменной окружения с API KEY
+      api_secret_env: BINANCE_BASE_MAIN_API_SECRET  # Имя переменной окружения с API SECRET
 
-      # ======================================================
-      # РИСК / SL / TP
-      # ======================================================
-      risk_wallet_pct: 2.0                       # Риск на сделку (% от кошелька).
-      stop_loss_pct: 2.0                         # Дистанция SL в % от entry (если recalc_sl_tp=true).
-      take_profit_pct: 6.0                       # Дистанция TP в % от entry (если recalc_sl_tp=true).
-      recalc_sl_tp: true                         # true => SL/TP пересчитываем от entry_price.
+      base_url: https://fapi.binance.com            # Базовый URL Binance Futures API
+      recv_window_ms: 5000                          # recvWindow для подписанных запросов (мс)
+      timeout_sec: 10                               # Таймаут http-запроса по умолчанию (сек)
 
-      # ======================================================
-      # LIVE: ТИПЫ ОРДЕРОВ
-      # ======================================================
-      entry_order_type: "market"                 # Тип входа
-      sl_order_mode: "trailing_stop_market"      # stop_market | trailing_stop_market
-      tp_order_mode: "take_profit_market"        # take_profit_market
+      # Баланс: брать с биржи или из БД (account_balance_snapshots).
+      # true  => брать по /fapi/v2/balance
+      # false => брать из БД
+      use_exchange_balance: false
 
-      reduce_only: true                          # reduceOnly для защитных/закрывающих ордеров (в one-way полезно)
-      working_type: "MARK_PRICE"                 # MARK_PRICE | CONTRACT_PRICE (если поддерживается)
-      time_in_force: "GTC"                       # Для LIMIT: GTC/IOC/FOK
+      binance_connect_timeout_sec: 3.0              # Таймаут установления соединения (сек)
+      binance_read_timeout_sec: 15.0                # Таймаут чтения ответа (сек)
+      binance_max_retries: 3                        # Кол-во повторов при сетевых ошибках
+      binance_retry_backoff_sec: 1.0                # Пауза между ретраями (сек)
 
-      client_order_id_prefix: "TL"               # Префикс clientOrderId.
+      # ----------------------------
+      # Получение и кэширование баланса
+      # ----------------------------
 
-      # ======================================================
-      # БЕЗОПАСНОСТЬ: РУЧНОЕ УПРАВЛЕНИЕ SL/TP + ОБРАБОТКА ОШИБОК BRACKET
-      # ======================================================
-      enable_stop_loss: true                     # Включить постановку стоп-лосса
-      enable_take_profit: true                   # Включить постановку тейк-профита
+      wallet_balance_retries: 2                     # Ретраи получения баланса (если не удалось с первого раза)
+      wallet_balance_retry_backoff_sec: 1.0         # Пауза между ретраями баланса (сек)
 
-      defer_stop_loss_until_last_add: true       # Если включён DCA — можно поставить SL только после последнего добора.
-      sl_after_last_add_distance_pct: 2.0        # SL после последнего добора (% от цены последнего добора)
+      # TTL кэша баланса (сек): чтобы не дергать биржу/БД слишком часто
+      wallet_balance_cache_ttl_sec: 180
 
-      abort_on_bracket_fail: true                # Если ожидали SL/TP, но они не выставились -> критично.
-      close_on_bracket_fail: true                # При критичном фейле пытаемся закрыть позицию MARKET (best-effort).
-      signal_status_on_bracket_fail: "CANCELLED" # Статус сигнала при bracket-fail
+      # Частота опроса баланса (сек) (если в коде используется периодический polling)
+      wallet_balance_poll_sec: 10
 
-      # ======================================================
-      # TRAILING (используется, если sl_order_mode="trailing_stop_market")
-      # ======================================================
-      trailing_enabled: true
-      trailing_activation_pct: 3.0               # Активация трейлинга: на сколько % цена должна уйти в прибыль
-      trailing_trail_pct: 0.6                    # callbackRate Binance (%)
+      # ----------------------------
+      # Риск и ограничения на позиции
+      # ----------------------------
 
-      # ==========================================================
-      # УСРЕДНЕНИЕ (DCA) НА ЗНАЧИМЫХ УРОВНЯХ HTF (1h/4h)
-      # ==========================================================
-      averaging_enabled: false
-      averaging_max_adds: 2
-      averaging_add_size_mode: "risk_pct"        # fixed_usdt | risk_pct
-      averaging_add_size_value: 20
-      averaging_order_type: "market"             # market | limit
+      leverage: 10                                  # Плечо (leverage) для символа
+      margin_type: CROSSED                          # Тип маржи: CROSSED или ISOLATED
+      hedge_enabled: true                           # Hedge mode: true => positionSide LONG/SHORT
 
-      averaging_levels_tf: "1h"
-      averaging_levels_lookback_hours: 720
-      averaging_levels_method: "combined"        # pivots | volume_profile | combined
-      averaging_level_tolerance_pct: 0.15
+      max_open_positions: 3                         # Максимум одновременно открытых позиций
 
-      averaging_vp_bins: 48
-      averaging_vp_top_nodes: 10
+      # Максимальный размер позиции относительно кошелька (в % от wallet) — ограничение на notional.
+      max_position_notional_pct_wallet: 10.0
 
-      averaging_pivot_left: 3
-      averaging_pivot_right: 3
+      # Риск на сделку (в % от wallet). Используется для расчёта размера позиции/добавок.
+      risk_wallet_pct: 2.0
 
-      averaging_cluster_tolerance_pct: 0.25
+      # SL/TP проценты (если используется простая логика от входа)
+      stop_loss_pct: 2.0                            # Стоп-лосс (%)
+      take_profit_pct: 6.0                          # Тейк-профит (%)
 
-      # ======================================================
-      # DEBUG
-      # ======================================================
-      debug: true
-      debug_top: 10
+      recalc_sl_tp: true                            # Пересчитывать SL/TP при изменении средней цены/добавках
 
-      # ======================================================
-      # PORTFOLIO CAP + RECONCILE + RECOVERY (LIVE SAFETY)
-      # ======================================================
-      # --- Шаг 3: margin-cap (по реальной марже из /positionRisk) ---
-      portfolio_cap_ratio: 0.9                  # 0=OFF. Если usedMargin/wallet >= ratio -> не открываем новые сделки.
+      # ----------------------------
+      # Вход и bracket-ордера
+      # ----------------------------
 
-      # --- Шаг 2: reconcile ledger ↔ Binance ---
-      reconcile_enabled: true
-      reconcile_qty_tolerance: 1e-8
-      reconcile_auto_close_ledger: true
-      reconcile_auto_adjust_ledger_qty_current: true  # Если qty_current в ledger отличается от биржи, можно авто-править (полезно при partial close). По умолчанию OFF.
-      reconcile_adjust_only_our_positions: true   # Если auto-adjust включен: корректировать qty_current только для 'наших' позиций (по clientOrderId/marker)
-      reconcile_every_n_cycles: 3
-      reconcile_log_diffs: true
+      entry_order_type: market                       # Тип входа: market / limit (если поддерживается)
 
-      # IMPORTANT: у тебя на Binance могут быть позиции от других стратегий/ботов.
-      # Тогда включай ignore_external_positions, чтобы это НЕ считалось ошибкой.
-      reconcile_ignore_external_positions: true   # Не считаем ошибкой, если на Binance есть позиции не из ledger.
-      reconcile_external_log_level: "debug"       # Уровень логирования внешних позиций: debug | info | warning.
+      sl_order_mode: stop_market                    # Тип/режим SL ордера
+#      sl_order_mode: trailing_stop_market            # Тип/режим SL ордера
+      tp_order_mode: take_profit_market              # Тип/режим TP ордера
 
-      # --- Шаг 1: auto-recovery SL/TP ---
-      auto_recovery_enabled: true
-      recovery_place_sl: true
-      recovery_place_tp: true
-      recovery_max_age_hours: 48
+      reduce_only: true                              # reduceOnly для защитных/закрывающих ордеров
+      working_type: MARK_PRICE                       # MARK_PRICE или CONTRACT_PRICE для триггеров
+      time_in_force: GTC                             # GTC/IOC/FOK (обычно GTC)
 
-      # --- Шаг 4: Async REST (пока OFF; включим после теста) ---
-      async_rest_enabled: true
-      async_rest_workers: 4
-      async_rest_timeout_sec: 8            # timeout ожидания параллельных REST задач (balance/positionRisk/openOrders)
+      client_order_id_prefix: TL                     # Префикс clientOrderId (для поиска/сопоставления ордеров)
+
+      enable_stop_loss: true                         # Ставить стоп-лосс
+      enable_take_profit: true                       # Ставить тейк-профит
+
+      # Не ставить SL сразу, пока не сделаны все добавки (если averaging включён)
+      defer_stop_loss_until_last_add: true
+
+      # Дистанция SL после последней добавки (%)
+      sl_after_last_add_distance_pct: 2.0
+
+      # Если не удалось выставить bracket (SL/TP/TS) — что делать
+      abort_on_bracket_fail: true                    # Прервать открытие/сделку, если bracket не выставился корректно
+      close_on_bracket_fail: true                    # Закрыть позицию, если bracket не удалось выставить
+      signal_status_on_bracket_fail: CANCELLED       # В какой статус перевести сигнал при провале bracket
+
+      # ----------------------------
+      # Trailing stop
+      # ----------------------------
+      trailing_enabled: true                         # Включить трейлинг
+      trailing_activation_pct: 3.0                   # Активация трейлинга после +X% в прибыль
+      trailing_trail_pct: 0.5                        # Дистанция трейла (%)
+
+      # Safety буферы от markPrice (чтобы не ловить -2021)
+      trailing_activation_buffer_pct: 0.25   # % буфер для activationPrice трейлинга
+      tp_trigger_buffer_pct: 0.25            # % буфер для triggerPrice TP
+
+      # Сколько раз ретраить выставление, если Binance говорит "would immediately trigger"
+      trailing_place_retries: 3
+      tp_place_retries: 3
+
+      # ----------------------------
+      # Усреднение (averaging / adds)
+      # ----------------------------
+
+      averaging_enabled: true                        # Разрешить добавки к позиции
+      averaging_max_adds: 1                          # Максимум добавок (сколько раз усредняться)
+
+#      averaging_add_size_mode: risk_pct             # Режим размера добавки: risk_pct / fixed / wallet_pct (зависит от реализации)
+#      averaging_add_size_value: 10                  # Значение для выбранного режима (например, %)
+
+      averaging_add_size_mode: position_mult         # Включение расчета добора позиции
+      averaging_add_position_multiplier: 2.0         # Во сколько раз увеличить позицию при доборе
+
+      # Добор ставим условным MARKET (trigger → market)
+      averaging_order_type: market                   # Тип ордера добавки
+
+      # Таймфрейм/метод построения уровней для добавок
+      averaging_levels_tf: 4h                        # TF для расчета уровней (например, 1h)
+      averaging_levels_lookback_hours: 480           # Глубина истории (часы) для уровней
+      averaging_levels_method: combined              # Метод уровней (например, combined / volume_profile / pivots и т.п.)
+      averaging_level_tolerance_pct: 0.15            # Допуск (в %) при сравнении цены с уровнем
+
+      # Минимальная дистанция до ближайшего уровня добора (в % от цены-референса: entry до 1-го добора, avg после)
+      averaging_min_level_distance_pct: 15.0   # Если ближайший уровень ближе этого процента — берём следующий.
+
+      # Параметры volume profile (если используется)
+      averaging_vp_bins: 48                          # Кол-во корзин VP
+      averaging_vp_top_nodes: 10                     # Сколько верхних "нод" учитывать
+
+      # Параметры pivot/кластеризации (если используется)
+      averaging_pivot_left: 4                        # Pivot left bars
+      averaging_pivot_right: 4                       # Pivot right bars
+      averaging_cluster_tolerance_pct: 0.25          # Допуск объединения уровней в кластер (%)
+
+      # ----------------------------
+      # Debug/логирование
+      # ----------------------------
+
+      debug: true                                    # Включить расширенные debug-логи
+      debug_top: 10                                  # Сколько элементов/строк выводить в "top" отладочных списков
+
+      # ----------------------------
+      # Backfill закрытых позиций (заполнение exit/pnl/fees и т.п.)
+      # ----------------------------
+
+      backfill_run_on_startup: true                  # Запускать backfill при старте трейдера
+      backfill_enabled: true                         # Включить backfill вообще
+
+      backfill_interval_sec: 300                     # Периодический интервал backfill (сек)
+      backfill_lookback_days: 30                     # Смотреть закрытые позиции за последние N дней
+      backfill_batch_limit: 50                       # Размер батча за один проход (сколько записей проверить)
+
+      backfill_overwrite: true                       # Перезаписывать рассчитанные поля (если уже заполнены)
+      backfill_fill_fees: true                       # Заполнять комиссии (fees), если это реализовано
+      backfill_diff_tol: 1e-9                        # Допуск сравнения чисел при решении "обновлять/не обновлять"
+
+      # На старте прогнать backfill "до конца" (пачками), чтобы показать все CLOSED за интервал
+      backfill_drain_on_startup: true
+
+      # Ограничитель на количество пачек на старте (защита от бесконечного/очень долгого прогона)
+      backfill_max_startup_batches: 200
+
+      # Логировать backfill даже если updated=0 (чтобы видеть checked)
+      backfill_log_empty: true
+
+      # Логировать каждую закрытую позицию, которую проверяет backfill (может быть очень много строк!)
+      backfill_log_each: true
+
+      # ----------------------------
+      # Portfolio cap (ограничение на использование маржи/кошелька)
+      # ----------------------------
+
+      portfolio_cap_ratio: 0.5       # 0=OFF. Если SUM(position_ledger.position_value_usdt WHERE OPEN)/wallet >= ratio -> не открываем новые сделки.
+                                     # Пример: 0.7 = не превышать 70% от баланса; 1.0 = не превышать 1x wallet.
+
+      # ----------------------------
+      # Reconcile (сверка позиций биржа vs леджер/БД)
+      # ----------------------------
+
+      reconcile_enabled: true                         # Включить reconcile
+      reconcile_qty_tolerance: 1e-8                   # Допуск по количеству (qty) при сравнениях
+
+      reconcile_auto_close_ledger: true               # Автоматически закрывать записи в леджере, если на бирже позиции нет
+      reconcile_auto_adjust_ledger_qty_current: true  # Автоматически корректировать qty_current в леджере по данным биржи
+      reconcile_adjust_only_our_positions: true       # Корректировать только "наши" позиции (по clientOrderId/префиксу)
+      reconcile_every_n_cycles: 1                     # Запускать reconcile каждые N циклов
+      reconcile_log_diffs: true                       # Логировать расхождения
+      reconcile_ignore_external_positions: true       # Игнорировать внешние позиции (не созданные ботом)
+      reconcile_external_log_level: debug             # Уровень логирования внешних позиций (debug/info/warn)
+
+      # ----------------------------
+      # Auto recovery (восстановление защитных ордеров/состояния)
+      # ----------------------------
+
+      auto_recovery_enabled: true                     # Включить авто-восстановление
+      recovery_place_sl: true                         # Пытаться восстановить SL
+      recovery_place_tp: true                         # Пытаться восстановить TP
+      recovery_max_age_hours: 48                      # Восстанавливать позиции не старше N часов (по леджеру/метаданным)
+
+      # ----------------------------
+      # Async REST (параллельные запросы к бирже)
+      # ----------------------------
+
+      async_rest_enabled: true                        # Включить асинхронные запросы (параллелизм)
+      async_rest_workers: 4                           # Кол-во воркеров/потоков для REST
+      async_rest_timeout_sec: 8                       # Таймаут асинхронных запросов (сек)

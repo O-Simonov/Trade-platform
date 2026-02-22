@@ -45,8 +45,8 @@ screeners:
       intervals: ["5m", "15m"]  # Список таймфреймов для прогона
       # interval: "5m"          # Альтернатива: один таймфрейм (если intervals не задан)
 
-      min_price: 0.0000001  # Минимальная цена (фильтр «пылинок» и мусорных символов)
-      max_price: 100000     # Максимальная цена (фильтр аномально дорогих/нецелевых)
+      min_price: 0.0000001   # Минимальная цена (фильтр «пылинок» и мусорных символов)
+      max_price: 1000        # Максимальная цена (фильтр аномально дорогих/нецелевых)
 
       max_symbols: 0        # 0 = без лимита; >0 = ограничить количество символов из БД
       signal_mode: "both"   # both | buy | sell (какие сигналы генерировать)
@@ -78,21 +78,21 @@ screeners:
           plot_lookback_bars: 220    # История на графике (в свечах)
 
           # Пороги BUY (5m) — «живые» стартовые значения
-          buy_oi_rise_pct: 0.9       # Рост OI (контракты) в trigger-окне, %
-          oi_value_confirm_pct: 0.9  # Рост OI$ (USDT) в trigger-окне, %
-          buy_volume_mult: 1.4       # Средний объём trigger >= median(base) * N
-          buy_volume_spike_mult: 2.8 # Пик свечи trigger >= median(base) * N
-          buy_price_rise_pct: 0.05   # Рост цены в trigger-окне (по «пику»), %
-          buy_min_green_candles: 1   # Минимум зелёных свечей в trigger-окне
+          buy_oi_rise_pct: 2.0       # Рост OI (контракты) в trigger-окне, %
+          oi_value_confirm_pct: 2.0   # Рост OI$ (USDT) в trigger-окне, %
+          buy_volume_mult: 2.2        # Средний объём trigger >= median(base) * N
+          buy_volume_spike_mult: 4.0  # Пик свечи trigger >= median(base) * N
+          buy_price_rise_pct: 1.0     # Рост цены в trigger-окне (по «пику»), %
+          buy_min_green_candles: 2    # Минимум зелёных свечей в trigger-окне
           buy_require_last_green: true # Последняя свеча trigger-окна должна быть зелёной
 
           # Пороги SELL (5m)
-          sell_oi_drop_one_candle_pct: 0.9 # Падение OI за 1 свечу, %
-          sell_oi_drop_window_pct: 0.9     # Падение OI за trigger-окно, %
-          sell_price_drop_last_pct: 0.3    # Падение цены на последней свече/в конце окна, %
-          sell_reversal_from_max_pct: 0.35 # Откат от локального максимума в trigger-окне, %
-          sell_volume_spike_mult: 1.6      # Пик объёма trigger >= median(base) * N
-          sell_volume_drop_ratio: 0.7      # Затухание: объём в конце <= peak * ratio
+          sell_oi_drop_one_candle_pct: 2.0 # Падение OI за 1 свечу, %
+          sell_oi_drop_window_pct: 2.5     # Падение OI за trigger-окно, %
+          sell_price_drop_last_pct: 1.0    # Падение цены на последней свече/в конце окна, %
+          sell_reversal_from_max_pct: 1.1  # Откат от локального максимума в trigger-окне, %
+          sell_volume_spike_mult: 2.3      # Пик объёма trigger >= median(base) * N
+          sell_volume_drop_ratio: 0.65     # Затухание: объём в конце <= peak * ratio
 
         "15m":
           # Окна и «свежесть» (×3 к 5m — чтобы сохранить смысл по времени)
@@ -102,21 +102,21 @@ screeners:
           plot_lookback_bars: 110     # ≈ тот же горизонт по времени, что 220 свечей на 5m
 
           # Пороги BUY (15m) — сделаны ЧУТЬ строже (не ×3!)
-          buy_oi_rise_pct: 1.3       # Было 0.7 на 5m → для 15m логичнее требовать сильнее рост OI
-          oi_value_confirm_pct: 1.3  # Подтверждение по OI$ чуть строже
-          buy_volume_mult: 1.9       # Средний объём должен сильнее выделяться на 15m
-          buy_volume_spike_mult: 3.4 # Пик свечи тоже строже
-          buy_price_rise_pct: 0.18   # Для 15m цена обычно ходит больше — порог выше
-          buy_min_green_candles: 1   # Обычно достаточно 1 (можно сделать 2, если будет много мусора)
+          buy_oi_rise_pct: 1.3        # Было 0.7 на 5m → для 15m логичнее требовать сильнее рост OI
+          oi_value_confirm_pct: 1.5   # Подтверждение по OI$ чуть строже
+          buy_volume_mult: 1.9        # Средний объём должен сильнее выделяться на 15m
+          buy_volume_spike_mult: 3.0  # Пик свечи тоже строже
+          buy_price_rise_pct: 1.4     # Для 15m цена обычно ходит больше — порог выше
+          buy_min_green_candles: 2    # Обычно достаточно 1 (можно сделать 2, если будет много мусора)
           buy_require_last_green: true
 
           # Пороги SELL (15m) — тоже чуть строже
-          sell_oi_drop_one_candle_pct: 1.1
-          sell_oi_drop_window_pct: 1.4
-          sell_price_drop_last_pct: 0.45
-          sell_reversal_from_max_pct: 1.1
-          sell_volume_spike_mult: 2.1
-          sell_volume_drop_ratio: 0.65
+          sell_oi_drop_one_candle_pct: 2.0
+          sell_oi_drop_window_pct: 2.5
+          sell_price_drop_last_pct: 1.2
+          sell_reversal_from_max_pct: 1.8
+          sell_volume_spike_mult: 2.5
+          sell_volume_drop_ratio: 0.6
 
       # ==========================================================
       # PRICE: критерии «базы» (фон)
@@ -124,7 +124,7 @@ screeners:
       # Эти параметры определяют «условия фона» за base_minutes:
       # - флэт (небольшой диапазон)
       # - или снижение (чтобы BUY ловил набор OI «после слабости»)
-      price_sideways_max_pct: 8.0   # Флэт: range% цены в базе <= порога
+      price_sideways_max_pct: 7.0   # Флэт: range% цены в базе <= порога
       price_downtrend_min_pct: 0.3  # Снижение: падение цены в базе >= порога (%)
 
       # ==========================================================
@@ -132,12 +132,12 @@ screeners:
       # ==========================================================
       # Чтобы импульс был заметен, база по объёму должна быть без экстремальных всплесков:
       # max(volume_base) <= median(volume_base) * base_volume_max_mult
-      base_volume_max_mult: 3.0     # Чем меньше — тем строже «тишина» базы
+      base_volume_max_mult: 5.5     # Чем меньше — тем строже «тишина» базы
 
       # ==========================================================
       # BUY: свечные подтверждения (общие дефолты, но override может менять)
       # ==========================================================
-      buy_min_green_candles: 1      # Минимум зелёных свечей в trigger-окне (если override не задан)
+      buy_min_green_candles: 2      # Минимум зелёных свечей в trigger-окне (если override не задан)
       buy_require_last_green: true  # Требовать, чтобы последняя свеча в trigger-окне была зелёной
 
       # ==========================================================
@@ -156,9 +156,9 @@ screeners:
       # ==========================================================
       # Funding filter (BUY)
       # ==========================================================
-      enable_funding: true                # Если true — BUY требует funding < buy_funding_max_pct
-      buy_funding_max_pct: -0.001        # BUY: funding должен быть ниже порога (0.0 = строго отрицательный)
-      buy_require_funding_decreasing: false # Если true — funding должен снижаться (делает BUY строже)
+      enable_funding: true                   # Если true — BUY требует funding < buy_funding_max_pct
+      buy_funding_max_pct: -0.0001            # BUY: funding должен быть ниже порога (0.0 = строго отрицательный)
+      buy_require_funding_decreasing: true  # Если true — funding должен снижаться (делает BUY строже)
 
       # ==========================================================
       # Funding filter (SELL)

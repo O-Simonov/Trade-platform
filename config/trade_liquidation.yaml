@@ -176,7 +176,7 @@ traders:
       # ----------------------------
 
       averaging_enabled: true                        # Разрешить добавки к позиции
-      averaging_max_adds: 1                          # Максимум добавок (сколько раз усредняться)
+      averaging_max_adds: 2                          # Максимум добавок (сколько раз усредняться)
 
 #      averaging_add_size_mode: risk_pct             # Режим размера добавки: risk_pct / fixed / wallet_pct (зависит от реализации)
 #      averaging_add_size_value: 10                  # Значение для выбранного режима (например, %)
@@ -194,7 +194,7 @@ traders:
       averaging_level_tolerance_pct: 0.15            # Допуск (в %) при сравнении цены с уровнем
 
       # Минимальная дистанция до ближайшего уровня добора (в % от цены-референса: entry до 1-го добора, avg после)
-      averaging_min_level_distance_pct: 15.0   # Если ближайший уровень ближе этого процента — берём следующий.
+      averaging_min_level_distance_pct: 10.0         # Если ближайший уровень ближе этого процента — берём следующий.
 
       # Параметры volume profile (если используется)
       averaging_vp_bins: 48                          # Кол-во корзин VP

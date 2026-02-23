@@ -351,6 +351,58 @@ class BinanceFuturesRest:
             raise RuntimeError(f"unexpected balance payload: {type(data)}")
         return data
 
+
+    # -------------------------------------------------------------------------
+    # Orders / trades bootstrap helpers (USDⓈ-M Futures)
+    # -------------------------------------------------------------------------
+
+    def fetch_open_orders(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
+        # GET /fapi/v1/openOrders (signed)
+        params: Dict[str, Any] = {}
+        if symbol:
+            params["symbol"] = symbol
+        data = self._request("GET", "/fapi/v1/openOrders", params=params, signed=True)
+        if not isinstance(data, list):
+            raise RuntimeError(f"unexpected openOrders payload: {type(data)}")
+        return data
+
+    def fetch_user_trades(
+        self,
+        *,
+        symbol: str,
+        start_time_ms: Optional[int] = None,
+        end_time_ms: Optional[int] = None,
+        limit: int = 1000,
+    ) -> List[Dict[str, Any]]:
+        # GET /fapi/v1/userTrades (signed) -- requires symbol
+        params: Dict[str, Any] = {"symbol": symbol, "limit": int(limit)}
+        if start_time_ms is not None:
+            params["startTime"] = int(start_time_ms)
+        if end_time_ms is not None:
+            params["endTime"] = int(end_time_ms)
+        data = self._request("GET", "/fapi/v1/userTrades", params=params, signed=True)
+        if not isinstance(data, list):
+            raise RuntimeError(f"unexpected userTrades payload: {type(data)}")
+        return data
+
+    def fetch_all_orders(
+        self,
+        *,
+        symbol: str,
+        start_time_ms: Optional[int] = None,
+        end_time_ms: Optional[int] = None,
+        limit: int = 1000,
+    ) -> List[Dict[str, Any]]:
+        # GET /fapi/v1/allOrders (signed) -- requires symbol
+        params: Dict[str, Any] = {"symbol": symbol, "limit": int(limit)}
+        if start_time_ms is not None:
+            params["startTime"] = int(start_time_ms)
+        if end_time_ms is not None:
+            params["endTime"] = int(end_time_ms)
+        data = self._request("GET", "/fapi/v1/allOrders", params=params, signed=True)
+        if not isinstance(data, list):
+            raise RuntimeError(f"unexpected allOrders payload: {type(data)}")
+        return data
     # user-data stream listenKey management
     def create_listen_key(self) -> str:
         data = self._request("POST", "/fapi/v1/listenKey", params={}, signed=False)
@@ -376,25 +428,44 @@ class BinanceFuturesRest:
 class BinanceFuturesUserStream:
     """
     Connects to wss://fstream.binance.com/ws/<listenKey> (USDⓈ-M Futures user stream).
-    Emits ACCOUNT_UPDATE events via callback.
+    Emits ACCOUNT_UPDATE and ORDER_TRADE_UPDATE events via callbacks.
     """
 
-    def __init__(self, rest: BinanceFuturesRest, asset: str, on_account_update, *, debug_messages: bool = False) -> None:
+    def __init__(
+        self,
+        rest: BinanceFuturesRest,
+        asset: str,
+        on_account_update,
+        on_order_trade_update=None,
+        *,
+        debug_messages: bool = False,
+    ) -> None:
         self._rest = rest
         self._asset = asset.upper()
         self._on_account_update = on_account_update
+        self._on_order_trade_update = on_order_trade_update
         self._debug_messages = debug_messages
 
         self._stop = threading.Event()
         self._ws: Optional[websocket.WebSocketApp] = None
         self._listen_key: Optional[str] = None
+        self._ws_url: Optional[str] = None
+        self._lock = threading.Lock()
 
         self._t_ws: Optional[threading.Thread] = None
         self._t_keep: Optional[threading.Thread] = None
 
+
+        # WS callbacks (for listenKey rotation rebuild)
+        self._cb_on_open = None
+        self._cb_on_message = None
+        self._cb_on_error = None
+        self._cb_on_close = None
     def start(self) -> None:
         self._listen_key = self._rest.create_listen_key()
         ws_url = f"wss://fstream.binance.com/ws/{self._listen_key}"
+        with self._lock:
+            self._ws_url = ws_url
         log.info("[BINANCE WS] connect: %s", ws_url)
 
         def on_message(_ws, message: str):
@@ -410,6 +481,12 @@ class BinanceFuturesUserStream:
             if et == "ACCOUNT_UPDATE":
                 self._on_account_update(obj)
 
+            elif et == "ORDER_TRADE_UPDATE" and self._on_order_trade_update is not None:
+                self._on_order_trade_update(obj)
+
+            elif et == "listenKeyExpired":
+                log.warning("[BINANCE WS] listenKeyExpired event received; rotating listenKey")
+                self._rotate_listen_key()
         def on_error(_ws, err):
             log.warning("[BINANCE WS] error: %s", err)
 
@@ -418,6 +495,12 @@ class BinanceFuturesUserStream:
 
         def on_open(_ws):
             log.info("[BINANCE WS] opened")
+
+        # Store callbacks so we can rebuild WS app on listenKey rotation.
+        self._cb_on_open = on_open
+        self._cb_on_message = on_message
+        self._cb_on_error = on_error
+        self._cb_on_close = on_close
 
         self._ws = websocket.WebSocketApp(
             ws_url,
@@ -433,6 +516,32 @@ class BinanceFuturesUserStream:
         self._t_keep = threading.Thread(target=self._run_keepalive, name="binance_ws_keepalive", daemon=True)
         self._t_keep.start()
 
+
+    def _rotate_listen_key(self) -> None:
+        """Rotate listenKey and force WS reconnect."""
+        try:
+            old = self._listen_key
+            new_key = self._rest.create_listen_key()
+            new_url = f"wss://fstream.binance.com/ws/{new_key}"
+            with self._lock:
+                self._listen_key = new_key
+                self._ws_url = new_url
+            # Best-effort close old listenKey
+            if old:
+                try:
+                    self._rest.close_listen_key(old)
+                except Exception:
+                    pass
+            # Force reconnect: close current socket; ws thread will rebuild using new url.
+            try:
+                if self._ws:
+                    self._ws.close()
+            except Exception:
+                pass
+            log.info("[BINANCE WS] rotated listenKey")
+        except Exception as e:
+            log.warning("[BINANCE WS] rotate listenKey failed: %s", e)
+
     def stop(self) -> None:
         self._stop.set()
         try:
@@ -444,15 +553,27 @@ class BinanceFuturesUserStream:
             self._rest.close_listen_key(self._listen_key)
 
     def _run_ws(self) -> None:
-        assert self._ws is not None
         # ping interval built-in
         while not self._stop.is_set():
             try:
+                # Rebuild app if listenKey rotated
+                with self._lock:
+                    url = self._ws_url
+                if url and (self._ws is None or getattr(self._ws, "url", None) != url):
+                    self._ws = websocket.WebSocketApp(
+                        url,
+                        on_open=self._cb_on_open,
+                        on_message=self._cb_on_message,
+                        on_error=self._cb_on_error,
+                        on_close=self._cb_on_close,
+                    )
+                assert self._ws is not None
                 self._ws.run_forever(ping_interval=20, ping_timeout=10)
             except Exception as e:
                 log.warning("[BINANCE WS] run_forever failed: %s", e)
             if not self._stop.is_set():
                 time.sleep(2.0)
+
 
     def _run_keepalive(self) -> None:
         # Binance requires keepalive at least once per 60 minutes; do every 30m
@@ -466,6 +587,8 @@ class BinanceFuturesUserStream:
                     log.info("[BINANCE WS] listenKey keepalive OK")
             except Exception as e:
                 log.warning("[BINANCE WS] listenKey keepalive failed: %s", e)
+                # If keepalive fails, rotate listenKey and reconnect.
+                self._rotate_listen_key()
 
 
 # =============================================================================
@@ -511,6 +634,9 @@ class AccountBalanceWriter:
         self._last_ws_ts: Optional[datetime] = None
         self._ws: Optional[BinanceFuturesUserStream] = None
 
+
+        self._symbol_cache: Dict[str, int] = {}
+        self._load_symbol_cache()
     def start(self) -> None:
         self._thread.start()
 
@@ -703,6 +829,898 @@ class AccountBalanceWriter:
         except Exception as e:
             log.warning("[BINANCE WS] parse/write failed: %s", e)
 
+    # ---- Orders/Trades via WS user stream
+
+    def _load_symbol_cache(self) -> None:
+        try:
+            rows = _db_fetch_all(
+                self._pool,
+                "SELECT symbol_id, symbol FROM public.symbols WHERE exchange_id = %(ex)s",
+                {"ex": self.exchange_id},
+            )
+            self._symbol_cache = {str(r["symbol"]).upper(): int(r["symbol_id"]) for r in rows if r.get("symbol") and r.get("symbol_id") is not None}
+        except Exception as e:
+            log.warning("Failed to load symbols cache: %s", e)
+            self._symbol_cache = {}
+
+    def _ensure_symbol_id(self, symbol: str) -> int:
+        sym = str(symbol).upper()
+        if sym in self._symbol_cache:
+            return self._symbol_cache[sym]
+        # Insert if missing (keeps system resilient when new symbols appear)
+        row = _db_fetch_one(
+            self._pool,
+            '''
+            INSERT INTO public.symbols(exchange_id, symbol, is_active, last_seen_at)
+            VALUES (%(ex)s, %(sym)s, true, now())
+            ON CONFLICT (exchange_id, symbol)
+            DO UPDATE SET last_seen_at = EXCLUDED.last_seen_at
+            RETURNING symbol_id
+            ''',
+            {"ex": self.exchange_id, "sym": sym},
+        )
+        if not row or row.get("symbol_id") is None:
+            raise RuntimeError(f"Cannot resolve symbol_id for {sym}")
+        sid = int(row["symbol_id"])
+        self._symbol_cache[sym] = sid
+        return sid
+
+    
+    # ---- REST bootstrap (orders / fills) before WS starts
+
+    def _bootstrap_rest_orders_and_fills(self) -> None:
+        """Seed orders and recent fills via REST so DB is consistent before WS updates."""
+        if os.getenv("BOOTSTRAP_ON_START", "1") != "1":
+            return
+
+        hours = int(os.getenv("BOOTSTRAP_HOURS", "24") or "24")
+        symbols_limit = int(os.getenv("BOOTSTRAP_SYMBOLS_LIMIT", "50") or "50")
+        do_all_orders = os.getenv("BOOTSTRAP_ALL_ORDERS", "0") == "1"
+
+        start_ms = int(time.time() * 1000) - hours * 3600 * 1000
+        log.info("[BOOTSTRAP] REST seed start: hours=%s symbols_limit=%s allOrders=%s", hours, symbols_limit, do_all_orders)
+        open_orders: List[Dict[str, Any]] = []
+
+
+        # 1) Open orders (no symbol required)
+        try:
+            open_orders = self._rest.fetch_open_orders()
+            upserts: List[Dict[str, Any]] = []
+            for o in open_orders:
+                sym = str(o.get("symbol") or "").upper()
+                if not sym:
+                    continue
+                sid = self._ensure_symbol_id(sym)
+                order_id = str(o.get("orderId") or "").strip()
+                if not order_id:
+                    continue
+                client_order_id = o.get("clientOrderId")
+                side = o.get("side")
+                type_ = o.get("type")
+                reduce_only = o.get("reduceOnly")
+                price = _safe_float(o.get("price"))
+                qty = _safe_float(o.get("origQty"))
+                filled_qty = _safe_float(o.get("executedQty"))
+                status = o.get("status")
+                ts_ms = o.get("updateTime") or o.get("time")
+                ts_ms = int(ts_ms) if ts_ms is not None else None
+                avg_price = _safe_float(o.get("avgPrice"))
+                self._upsert_order(
+                    order_id=order_id,
+                    symbol_id=sid,
+                    client_order_id=client_order_id,
+                    side=side,
+                    type_=type_,
+                    reduce_only=bool(reduce_only) if reduce_only is not None else None,
+                    price=price,
+                    qty=qty,
+                    filled_qty=filled_qty,
+                    status=status,
+                    ts_ms=ts_ms,
+                    raw_json_obj={"rest_open_order": o},
+                    avg_price=avg_price,
+                    source="rest_bootstrap",
+                )
+            log.info("[BOOTSTRAP] openOrders: %s", len(open_orders))
+        except Exception as e:
+            log.warning("[BOOTSTRAP] openOrders failed: %s", e, exc_info=True)
+
+        
+        # 2) Recent user trades (fills) per selected symbols (active set + openOrders + recent orders)
+        try:
+            # Prefer symbols that are actually relevant for this account (reduces API calls, reaches SOLUSDT etc.).
+            selected: List[str] = []
+
+            # (a) Symbols from open orders (already fetched above)
+            open_syms: set[str] = set()
+            try:
+                for o in open_orders if isinstance(open_orders, list) else []:
+                    s = str(o.get('symbol') or '').upper()
+                    if s:
+                        open_syms.add(s)
+            except Exception:
+                open_syms = set()
+
+            # (b) Symbols that appear in recent orders in DB for this account
+            db_syms: List[str] = []
+            try:
+                rows = _db_fetch_all(
+                    self._pool,
+                    '''
+                    SELECT s.symbol, COUNT(*) AS n
+                    FROM public.orders o
+                    JOIN public.symbols s
+                      ON s.symbol_id = o.symbol_id AND s.exchange_id = o.exchange_id
+                    WHERE o.exchange_id = %(ex)s AND o.account_id = %(ac)s
+                      AND o.created_at >= now() - ( %(hours)s * interval '1 hour' )
+                    GROUP BY s.symbol
+                    ORDER BY n DESC
+                    LIMIT %(lim)s
+                    ''',
+                    {'ex': self.exchange_id, 'ac': self.account_id, 'hours': hours, 'lim': symbols_limit},
+                )
+                db_syms = [str(r['symbol']).upper() for r in rows if r.get('symbol')]
+            except Exception as e:
+                log.warning('[BOOTSTRAP] recent orders symbols query failed: %s', e)
+
+            # Merge with priority: open orders first, then recent DB symbols
+            seen: set[str] = set()
+            for s in list(open_syms) + db_syms:
+                s = str(s).upper()
+                if not s or s in seen:
+                    continue
+                selected.append(s)
+                seen.add(s)
+                if len(selected) >= symbols_limit:
+                    break
+
+            # (c) Backfill from symbols.last_seen_at if we still need more
+            if len(selected) < symbols_limit:
+                sym_rows = _db_fetch_all(
+                    self._pool,
+                    '''
+                    SELECT symbol
+                    FROM public.symbols
+                    WHERE exchange_id = %(ex)s AND is_active IS TRUE
+                    ORDER BY last_seen_at DESC NULLS LAST
+                    LIMIT %(lim)s
+                    ''',
+                    {'ex': self.exchange_id, 'lim': max(symbols_limit * 5, symbols_limit)},
+                )
+                for r in sym_rows:
+                    s = str(r.get('symbol') or '').upper()
+                    if not s or s in seen:
+                        continue
+                    selected.append(s)
+                    seen.add(s)
+                    if len(selected) >= symbols_limit:
+                        break
+
+            log.info('[BOOTSTRAP] userTrades symbols selected: %s (e.g. %s)', len(selected), ','.join(selected[:10]))
+
+            total_fills = 0
+            for sym in selected:
+                try:
+                    trades = self._rest.fetch_user_trades(symbol=sym, start_time_ms=start_ms, limit=1000)
+                    if not trades:
+                        continue
+                    sid = self._ensure_symbol_id(sym)
+                    inserted_sym = 0
+                    for t in trades:
+                        # Binance /fapi/v1/userTrades uses `id` as unique trade id
+                        trade_id = str(t.get('id') or '').strip() or None
+                        if not trade_id:
+                            continue
+                        order_id = str(t.get('orderId') or '').strip() or None
+
+                        # OMS invariant: fill_uid == trade_id
+                        self._insert_fill(
+                            fill_uid=str(trade_id),
+                            symbol_id=sid,
+                            order_id=order_id,
+                            trade_id=str(trade_id),
+                            client_order_id=None,
+                            price=_safe_float(t.get('price')),
+                            qty=_safe_float(t.get('qty')),
+                            realized_pnl=_safe_float(t.get('realizedPnl')),
+                            ts_ms=int(t.get('time') or t.get('timestamp') or self._rest._ts_ms()),
+                            source='rest_bootstrap',
+                        )
+                        inserted_sym += 1
+                        total_fills += 1
+
+                    log.info('[BOOTSTRAP] userTrades %s: got=%d inserted=%d', sym, len(trades), inserted_sym)
+                except Exception as e:
+                    log.warning('[BOOTSTRAP] userTrades failed for %s: %s', sym, e, exc_info=True)
+                    continue
+
+            log.info('[BOOTSTRAP] userTrades fills inserted: %s', total_fills)
+        except Exception as e:
+            log.warning('[BOOTSTRAP] userTrades bootstrap failed: %s', e, exc_info=True)
+
+# 3) Optional: recent allOrders history to sync statuses (can be heavy)
+        if do_all_orders:
+            try:
+                sym_rows = _db_fetch_all(
+                    self._pool,
+                    '''
+                    SELECT symbol
+                    FROM public.symbols
+                    WHERE exchange_id = %(ex)s AND is_active IS TRUE
+                    ORDER BY last_seen_at DESC NULLS LAST
+                    LIMIT %(lim)s
+                    ''',
+                    {"ex": self.exchange_id, "lim": symbols_limit},
+                )
+                symbols = [str(r["symbol"]).upper() for r in sym_rows if r.get("symbol")]
+                total = 0
+                for sym in symbols:
+                    try:
+                        orders = self._rest.fetch_all_orders(symbol=sym, start_time_ms=start_ms, limit=1000)
+                        for o in orders:
+                            sid = self._ensure_symbol_id(sym)
+                            order_id = str(o.get("orderId") or "").strip()
+                            if not order_id:
+                                continue
+                            self._upsert_order(
+                                order_id=order_id,
+                                symbol_id=sid,
+                                client_order_id=o.get("clientOrderId"),
+                                side=o.get("side"),
+                                type_=o.get("type"),
+                                reduce_only=bool(o.get("reduceOnly")) if o.get("reduceOnly") is not None else None,
+                                price=_safe_float(o.get("price")),
+                                qty=_safe_float(o.get("origQty")),
+                                filled_qty=_safe_float(o.get("executedQty")),
+                                status=o.get("status"),
+                                ts_ms=int(o.get("updateTime") or o.get("time") or start_ms),
+                                raw_json_obj={"rest_all_order": o},
+                                avg_price=_safe_float(o.get("avgPrice")),
+                                source="rest_bootstrap",
+                            )
+                            total += 1
+                    except Exception as e:
+                        log.warning("[BOOTSTRAP] allOrders failed for %s: %s", sym, e)
+                log.info("[BOOTSTRAP] allOrders upserts: %s", total)
+            except Exception as e:
+                log.warning("[BOOTSTRAP] allOrders bootstrap failed: %s", e, exc_info=True)
+
+        log.info("[BOOTSTRAP] REST seed done")
+
+    def _reconcile_orders_rest_once(self) -> None:
+        """Lightweight periodic reconcile via REST to avoid WS gaps.
+
+        - refreshes openOrders and upserts them into public.orders
+        - optionally refreshes allOrders for symbols that currently have open orders
+        """
+        every = float(os.getenv("RECONCILE_ORDERS_EVERY_SEC", "300") or 300)
+        if every <= 0:
+            return
+        open_orders: List[Dict[str, Any]] = []
+
+        try:
+            open_orders = self._rest.fetch_open_orders()
+            log.info("[RECONCILE] openOrders: %s", len(open_orders))
+            symbols: set[str] = set()
+            for o in open_orders:
+                sym = str(o.get("symbol") or "").strip()
+                if not sym:
+                    continue
+                symbols.add(sym)
+                sid = self._ensure_symbol_id(sym)
+                order_id = str(o.get("orderId") or "").strip()
+                if not order_id:
+                    continue
+                client_order_id = str(o.get("clientOrderId") or "").strip() or None
+                side = str(o.get("side") or "").strip() or None
+                type_ = str(o.get("type") or "").strip() or None
+                reduce_only = o.get("reduceOnly")
+                price = _safe_float(o.get("price"))
+                qty = _safe_float(o.get("origQty"))
+                filled_qty = _safe_float(o.get("executedQty"))
+                status = str(o.get("status") or "").strip() or None
+                ts_ms = o.get("updateTime") or o.get("time") or None
+                self._upsert_order(
+                    order_id=order_id,
+                    symbol_id=int(sid),
+                    client_order_id=client_order_id,
+                    side=side,
+                    type_=type_,
+                    reduce_only=bool(reduce_only) if reduce_only is not None else None,
+                    price=price,
+                    qty=qty,
+                    filled_qty=filled_qty,
+                    status=status,
+                    ts_ms=int(ts_ms) if ts_ms is not None else None,
+                    raw_json_obj=o,
+                    avg_price=_safe_float(o.get("avgPrice")),
+                    source="rest_reconcile",
+                )
+        except Exception as e:
+            log.warning("[RECONCILE] openOrders failed: %s", e, exc_info=True)
+            return
+
+        if os.getenv("RECONCILE_ALL_ORDERS", "0") != "1":
+            return
+
+        hours = float(os.getenv("RECONCILE_HOURS", "24") or 24)
+        start_ms = int((time.time() - hours * 3600) * 1000)
+
+        # Also reconcile symbols that have potentially stale NEW/PARTIALLY_FILLED orders in DB
+        # (e.g. duplicate/old averaging orders) even if they are no longer present in openOrders.
+        try:
+            stale_lim = int(os.getenv("RECONCILE_STALE_SYMBOLS_LIMIT", "30") or 30)
+            if stale_lim > 0:
+                stale_rows = _db_fetch_all(
+                    self._pool,
+                    """
+                    SELECT s.symbol
+                    FROM public.orders o
+                    JOIN public.symbols s
+                      ON s.exchange_id = o.exchange_id AND s.symbol_id = o.symbol_id
+                    WHERE o.exchange_id = %(ex)s AND o.account_id = %(ac)s
+                      AND o.status IN ('NEW','PARTIALLY_FILLED')
+                      AND o.updated_at >= now() - (%(hours)s * interval '1 hour')
+                    GROUP BY s.symbol
+                    ORDER BY MAX(o.updated_at) DESC
+                    LIMIT %(lim)s
+                    """,
+                    {"ex": self.exchange_id, "ac": self.account_id, "hours": hours, "lim": stale_lim},
+                )
+                for r in stale_rows:
+                    sym = str(r.get("symbol") or "").strip()
+                    if sym:
+                        symbols.add(sym.upper())
+        except Exception as e:
+            log.warning("[RECONCILE] stale symbols lookup failed: %s", e)
+
+
+
+        # Only for symbols with active open orders to keep it light.
+        for sym in sorted(symbols):
+            try:
+                orders = self._rest.fetch_all_orders(symbol=sym, start_time_ms=start_ms)
+                up = 0
+                for o in orders:
+                    sid = self._ensure_symbol_id(sym)
+                    order_id = str(o.get("orderId") or "").strip()
+                    if not order_id:
+                        continue
+                    client_order_id = str(o.get("clientOrderId") or "").strip() or None
+                    side = str(o.get("side") or "").strip() or None
+                    type_ = str(o.get("type") or "").strip() or None
+                    reduce_only = o.get("reduceOnly")
+                    price = _safe_float(o.get("price"))
+                    qty = _safe_float(o.get("origQty"))
+                    filled_qty = _safe_float(o.get("executedQty"))
+                    status = str(o.get("status") or "").strip() or None
+                    ts_ms = o.get("updateTime") or o.get("time") or None
+                    self._upsert_order(
+                        order_id=order_id,
+                        symbol_id=int(sid),
+                        client_order_id=client_order_id,
+                        side=side,
+                        type_=type_,
+                        reduce_only=bool(reduce_only) if reduce_only is not None else None,
+                        price=price,
+                        qty=qty,
+                        filled_qty=filled_qty,
+                        status=status,
+                        ts_ms=int(ts_ms) if ts_ms is not None else None,
+                        raw_json_obj=o,
+                        avg_price=_safe_float(o.get("avgPrice")),
+                        source="rest_reconcile",
+                    )
+                    up += 1
+                if up:
+                    log.info("[RECONCILE] allOrders %s: upserted=%s", sym, up)
+            except Exception as e:
+                log.warning("[RECONCILE] allOrders failed for %s: %s", sym, e)
+
+        # Optional GC: mark very old TL averaging orders that are still NEW/PARTIALLY_FILLED in DB,
+        # but are NOT present in current openOrders, as CANCELED. This prevents stale duplicates
+        # from inflating active_adds and breaking scale-in limits.
+        try:
+            gc_age_h = float(os.getenv("RECONCILE_GC_AGE_HOURS", "12") or 12)
+            gc_lim = int(os.getenv("RECONCILE_GC_LIMIT", "500") or 500)
+            if gc_age_h > 0 and gc_lim > 0:
+                open_ids = {str(o.get("orderId") or "").strip() for o in (open_orders or []) if str(o.get("orderId") or "").strip()}
+                pat = r"TL\_%\_ADD%"
+                stale = _db_fetch_all(
+                    self._pool,
+                    """
+                    SELECT order_id
+                    FROM public.orders
+                    WHERE exchange_id = %(ex)s AND account_id = %(ac)s
+                      AND strategy_id = 'trade_liquidation'
+                      AND status IN ('NEW','PARTIALLY_FILLED')
+                      AND order_id IS NOT NULL AND btrim(order_id) <> ''
+                      AND client_order_id LIKE %(pat)s ESCAPE '\\'
+                      AND updated_at < now() - (%(age)s * interval '1 hour')
+                    ORDER BY updated_at ASC
+                    LIMIT %(lim)s
+                    """,
+                    {"ex": self.exchange_id, "ac": self.account_id, "pat": pat, "age": gc_age_h, "lim": gc_lim},
+                )
+                to_cancel = [str(r.get("order_id") or "").strip() for r in stale if str(r.get("order_id") or "").strip() and str(r.get("order_id") or "").strip() not in open_ids]
+                if to_cancel:
+                    _db_exec(
+                        self._pool,
+                        """
+                        UPDATE public.orders
+                        SET status = 'CANCELED',
+                            updated_at = now(),
+                            source = 'reconcile_gc'
+                        WHERE exchange_id = %(ex)s AND account_id = %(ac)s
+                          AND strategy_id = 'trade_liquidation'
+                          AND status IN ('NEW','PARTIALLY_FILLED')
+                          AND order_id = ANY(%(ids)s)
+                        """,
+                        {"ex": self.exchange_id, "ac": self.account_id, "ids": to_cancel},
+                    )
+                    log.info("[RECONCILE] GC canceled stale TL orders: %s", len(to_cancel))
+        except Exception as e:
+            log.warning("[RECONCILE] GC failed: %s", e)
+
+    def _insert_order_event(
+        self,
+        *,
+        order_id: str,
+        symbol_id: int,
+        client_order_id: Optional[str],
+        status: str,
+        side: Optional[str],
+        type_: Optional[str],
+        reduce_only: Optional[bool],
+        price: Optional[float],
+        qty: Optional[float],
+        filled_qty: Optional[float],
+        ts_ms: int,
+        raw_json_text: str,
+        strategy_id: str = "unknown",
+        pos_uid: Optional[str] = None,
+        source: str = "ws_user",
+    ) -> None:
+        _db_exec(
+            self._pool,
+            '''
+            INSERT INTO public.order_events(
+              exchange_id, account_id, order_id, symbol_id, client_order_id,
+              status, side, type, reduce_only, price, qty, filled_qty,
+              source, ts_ms, recv_ts, raw_json, strategy_id, pos_uid
+            )
+            VALUES (
+              %(ex)s, %(ac)s, %(oid)s, %(sid)s, %(coid)s,
+              %(st)s, %(side)s, %(typ)s, %(ro)s, %(price)s, %(qty)s, %(fqty)s,
+              %(src)s, %(ts_ms)s, now(), %(raw)s, %(strategy)s, %(pos_uid)s
+            )
+            ON CONFLICT DO NOTHING
+            ''',
+            {
+                "ex": self.exchange_id,
+                "ac": self.account_id,
+                "oid": order_id,
+                "sid": symbol_id,
+                "coid": client_order_id,
+                "st": status,
+                "side": side,
+                "typ": type_,
+                "ro": reduce_only,
+                "price": price,
+                "qty": qty,
+                "fqty": filled_qty,
+                "src": source,
+                "ts_ms": int(ts_ms),
+                "raw": raw_json_text,
+                "strategy": strategy_id or "unknown",
+                "pos_uid": pos_uid,
+            },
+        )
+
+    def _upsert_order(
+        self,
+        *,
+        order_id: str,
+        symbol_id: int,
+        client_order_id: Optional[str],
+        side: Optional[str],
+        type_: Optional[str],
+        reduce_only: Optional[bool],
+        price: Optional[float],
+        qty: Optional[float],
+        filled_qty: Optional[float],
+        status: Optional[str],
+        ts_ms: Optional[int],
+        raw_json_obj: Dict[str, Any],
+        avg_price: Optional[float],
+        source: str = "ws_user",
+    ) -> None:
+        strategy_id = "unknown"
+        pos_uid = None
+        if client_order_id:
+            # Prefer metadata from existing real orders with the same client_order_id (common when one client id
+            # is reused across multiple exchange orders).
+            r = _db_fetch_one(
+                self._pool,
+                '''
+                SELECT strategy_id, pos_uid
+                FROM public.orders
+                WHERE exchange_id = %(ex)s AND account_id = %(ac)s
+                  AND client_order_id = %(coid)s
+                  AND btrim(order_id) <> ''
+                  AND (strategy_id IS NOT NULL AND strategy_id <> 'unknown'
+                       OR (pos_uid IS NOT NULL AND pos_uid <> ''))
+                ORDER BY updated_at DESC NULLS LAST
+                LIMIT 1
+                ''',
+                {"ex": self.exchange_id, "ac": self.account_id, "coid": client_order_id},
+            )
+            if r:
+                strategy_id = str(r.get("strategy_id") or "unknown")
+                pos_uid = r.get("pos_uid")
+            else:
+                # Fallback: if a placeholder exists, pick metadata from it.
+                r2 = _db_fetch_one(
+                    self._pool,
+                    '''
+                    SELECT strategy_id, pos_uid
+                    FROM public.orders
+                    WHERE exchange_id = %(ex)s AND account_id = %(ac)s
+                      AND (order_id IS NULL OR btrim(order_id) = '')
+                      AND client_order_id = %(coid)s
+                    LIMIT 1
+                    ''',
+                    {"ex": self.exchange_id, "ac": self.account_id, "coid": client_order_id},
+                )
+                if r2:
+                    strategy_id = str(r2.get("strategy_id") or "unknown")
+                    pos_uid = r2.get("pos_uid")
+
+        raw_json_text = json.dumps(raw_json_obj, ensure_ascii=False)
+
+        _db_exec(
+            self._pool,
+            '''
+            INSERT INTO public.orders(
+              exchange_id, account_id, order_id, symbol_id,
+              strategy_id, pos_uid, client_order_id,
+              side, type, reduce_only, price, qty, filled_qty,
+              status, created_at, updated_at, source, ts_ms, raw_json, avg_price
+            )
+            VALUES (
+              %(ex)s, %(ac)s, %(oid)s, %(sid)s,
+              %(strategy)s, %(pos_uid)s, %(coid)s,
+              %(side)s, %(typ)s, %(ro)s, %(price)s, %(qty)s, %(fqty)s,
+              %(st)s, now(), now(), %(src)s, %(ts_ms)s, %(raw)s::jsonb, %(avg_price)s
+            )
+            ON CONFLICT (exchange_id, account_id, order_id)
+            DO UPDATE SET
+              symbol_id = EXCLUDED.symbol_id,
+              strategy_id = COALESCE(NULLIF(EXCLUDED.strategy_id,'unknown'), public.orders.strategy_id),
+              pos_uid = COALESCE(EXCLUDED.pos_uid, public.orders.pos_uid),
+              client_order_id = COALESCE(EXCLUDED.client_order_id, public.orders.client_order_id),
+              side = COALESCE(EXCLUDED.side, public.orders.side),
+              type = COALESCE(EXCLUDED.type, public.orders.type),
+              reduce_only = COALESCE(EXCLUDED.reduce_only, public.orders.reduce_only),
+              price = COALESCE(EXCLUDED.price, public.orders.price),
+              qty = COALESCE(EXCLUDED.qty, public.orders.qty),
+              filled_qty = COALESCE(EXCLUDED.filled_qty, public.orders.filled_qty),
+              status = COALESCE(EXCLUDED.status, public.orders.status),
+              updated_at = now(),
+              ts_ms = COALESCE(EXCLUDED.ts_ms, public.orders.ts_ms),
+              raw_json = COALESCE(EXCLUDED.raw_json, public.orders.raw_json),
+              avg_price = COALESCE(EXCLUDED.avg_price, public.orders.avg_price)
+            ''',
+            {
+                "ex": self.exchange_id,
+                "ac": self.account_id,
+                "oid": order_id,
+                "sid": symbol_id,
+                "strategy": strategy_id or "unknown",
+                "pos_uid": pos_uid,
+                "coid": client_order_id,
+                "side": side,
+                "typ": type_,
+                "ro": reduce_only,
+                "price": price,
+                "qty": qty,
+                "fqty": filled_qty,
+                "st": status,
+                "src": source,
+                "ts_ms": int(ts_ms) if ts_ms is not None else None,
+                "raw": raw_json_text,
+                "avg_price": avg_price,
+            },
+        )
+
+        if client_order_id:
+            _db_exec(
+                self._pool,
+                '''
+                DELETE FROM public.orders
+                WHERE exchange_id = %(ex)s AND account_id = %(ac)s
+                  AND (order_id IS NULL OR btrim(order_id) = '')
+                  AND client_order_id = %(coid)s
+                ''',
+                {"ex": self.exchange_id, "ac": self.account_id, "coid": client_order_id},
+            )
+
+    def _merge_orphan_placeholders_once(self, *, limit: int = 50) -> int:
+        """Merge "placeholder" orders (order_id='') into real orders by client_order_id.
+
+        Strategy code may insert placeholders *after* Binance WS already created real orders.
+        In that case, the WS path can't delete/merge the placeholder retroactively.
+
+        This reconciler:
+          - finds placeholders for this account
+          - for each client_order_id, picks the most recently updated real order
+          - copies strategy_id/pos_uid onto the real order if missing/unknown
+          - deletes the placeholder rows
+        """
+
+        rows = _db_fetch_all(
+            self._pool,
+            '''
+            SELECT client_order_id, strategy_id, pos_uid
+            FROM public.orders
+            WHERE exchange_id = %(ex)s AND account_id = %(ac)s
+              AND (order_id IS NULL OR btrim(order_id) = '')
+              AND client_order_id IS NOT NULL
+            ORDER BY updated_at DESC NULLS LAST
+            LIMIT %(lim)s
+            ''',
+            {"ex": self.exchange_id, "ac": self.account_id, "lim": int(limit)},
+        )
+        if not rows:
+            return 0
+
+        merged = 0
+        for r in rows:
+            coid = str(r.get("client_order_id") or "").strip()
+            if not coid:
+                continue
+
+            real = _db_fetch_one(
+                self._pool,
+                '''
+                SELECT order_id
+                FROM public.orders
+                WHERE exchange_id = %(ex)s AND account_id = %(ac)s
+                  AND client_order_id = %(coid)s
+                  AND btrim(order_id) <> ''
+                ORDER BY updated_at DESC NULLS LAST
+                LIMIT 1
+                ''',
+                {"ex": self.exchange_id, "ac": self.account_id, "coid": coid},
+            )
+            if not real:
+                continue
+
+            real_oid = str(real.get("order_id") or "").strip()
+            if not real_oid:
+                continue
+
+            ph_strategy = r.get("strategy_id")
+            ph_pos_uid = r.get("pos_uid")
+
+            _db_exec(
+                self._pool,
+                '''
+                UPDATE public.orders
+                SET
+                  strategy_id = CASE
+                    WHEN public.orders.strategy_id IS NULL OR public.orders.strategy_id = 'unknown'
+                      THEN %(strategy)s
+                    ELSE public.orders.strategy_id
+                  END,
+                  pos_uid = COALESCE(public.orders.pos_uid, %(pos_uid)s),
+                  updated_at = now()
+                WHERE exchange_id = %(ex)s AND account_id = %(ac)s AND order_id = %(oid)s
+                ''',
+                {
+                    "ex": self.exchange_id,
+                    "ac": self.account_id,
+                    "oid": real_oid,
+                    "strategy": ph_strategy or "unknown",
+                    "pos_uid": ph_pos_uid,
+                },
+            )
+
+            _db_exec(
+                self._pool,
+                '''
+                DELETE FROM public.orders
+                WHERE exchange_id = %(ex)s AND account_id = %(ac)s
+                  AND (order_id IS NULL OR btrim(order_id) = '')
+                  AND client_order_id = %(coid)s
+                ''',
+                {"ex": self.exchange_id, "ac": self.account_id, "coid": coid},
+            )
+            merged += 1
+
+        if merged:
+            log.info("[merge] merged %s placeholder order(s)", merged)
+        return merged
+
+
+    def _propagate_order_meta_once(self) -> None:
+        """Propagate strategy_id/pos_uid across orders that share the same client_order_id.
+
+        Some strategies reuse a client_order_id for a chain of orders. In that case we want every related order row
+        to have the same strategy_id/pos_uid once any of them has it.
+        """
+        _db_exec(
+            self._pool,
+            '''
+            UPDATE public.orders o
+            SET
+              strategy_id = COALESCE(NULLIF(o.strategy_id,'unknown'), src.strategy_id),
+              pos_uid     = COALESCE(NULLIF(o.pos_uid,''), src.pos_uid),
+              updated_at  = now()
+            FROM (
+              SELECT client_order_id,
+                     max(strategy_id) FILTER (WHERE strategy_id IS NOT NULL AND strategy_id <> 'unknown') AS strategy_id,
+                     max(pos_uid)      FILTER (WHERE pos_uid IS NOT NULL AND pos_uid <> '')              AS pos_uid
+              FROM public.orders
+              WHERE exchange_id = %(ex)s AND account_id = %(ac)s
+                AND client_order_id IS NOT NULL AND client_order_id <> ''
+              GROUP BY client_order_id
+            ) src
+            WHERE o.exchange_id = %(ex)s AND o.account_id = %(ac)s
+              AND o.client_order_id = src.client_order_id
+              AND (o.strategy_id IS NULL OR o.strategy_id = 'unknown' OR o.pos_uid IS NULL OR o.pos_uid = '')
+              AND (src.strategy_id IS NOT NULL OR src.pos_uid IS NOT NULL)
+            ''',
+            {"ex": self.exchange_id, "ac": self.account_id},
+        )
+
+        # If an order originates from the exchange UI / API without strategy tagging,
+        # it often has a client_order_id starting with 'web_'. Mark those as 'exchange'
+        # instead of leaving them as 'unknown' so dashboards are cleaner.
+        _db_exec(
+            self._pool,
+            '''
+            UPDATE public.orders
+            SET strategy_id = 'exchange', updated_at = now()
+            WHERE exchange_id = %(ex)s AND account_id = %(ac)s
+              AND client_order_id LIKE %(web_pattern)s ESCAPE '\\'
+              AND (strategy_id IS NULL OR strategy_id = 'unknown')
+            ''',
+            {"ex": self.exchange_id, "ac": self.account_id, "web_pattern": r"web\_%"},
+        )
+
+
+    def _insert_fill(
+        self,
+        *,
+        fill_uid: str,
+        symbol_id: int,
+        order_id: Optional[str],
+        trade_id: Optional[str],
+        client_order_id: Optional[str],
+        price: Optional[float],
+        qty: Optional[float],
+        realized_pnl: Optional[float],
+        ts_ms: int,
+        source: str = "ws_user",
+    ) -> None:
+        ts = datetime.fromtimestamp(int(ts_ms) / 1000.0, tz=timezone.utc)
+        _db_exec(
+            self._pool,
+            '''
+            INSERT INTO public.order_fills(
+              exchange_id, account_id, fill_uid, symbol_id,
+              order_id, trade_id, client_order_id,
+              price, qty, realized_pnl, ts, source
+            )
+            VALUES (
+              %(ex)s, %(ac)s, %(uid)s, %(sid)s,
+              %(oid)s, %(tid)s, %(coid)s,
+              %(price)s, %(qty)s, %(rpnl)s, %(ts)s, %(src)s
+            )
+            ON CONFLICT (exchange_id, account_id, fill_uid)
+            DO NOTHING
+            ''',
+            {
+                "ex": self.exchange_id,
+                "ac": self.account_id,
+                "uid": fill_uid,
+                "sid": symbol_id,
+                "oid": order_id,
+                "tid": trade_id,
+                "coid": client_order_id,
+                "price": price,
+                "qty": qty,
+                "rpnl": realized_pnl,
+                "ts": ts,
+                "src": source,
+            },
+        )
+
+    def _on_ws_order_trade_update(self, obj: Dict[str, Any]) -> None:
+        try:
+            o = obj.get("o") or {}
+            symbol = o.get("s")
+            if not symbol:
+                return
+            symbol_id = self._ensure_symbol_id(str(symbol))
+
+            order_id = str(o.get("i") or "").strip()
+            client_order_id = str(o.get("c") or "").strip() or None
+
+            status = str(o.get("X") or "").strip()
+            side = str(o.get("S") or "").strip() or None
+            type_ = str(o.get("o") or "").strip() or None
+            reduce_only = o.get("R")
+            if reduce_only is not None:
+                reduce_only = bool(reduce_only)
+
+            price = _safe_float(o.get("p"))
+            if price is not None and abs(price) < 1e-18:
+                price = None
+            qty = _safe_float(o.get("q"))
+            filled_qty = _safe_float(o.get("z"))
+            avg_price = _safe_float(o.get("ap"))
+
+            ts_ms = o.get("T") or obj.get("E") or obj.get("T")
+            if ts_ms is None:
+                ts_ms = int(time.time() * 1000)
+
+            if order_id:
+                self._insert_order_event(
+                    order_id=order_id,
+                    symbol_id=symbol_id,
+                    client_order_id=client_order_id,
+                    status=status or "UNKNOWN",
+                    side=side,
+                    type_=type_,
+                    reduce_only=reduce_only,
+                    price=price,
+                    qty=qty,
+                    filled_qty=filled_qty if filled_qty is not None else 0.0,
+                    ts_ms=int(ts_ms),
+                    raw_json_text=json.dumps(obj, ensure_ascii=False),
+                )
+
+                self._upsert_order(
+                    order_id=order_id,
+                    symbol_id=symbol_id,
+                    client_order_id=client_order_id,
+                    side=side,
+                    type_=type_,
+                    reduce_only=reduce_only,
+                    price=price,
+                    qty=qty,
+                    filled_qty=filled_qty,
+                    status=status or None,
+                    ts_ms=int(ts_ms) if ts_ms is not None else None,
+                    raw_json_obj=obj,
+                    avg_price=avg_price,
+                )
+
+            exec_type = str(o.get("x") or "").strip()
+            if exec_type == "TRADE" and order_id:
+                trade_id = str(o.get("t") or "").strip() or None
+                if trade_id:
+                    last_qty = _safe_float(o.get("l"))
+                    last_price = _safe_float(o.get("L"))
+                    realized_pnl = _safe_float(o.get("rp"))
+                    # OMS invariant: fill_uid == trade_id
+                    self._insert_fill(
+                        fill_uid=str(trade_id),
+                        symbol_id=symbol_id,
+                        order_id=order_id,
+                        trade_id=str(trade_id),
+                        client_order_id=client_order_id,
+                        price=last_price,
+                        qty=last_qty,
+                        realized_pnl=realized_pnl,
+                        ts_ms=int(ts_ms),
+                    )
+
+
+        except Exception as e:
+            log.warning("[BINANCE WS] order/trade parse/write failed: %s", e, exc_info=True)
     # ---- main loop
 
     def run(self) -> None:
@@ -711,8 +1729,32 @@ class AccountBalanceWriter:
         heartbeat_sec = max(0.0, float(getattr(self.cfg, "rest_heartbeat_sec", 60.0) or 0.0))
         debug = os.getenv("DEBUG_BALANCE_WRITER", "0") == "1"
 
+        # placeholder merge cadence (helps when strategy inserts placeholders after WS already has real orders)
+        merge_every_sec = float(os.getenv("MERGE_PLACEHOLDERS_EVERY_SEC", "60") or 60)
+        next_merge = time.time() + 5.0
+
+        # propagate strategy_id/pos_uid across same client_order_id
+        propagate_every_sec = float(os.getenv("PROPAGATE_ORDER_META_EVERY_SEC", "60") or 60)
+        next_propagate = time.time() + 10.0
+
+        # periodic REST reconcile for order statuses (WS gap protection)
+        reconcile_every_sec = float(os.getenv("RECONCILE_ORDERS_EVERY_SEC", "300") or 300)
+        next_reconcile = time.time() + 15.0
+
+
         if mode in ("ws", "hybrid"):
-            self._ws = BinanceFuturesUserStream(self._rest, self.cfg.asset, self._on_ws_account_update)
+            # REST bootstrap first: seed orders/fills so DB is consistent before WS updates
+            self._bootstrap_rest_orders_and_fills()
+            # Also reconcile any placeholders against already-known real orders.
+            try:
+                self._merge_orphan_placeholders_once(limit=200)
+            except Exception:
+                log.warning("[merge] placeholder reconcile failed", exc_info=True)
+            try:
+                self._propagate_order_meta_once()
+            except Exception:
+                log.warning("[meta] propagate failed", exc_info=True)
+            self._ws = BinanceFuturesUserStream(self._rest, self.cfg.asset, self._on_ws_account_update, self._on_ws_order_trade_update)
             self._ws.start()
 
         # For "ws": write when events arrive; do occasional REST heartbeat to refresh available balance.
@@ -751,6 +1793,31 @@ class AccountBalanceWriter:
                         log.info("[debug] heartbeat REST: refresh avail (%s)", self.cfg.asset)
                     self._rest_fetch(cache_only=True)
                     next_rest = time.time() + heartbeat_sec if heartbeat_sec > 0 else time.time() + poll_sec
+
+                # Periodically reconcile placeholders even in WS mode.
+                if merge_every_sec > 0 and time.time() >= next_merge:
+                    try:
+                        self._merge_orphan_placeholders_once(limit=200)
+                    except Exception:
+                        log.warning("[merge] placeholder reconcile failed", exc_info=True)
+                    next_merge = time.time() + merge_every_sec
+
+                # Propagate strategy_id/pos_uid across orders sharing client_order_id.
+                if propagate_every_sec > 0 and time.time() >= next_propagate:
+                    try:
+                        self._propagate_order_meta_once()
+                    except Exception:
+                        log.warning("[meta] propagate failed", exc_info=True)
+                    next_propagate = time.time() + propagate_every_sec
+
+                # Periodic REST reconcile for orders (WS gap protection).
+                if reconcile_every_sec > 0 and time.time() >= next_reconcile:
+                    try:
+                        self._reconcile_orders_rest_once()
+                    except Exception:
+                        log.warning("[RECONCILE] failed", exc_info=True)
+                    next_reconcile = time.time() + reconcile_every_sec
+
 
                 # write-heartbeat: persist cached state even if WS is quiet
                 if (self.cfg.write_heartbeat_sec and self.cfg.write_heartbeat_sec > 0) and time.time() >= next_write:

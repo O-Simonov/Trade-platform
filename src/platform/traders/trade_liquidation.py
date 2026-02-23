@@ -26,6 +26,9 @@ from src.platform.data.storage.postgres.storage import PostgreSQLStorage
 
 log = logging.getLogger("traders.trade_liquidation")
 
+# Match averaging add order ids: ..._ADD1, ..._ADD2, ...
+_ADD_RE = re.compile(r"_ADD(\d+)$", re.IGNORECASE)
+
 
 # ==============================================================
 # Small utils
@@ -980,6 +983,10 @@ class TradeLiquidation:
         # cycle counter (used for reconcile/recovery throttling)
         self._cycle_n = 0
 
+        # Runtime caches
+        #   pos_uid -> last avg_price that TP/TRAIL were anchored to
+        self._avg_anchor_cache: Dict[str, float] = {}
+
         # cached symbol map (symbol_id -> symbol)
         self._symbols_cache: Optional[Dict[int, str]] = None
         self._symbols_cache_ts: Optional[datetime] = None
@@ -1402,6 +1409,22 @@ class TradeLiquidation:
                 log.debug("[trade_liquidation] backfill_closed_exit_pnl failed", exc_info=True)
 
         open_positions = self._get_open_positions()
+
+        # LIVE: averaging adds maintenance.
+        # Ensure we have the next ADD order queued, but never exceed max_adds.
+        # We place at most ONE missing ADD per cycle to avoid spamming Binance endpoints.
+        if self._is_live and bool(getattr(self.p, "averaging_enabled", False)) and self._cfg_max_adds() > 0:
+            try:
+                placed_any = False
+                for p in open_positions or []:
+                    if self._live_ensure_next_add_order(pos=p):
+                        placed_any = True
+                        break
+                if placed_any:
+                    # refresh snapshot next cycle; current cycle continues
+                    pass
+            except Exception:
+                log.debug("[trade_liquidation][LIVE][AVG] ensure_next_add failed", exc_info=True)
         self._dlog(
             "cycle start: open_positions=%d/%d | signal_tf=%s | sl_mode=%s tp_mode=%s | trailing=%s | avg=%s levels=%s | canceled_leftovers=%d",
             len(open_positions),
@@ -1977,7 +2000,7 @@ class TradeLiquidation:
                 # Defer STOP_MARKET SL until last averaging add (if enabled)
                 defer_sl = bool(getattr(self.p, "defer_stop_loss_until_last_add", False))
                 avg_enabled = bool(getattr(self.p, "averaging_enabled", False))
-                cfg_max_adds = int(getattr(self.p, "averaging_max_adds", 0) or 0)
+                cfg_max_adds = int(self._cfg_max_adds() or 0)
                 allow_place_sl = True
                 if avg_enabled and defer_sl and cfg_max_adds > 0:
                     try:
@@ -2350,7 +2373,7 @@ class TradeLiquidation:
             add_price = _round_to_step(add_price, tick, rounding=("floor" if add_side == "BUY" else "ceiling"))
 
         # Qty sizing: default = position qty / max_adds, unless averaging_add_qty_pct is specified
-        max_adds = int(getattr(self.p, "averaging_max_adds", 1) or 1)
+        max_adds = int(self._cfg_max_adds() or 1)
         add_qty_pct = Decimal(str(getattr(self.p, "averaging_add_qty_pct", 0) or 0))
         if add_qty_pct > 0:
             add_qty = pos_qty * (add_qty_pct / Decimal("100"))
@@ -2432,6 +2455,412 @@ class TradeLiquidation:
             pass
 
         log.info("[trade_liquidation][RECOVERY] placed missing ADD1 %s %s pos_uid=%s price=%s qty=%s", sym_u, side, pos_uid, add_price, add_qty)
+
+    # ----------------------------------------------------------
+    # LIVE: Averaging (scale-in) helpers
+    # ----------------------------------------------------------
+
+    def _cfg_max_adds(self) -> int:
+        """Read max additions from config with backward-compatible keys.
+
+        Supported keys:
+          - averaging_max_additions (new)
+          - averaging_max_adds      (legacy)
+        """
+        try:
+            v = getattr(self.p, "averaging_max_additions", None)
+            if v is None:
+                v = getattr(self.p, "averaging_max_adds", None)
+            if v is None:
+                # some old configs used 'averaging_max_adds' under extras
+                v = getattr(self.p, "avg_max_adds", None)
+            n = int(v or 0)
+            return max(0, n)
+        except Exception:
+            return 0
+
+    def _parse_add_n(self, client_id: str) -> int:
+        """Extract ADD number from client_order_id (.._ADD1/.._ADD2..)."""
+        try:
+            m = _ADD_RE.search(str(client_id or ""))
+            if not m:
+                return 0
+            return max(0, int(m.group(1)))
+        except Exception:
+            return 0
+
+    def _live_refresh_scale_in_count(self, *, pos_uid: str, prefix: str, tok: str) -> int:
+        """Best-effort compute how many averaging adds were actually FILLED and store into ledger.
+
+        We consider a scale-in 'done' when there is at least one fill for an ADD order.
+        This protects against double-counting and ensures we never exceed the configured cap.
+        """
+        if not self._is_live:
+            return 0
+
+        # Pull latest filled ADD orders for this pos_uid.
+        q = """
+        SELECT o.client_order_id
+        FROM public.order_fills f
+        JOIN public.orders o
+          ON o.exchange_id = f.exchange_id
+         AND o.account_id  = f.account_id
+         AND o.order_id    = f.order_id
+        WHERE o.exchange_id=%(ex)s
+          AND o.account_id=%(acc)s
+          AND o.pos_uid=%(pos_uid)s
+          AND o.strategy_id=%(sid)s
+          AND o.client_order_id LIKE %(like)s
+        ORDER BY f.ts DESC
+        LIMIT 500;
+        """
+        like = f"{prefix}_{tok}_ADD%"
+        rows = list(
+            self.store.query_dict(
+                q,
+                {
+                    "ex": int(self.exchange_id),
+                    "acc": int(self.account_id),
+                    "pos_uid": str(pos_uid),
+                    "sid": self.STRATEGY_ID,
+                    "like": like,
+                },
+            )
+        )
+
+        done: set[int] = set()
+        for r in rows:
+            n = self._parse_add_n(str(r.get("client_order_id") or ""))
+            if n > 0:
+                done.add(n)
+
+        # Use MAX(ADDn) instead of COUNT(DISTINCT), because some exchanges/strategies may
+        # skip numbers after restarts. MAX is a safer "how far did we already scale in".
+        adds_done = max(done) if done else 0
+        try:
+            self.store.execute(
+                """
+                UPDATE public.position_ledger
+                SET scale_in_count = GREATEST(COALESCE(scale_in_count,0), %(n)s),
+                    updated_at = now()
+                WHERE exchange_id=%(ex)s AND account_id=%(acc)s AND pos_uid=%(pos_uid)s
+                  AND status='OPEN' AND source='live' AND strategy_id=%(sid)s;
+                """,
+                {
+                    "ex": int(self.exchange_id),
+                    "acc": int(self.account_id),
+                    "pos_uid": str(pos_uid),
+                    "sid": self.STRATEGY_ID,
+                    "n": int(adds_done),
+                },
+            )
+        except Exception:
+            # non-fatal
+            pass
+
+        return int(adds_done)
+
+    def _live_ensure_next_add_order(self, *, pos: dict) -> bool:
+        """Ensure the *next* averaging add order exists (LIVE).
+
+        Rules:
+          - Never place more than cfg_max_adds.
+          - Place only one missing order per cycle (reduces spam).
+          - Add levels are derived from avg_price with a minimum distance percentage.
+        """
+        if not self._is_live or self._binance is None:
+            return False
+
+        if not bool(getattr(self.p, "averaging_enabled", False)):
+            return False
+
+        max_adds = self._cfg_max_adds()
+        if max_adds <= 0:
+            return False
+
+        sym = str(pos.get("symbol") or "").upper()
+        if not sym:
+            return False
+
+        side = str(pos.get("side") or "").upper()  # LONG/SHORT
+        pos_uid = str(pos.get("pos_uid") or "")
+        if not pos_uid:
+            return False
+
+        prefix = _sanitize_coid_prefix(str(getattr(self.p, "client_order_prefix", "TL") or "TL"))
+        tok = _coid_token(pos_uid)
+
+        # Refresh adds_done from real fills (avoids over-adding after restart)
+        adds_done = self._live_refresh_scale_in_count(pos_uid=pos_uid, prefix=prefix, tok=tok)
+        # Ledger snapshot may already have something
+        try:
+            adds_done = max(adds_done, int(pos.get("scale_in_count", 0) or 0))
+        except Exception:
+            pass
+
+        next_n = int(adds_done) + 1
+        if next_n > max_adds:
+            return False
+
+        # Check open ADD orders (openOrders/openAlgoOrders).
+        # IMPORTANT: we must not spam multiple ADDs at once.
+        want_cid = f"{prefix}_{tok}_ADD{next_n}"
+        open_all = self._rest_snapshot_get("open_orders_all") or []
+        open_algos = self._rest_snapshot_get("open_algo_orders_all") or []
+
+        def _iter_open_adds() -> list[dict[str, Any]]:
+            out: list[dict[str, Any]] = []
+            # Regular openOrders
+            for oo in open_all if isinstance(open_all, list) else []:
+                try:
+                    if str(oo.get("symbol") or "").upper() != sym:
+                        continue
+                    cid = str(oo.get("clientOrderId") or "")
+                    if not cid.startswith(f"{prefix}_{tok}_ADD"):
+                        continue
+                    out.append({
+                        "kind": "order",
+                        "cid": cid,
+                        "id": str(oo.get("orderId") or ""),
+                        "add_n": self._parse_add_n(cid),
+                    })
+                except Exception:
+                    continue
+            # Conditional openAlgoOrders
+            for ao in open_algos if isinstance(open_algos, list) else []:
+                try:
+                    if str(ao.get("symbol") or "").upper() != sym:
+                        continue
+                    cid = str(ao.get("clientAlgoId") or "")
+                    if not cid.startswith(f"{prefix}_{tok}_ADD"):
+                        continue
+                    out.append({
+                        "kind": "algo",
+                        "cid": cid,
+                        "id": str(ao.get("algoId") or ""),
+                        "add_n": self._parse_add_n(cid),
+                    })
+                except Exception:
+                    continue
+            return out
+
+        def _cancel_open_add(a: dict[str, Any]) -> bool:
+            """Best-effort cancel one open ADD (regular or algo) by client id."""
+            cid = str(a.get("cid") or "")
+            if not cid:
+                return False
+            try:
+                if str(a.get("kind")) == "algo":
+                    self._binance.cancel_algo_order(symbol=sym, clientAlgoId=cid)
+                else:
+                    self._binance.cancel_order(symbol=sym, origClientOrderId=cid)
+                return True
+            except Exception:
+                return False
+
+        # 1) Cleanup: if we already have FILLED adds_done, any older open ADD1/ADD2... that is <= adds_done
+        # should be canceled (stale orders after restart / duplicated placement).
+        open_adds = _iter_open_adds()
+
+        # Drop obviously invalid numbers
+        open_adds = [a for a in open_adds if int(a.get("add_n") or 0) > 0]
+
+        # Cancel obsolete (<= adds_done) and out-of-range (> max_adds) orders.
+        canceled_any = False
+        for a in list(open_adds):
+            n = int(a.get("add_n") or 0)
+            if n <= int(adds_done) or n > int(max_adds):
+                if _cancel_open_add(a):
+                    canceled_any = True
+                    log.info("[trade_liquidation][LIVE][AVG] canceled stale ADD%d %s (pos_uid=%s)", n, sym, pos_uid)
+
+        # Cancel duplicates for the same ADDn (keep only the newest by numeric id).
+        # This is rare, but protects from accidental double placement.
+        if open_adds:
+            by_n: dict[int, list[dict[str, Any]]] = {}
+            for a in open_adds:
+                by_n.setdefault(int(a.get("add_n") or 0), []).append(a)
+            for n, items in by_n.items():
+                if len(items) <= 1:
+                    continue
+                # keep max numeric id
+                def _id_num(x: dict[str, Any]) -> int:
+                    try:
+                        return int(str(x.get("id") or "0"))
+                    except Exception:
+                        return 0
+                items_sorted = sorted(items, key=_id_num, reverse=True)
+                for extra in items_sorted[1:]:
+                    if _cancel_open_add(extra):
+                        canceled_any = True
+                        log.info("[trade_liquidation][LIVE][AVG] canceled duplicate ADD%d %s (pos_uid=%s)", int(n), sym, pos_uid)
+
+        if canceled_any:
+            # Snapshot will refresh next cycle; avoid placing a new ADD in the same cycle.
+            return False
+
+        # Re-check open adds after cleanup.
+        open_adds = _iter_open_adds()
+        open_adds = [a for a in open_adds if int(a.get("add_n") or 0) > 0]
+
+        # If any ADD is still open that is NOT the desired next one, do not place a new one.
+        # This enforces: at most one active ADD per position.
+        for a in open_adds:
+            if str(a.get("cid") or "") != want_cid:
+                return False
+
+        # If the next ADD is already open, we're done.
+        for a in open_adds:
+            if str(a.get("cid") or "") == want_cid:
+                return False
+
+        # Respect cooldown between additions
+        cd_min = float(getattr(self.p, "averaging_cooldown_minutes", 0) or 0)
+        if cd_min > 0:
+            try:
+                meta = pos.get("raw_meta") if isinstance(pos.get("raw_meta"), dict) else None
+                last_add_ts = None
+                if isinstance(meta, dict):
+                    last_add_ts = meta.get("last_add_at")
+                # We also store last_add_at in paper_position_risk, but for LIVE best-effort.
+                if isinstance(last_add_ts, datetime):
+                    age_min = (_utc_now() - last_add_ts.astimezone(timezone.utc)).total_seconds() / 60.0
+                    if 0 <= age_min < cd_min:
+                        return False
+            except Exception:
+                pass
+
+        # Re-anchor TP/TRAIL when avg changes after an add fill
+        avg_price = _dec(pos.get("avg_price") or pos.get("entry_price") or 0)
+        if avg_price <= 0:
+            return False
+        try:
+            self._live_reanchor_tp_and_trailing_after_avg_change(pos, float(avg_price))
+        except Exception:
+            pass
+
+        # Compute next averaging level with "min distance" rule.
+        # Reference: entry for 1st add, avg after that.
+        min_dist_pct = float(getattr(self.p, "averaging_min_level_distance_pct", 15.0) or 15.0)
+        ref_price = _dec(pos.get("entry_price") or 0) if int(adds_done) == 0 else avg_price
+        if ref_price <= 0:
+            ref_price = avg_price
+
+        add_side = "BUY" if side == "LONG" else "SELL"
+
+        picked: Optional[float] = None
+        try:
+            sid = int(pos.get("symbol_id") or 0)
+            if sid > 0:
+                picked = self._pick_averaging_price_from_candles(
+                    symbol_id=sid,
+                    side=side,
+                    ref_price=float(ref_price),
+                    min_dist_pct=min_dist_pct,
+                    level_index=next_n,
+                )
+        except Exception:
+            picked = None
+
+        if picked is not None and picked > 0:
+            level = _dec(str(picked))
+        else:
+            # fallback spacing from reference
+            pct = _dec(str(min_dist_pct)) / _dec("100")
+            if pct <= 0:
+                pct = _dec("0.10")
+            if side == "LONG":
+                level = ref_price * (_dec("1") - pct * _dec(str(next_n)))
+            else:
+                level = ref_price * (_dec("1") + pct * _dec(str(next_n)))
+
+        tick = self._price_tick_for_symbol(sym) or _dec("0")
+        if tick and tick > 0:
+            level = _round_to_step(level, tick, rounding=("floor" if add_side == "BUY" else "ceiling"))
+
+        # Ensure trigger is not immediate wrt mark price
+        mark = _dec("0")
+        try:
+            pr = self._rest_snapshot_get("position_risk") or []
+            for r in pr if isinstance(pr, list) else []:
+                if str(r.get("symbol") or "").upper() == sym and str(r.get("positionSide") or "").upper() == side:
+                    mark = _dec(r.get("markPrice") or 0)
+                    break
+        except Exception:
+            mark = _dec("0")
+
+        if mark > 0 and tick and tick > 0:
+            if add_side == "BUY" and level >= mark:
+                level = mark - tick
+            if add_side == "SELL" and level <= mark:
+                level = mark + tick
+
+        # Qty sizing
+        qty_step = _dec(self._qty_step_for_symbol(sym) or "0")
+        pos_qty = _dec(pos.get("qty_current") or pos.get("qty_opened") or 0)
+        if pos_qty <= 0:
+            return False
+
+        add_pct = _dec(str(getattr(self.p, "averaging_add_pct_of_position", 35.0) or 35.0)) / _dec("100")
+        add_qty = pos_qty * add_pct
+        if add_qty <= 0:
+            return False
+        if qty_step and qty_step > 0:
+            add_qty = _round_qty_to_step(add_qty, qty_step, mode="down")
+        if add_qty <= 0:
+            return False
+
+        hedge_mode = bool(getattr(self.p, "hedge_enabled", False))
+        position_side = side if hedge_mode else None
+
+        # Place conditional MARKET add
+        params = dict(
+            symbol=sym,
+            side=add_side,
+            type="TAKE_PROFIT_MARKET",
+            stopPrice=float(level),
+            quantity=float(add_qty),
+            workingType=str(getattr(self.p, "working_type", "MARK_PRICE")),
+            priceProtect=True,
+            newClientOrderId=want_cid,
+            positionSide=position_side,
+        )
+
+        try:
+            resp = self._binance.new_order(**params)
+        except Exception as e:
+            log.warning("[trade_liquidation][LIVE][AVG] failed to place ADD%d for %s: %s", int(next_n), sym, e)
+            return False
+
+        # Shadow
+        try:
+            if isinstance(resp, dict):
+                self._upsert_order_shadow(
+                    pos_uid=pos_uid,
+                    order_id=str(resp.get("orderId") or resp.get("order_id") or resp.get("algoId") or ""),
+                    client_order_id=want_cid,
+                    symbol_id=int(pos.get("symbol_id") or 0),
+                    side=add_side,
+                    order_type=str(resp.get("type") or "TAKE_PROFIT_MARKET"),
+                    qty=float(add_qty),
+                    price=float(level),
+                    reduce_only=False,
+                    status=str(resp.get("status") or "NEW"),
+                )
+        except Exception:
+            pass
+
+        log.info(
+            "[trade_liquidation][LIVE][AVG] placed ADD%d %s %s stop=%.8f qty=%.8f (adds_done=%d/%d)",
+            int(next_n),
+            sym,
+            add_side,
+            float(level),
+            float(add_qty),
+            int(adds_done),
+            int(max_adds),
+        )
+        return True
 
     # ----------------------------------------------------------
     # LIVE: cleanup leftover SL/TP based on order-events/fills
@@ -4747,7 +5176,7 @@ class TradeLiquidation:
         try:
             # If averaging (scale-in) is enabled and we defer SL until the last add,
             # do NOT place STOP_MARKET SL on initial entry. Trailing (if enabled) is handled separately.
-            avg_enabled = bool(getattr(self.p, "averaging_enabled", False)) and int(getattr(self.p, "averaging_max_adds", 0) or 0) > 0
+            avg_enabled = bool(getattr(self.p, "averaging_enabled", False)) and int(self._cfg_max_adds() or 0) > 0
             defer_sl = bool(getattr(self.p, "defer_stop_loss_until_last_add", False))
             if bool(getattr(self.p, "enable_stop_loss", True)) and (not (avg_enabled and defer_sl)):
                 sl_resp = _place_sl()
@@ -4794,7 +5223,7 @@ class TradeLiquidation:
         # 3.5) Averaging add (conditional MARKET) right after entry (if enabled)
         add_resp: Optional[dict] = None
         try:
-            if bool(getattr(self.p, "averaging_enabled", False)) and int(getattr(self.p, "averaging_max_adds", 0) or 0) > 0:
+            if bool(getattr(self.p, "averaging_enabled", False)) and int(self._cfg_max_adds() or 0) > 0:
                 mult = float(getattr(self.p, "averaging_add_position_multiplier", 1.0) or 1.0)
                 if mult > 1.0:
                     # pick a significant level from candles (support/resistance)
@@ -4803,7 +5232,7 @@ class TradeLiquidation:
                     left = int(getattr(self.p, "averaging_pivot_left", 3) or 3)
                     right = int(getattr(self.p, "averaging_pivot_right", 3) or 3)
                     tol_pct = float(getattr(self.p, "averaging_level_tolerance_pct", 0.15) or 0.15)
-                    min_dist_pct = float(getattr(self.p, "averaging_min_level_distance_pct", 5.0) or 5.0)
+                    min_dist_pct = float(getattr(self.p, "averaging_min_level_distance_pct", 15.0) or 15.0)
                     dist_limit_pct = max(5.0, float(min_dist_pct))
 
                     # load candles

@@ -160,7 +160,7 @@ traders:
       # Trailing stop
       # ----------------------------
       trailing_enabled: true                         # Включить трейлинг
-      trailing_activation_pct: 3.0                   # Активация трейлинга после +X% в прибыль
+      trailing_activation_pct: 2.5                   # Активация трейлинга после +X% в прибыль
       trailing_trail_pct: 0.5                        # Дистанция трейла (%)
 
       # Safety буферы от markPrice (чтобы не ловить -2021)
@@ -268,7 +268,7 @@ traders:
       auto_recovery_enabled: true                     # Включить авто-восстановление
       recovery_place_sl: true                         # Пытаться восстановить SL
       recovery_place_tp: true                         # Пытаться восстановить TP
-      recovery_max_age_hours: 48                      # Восстанавливать позиции не старше N часов (по леджеру/метаданным)
+      recovery_max_age_hours: 168                     # Восстанавливать позиции не старше N часов (по леджеру/метаданным)
 
       # ----------------------------
       # Async REST (параллельные запросы к бирже)

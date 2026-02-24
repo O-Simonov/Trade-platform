@@ -1819,6 +1819,79 @@ class TradeLiquidation:
             )
         )
 
+        # --- Reconcile DB: if TP/TRL/SL were manually canceled on the exchange,
+        # the DB may still show them as NEW and the trader will think protection exists.
+        # We treat the exchange as source of truth and mark such stale DB rows as CANCELED.
+        try:
+            active_client_ids: set[str] = set()
+            # regular orders (openOrders): open_by_symbol already stores clientOrderId strings
+            for _ids in open_by_symbol.values():
+                try:
+                    active_client_ids.update(str(x) for x in (_ids or []) if x)
+                except Exception:
+                    pass
+
+            # conditional orders (openAlgoOrders): open_algo_by_symbol stores list[dict]
+            for _rows in open_algo_by_symbol.values():
+                try:
+                    for o in (_rows or []):
+                        if isinstance(o, dict):
+                            cid = o.get("clientAlgoId") or o.get("clientOrderId") or o.get("newClientOrderId")
+                            if cid:
+                                active_client_ids.add(str(cid))
+                        elif o:
+                            # if upstream ever stores ids directly
+                            active_client_ids.add(str(o))
+                except Exception:
+                    pass
+
+            pos_uids = [str(r.get("pos_uid")) for r in led if r.get("pos_uid")]
+            if pos_uids:
+                like_tp = r"TL\_%\_TP%"
+                like_trl = r"TL\_%\_TRL%"
+                like_sl = r"TL\_%\_SL%"
+
+                if active_client_ids:
+                    self.store.execute(
+                        '''
+                        UPDATE public.orders
+                           SET status = 'CANCELED',
+                               updated_at = NOW(),
+                               source = 'reconcile_exchange'
+                         WHERE strategy_id = 'trade_liquidation'
+                           AND pos_uid = ANY(%s)
+                           AND status IN ('NEW','PARTIALLY_FILLED')
+                           AND (
+                                 client_order_id LIKE %s ESCAPE '\\'
+                              OR client_order_id LIKE %s ESCAPE '\\'
+                              OR client_order_id LIKE %s ESCAPE '\\'
+                           )
+                           AND NOT (client_order_id = ANY(%s))
+                        ''',
+                        (pos_uids, like_tp, like_trl, like_sl, list(active_client_ids)),
+                    )
+                else:
+                    # No active TP/TRL/SL on exchange → cancel all DB-protective orders for these positions
+                    self.store.execute(
+                        '''
+                        UPDATE public.orders
+                           SET status = 'CANCELED',
+                               updated_at = NOW(),
+                               source = 'reconcile_exchange'
+                         WHERE strategy_id = 'trade_liquidation'
+                           AND pos_uid = ANY(%s)
+                           AND status IN ('NEW','PARTIALLY_FILLED')
+                           AND (
+                                 client_order_id LIKE %s ESCAPE '\\'
+                              OR client_order_id LIKE %s ESCAPE '\\'
+                              OR client_order_id LIKE %s ESCAPE '\\'
+                           )
+                        ''',
+                        (pos_uids, like_tp, like_trl, like_sl),
+                    )
+        except Exception:
+            log.exception("[TL][auto-recovery] reconcile stale TP/TRL/SL in DB failed")
+
         now = _utc_now()
         recovered = 0
 
@@ -4829,10 +4902,34 @@ class TradeLiquidation:
         reduce_only: bool,
         status: str = "NEW",
     ) -> None:
-        """Write/Update row in public.orders to link exchange orders with pos_uid/strategy_id."""
+        """Write/Update row in public.orders to link exchange orders with pos_uid/strategy_id.
+
+        Multi-account safe: first UPDATE by (exchange_id, account_id, client_order_id) for active status=NEW,
+        then INSERT; avoids unique violations on the partial unique index for active NEW orders.
+        """
         try:
             oid = str(order_id)
             sql = """
+            WITH upd AS (
+                UPDATE orders
+                SET
+                    order_id = %(oid)s,
+                    symbol_id = %(sym)s,
+                    side = %(side)s,
+                    type = %(type)s,
+                    status = %(status)s,
+                    qty = %(qty)s,
+                    price = %(price)s,
+                    reduce_only = %(reduce_only)s,
+                    strategy_id = %(strategy_id)s,
+                    pos_uid = %(pos_uid)s,
+                    updated_at = now()
+                WHERE exchange_id = %(ex)s
+                  AND account_id = %(acc)s
+                  AND client_order_id = %(coid)s
+                  AND status = 'NEW'
+                RETURNING 1
+            )
             INSERT INTO orders (
                 exchange_id, account_id, symbol_id,
                 order_id, client_order_id,
@@ -4842,7 +4939,7 @@ class TradeLiquidation:
                 strategy_id, pos_uid,
                 created_at, updated_at
             )
-            VALUES (
+            SELECT
                 %(ex)s, %(acc)s, %(sym)s,
                 %(oid)s, %(coid)s,
                 %(side)s, %(type)s, %(status)s,
@@ -4850,7 +4947,7 @@ class TradeLiquidation:
                 %(reduce_only)s,
                 %(strategy_id)s, %(pos_uid)s,
                 now(), now()
-            )
+            WHERE NOT EXISTS (SELECT 1 FROM upd)
             ON CONFLICT (exchange_id, account_id, order_id) DO UPDATE
             SET
                 client_order_id = EXCLUDED.client_order_id,

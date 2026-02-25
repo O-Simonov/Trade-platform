@@ -287,6 +287,24 @@ class TradeLiquidationParams:
     # hedge-mode (Binance Dual Side)
     hedge_enabled: bool = False  # true => positionSide LONG/SHORT
 
+    # Hedge (strategy): if enabled, SL is replaced by opening an opposite hedge position (market),
+    # validated by EMA(20) trend on 5m candles.
+    hedge_koff: float = 1.2  # hedge qty = abs(main_qty) * hedge_koff
+    hedge_ema_window: int = 20
+    hedge_ema_interval: str = "5m"
+    hedge_ema_confirm_bars: int = 3  # require N consecutive EMA moves
+    hedge_ema_min_slope_pct: float = 0.0  # minimal EMA slope (% per bar) to validate direction
+    hedge_ema_flip_slope_mult: float = 0.7  # close-on-flip uses min_slope * mult
+    hedge_cooldown_sec: int = 180  # cooldown between hedge open/close actions
+    hedge_close_on_level: bool = True  # close hedge near averaging significant level
+    hedge_close_on_ema_flip: bool = True  # close hedge if EMA trend flips against hedge
+    hedge_level_tolerance_pct: float = 0.10  # tolerance around computed level for closing hedge
+
+    hedge_reopen_enabled: bool = True
+    hedge_reopen_drawdown_pct: float = 0.0
+
+    all_P_L: float = 0.0  # close both positions when combined unrealized PnL >= this USDT
+
     # live cleanup (after closure by FILLED SL/TP via order-events/fills)
     client_order_id_prefix: str = "TL"
     live_cleanup_remaining_orders: bool = True
@@ -450,6 +468,19 @@ class TradeLiquidationParams:
         params["trailing_enabled"] = _as_bool(params.get("trailing_enabled", cls().trailing_enabled), cls().trailing_enabled)
         params["averaging_enabled"] = _as_bool(params.get("averaging_enabled", cls().averaging_enabled), cls().averaging_enabled)
         params["hedge_enabled"] = _as_bool(params.get("hedge_enabled", cls().hedge_enabled), cls().hedge_enabled)
+        params["hedge_koff"] = float(_as_float(params.get("hedge_koff", cls().hedge_koff), cls().hedge_koff) or cls().hedge_koff)
+        params["hedge_ema_window"] = int(_as_int(params.get("hedge_ema_window", cls().hedge_ema_window), cls().hedge_ema_window) or cls().hedge_ema_window)
+        params["hedge_ema_interval"] = str(params.get("hedge_ema_interval", cls().hedge_ema_interval) or cls().hedge_ema_interval)
+        params["hedge_ema_confirm_bars"] = int(_as_int(params.get("hedge_ema_confirm_bars", cls().hedge_ema_confirm_bars), cls().hedge_ema_confirm_bars) or cls().hedge_ema_confirm_bars)
+        params["hedge_ema_min_slope_pct"] = float(_as_float(params.get("hedge_ema_min_slope_pct", cls().hedge_ema_min_slope_pct), cls().hedge_ema_min_slope_pct) or cls().hedge_ema_min_slope_pct)
+        params["hedge_ema_flip_slope_mult"] = float(_as_float(params.get("hedge_ema_flip_slope_mult", cls().hedge_ema_flip_slope_mult), cls().hedge_ema_flip_slope_mult) or cls().hedge_ema_flip_slope_mult)
+        params["hedge_cooldown_sec"] = int(_as_int(params.get("hedge_cooldown_sec", cls().hedge_cooldown_sec), cls().hedge_cooldown_sec) or cls().hedge_cooldown_sec)
+        params["hedge_close_on_level"] = _as_bool(params.get("hedge_close_on_level", cls().hedge_close_on_level), cls().hedge_close_on_level)
+        params["hedge_close_on_ema_flip"] = _as_bool(params.get("hedge_close_on_ema_flip", cls().hedge_close_on_ema_flip), cls().hedge_close_on_ema_flip)
+        params["hedge_level_tolerance_pct"] = float(_as_float(params.get("hedge_level_tolerance_pct", cls().hedge_level_tolerance_pct), cls().hedge_level_tolerance_pct) or cls().hedge_level_tolerance_pct)
+        params["hedge_reopen_enabled"] = _as_bool(params.get("hedge_reopen_enabled", cls().hedge_reopen_enabled), cls().hedge_reopen_enabled)
+        params["hedge_reopen_drawdown_pct"] = float(_as_float(params.get("hedge_reopen_drawdown_pct", cls().hedge_reopen_drawdown_pct), cls().hedge_reopen_drawdown_pct) or cls().hedge_reopen_drawdown_pct)
+        params["all_P_L"] = float(_as_float(params.get("all_P_L", cls().all_P_L), cls().all_P_L) or cls().all_P_L)
         # accept hedge_mode too
         if "hedge_mode" in d and "hedge_enabled" not in d:
             params["hedge_enabled"] = _as_bool(d.get("hedge_mode"), cls().hedge_enabled)
@@ -1738,6 +1769,9 @@ class TradeLiquidation:
 
         max_age_h = float(getattr(self.p, "recovery_max_age_hours", 48) or 48)
         place_sl = bool(getattr(self.p, "recovery_place_sl", True))
+        # Hedge strategy: do not auto-place SL brackets (hedge replaces SL)
+        if bool(getattr(self.p, "hedge_enabled", False)):
+            place_sl = False
         place_tp = bool(getattr(self.p, "recovery_place_tp", True))
         hedge_mode = bool(getattr(self.p, "hedge_enabled", False))
 
@@ -2419,6 +2453,38 @@ class TradeLiquidation:
         tok = _coid_token(pos_uid)
         sym_u = (sym or "").upper()
 
+
+        # Respect max additions cap: if configured max_adds < 1, never place ADD1.
+        max_adds_cfg = int(self._cfg_max_adds() or 0)
+        if max_adds_cfg < 1:
+            return
+
+        # If ledger already indicates we reached the cap (e.g. ADD1 filled previously),
+        # do not place a new ADD1 during recovery.
+        try:
+            rows = list(
+                self.store.query_dict(
+                    """
+                    SELECT COALESCE(scale_in_count, 0) AS scale_in_count
+                    FROM position_ledger
+                    WHERE exchange_id=%(ex)s AND account_id=%(acc)s AND pos_uid=%(pos_uid)s
+                      AND status='OPEN' AND source='live' AND strategy_id=%(sid)s
+                    LIMIT 1;
+                    """,
+                    {
+                        "ex": int(self.exchange_id),
+                        "acc": int(self.account_id),
+                        "pos_uid": str(pos_uid),
+                        "sid": self.STRATEGY_ID,
+                    },
+                )
+            )
+            if rows and int(rows[0].get("scale_in_count") or 0) >= max_adds_cfg:
+                return
+        except Exception:
+            # best-effort, non-fatal
+            pass
+
         # If any ADD exists, do nothing
         for cid in (existing_client_ids or set()):
             if isinstance(cid, str) and (f"TL_{tok}_ADD" in cid):
@@ -2536,19 +2602,50 @@ class TradeLiquidation:
     def _cfg_max_adds(self) -> int:
         """Read max additions from config with backward-compatible keys.
 
-        Supported keys:
-          - averaging_max_additions (new)
-          - averaging_max_adds      (legacy)
+        IMPORTANT:
+          - Many configs still use `averaging_max_adds`.
+          - `averaging_max_additions` has a non-zero default in Params, so we must not
+            blindly prefer it when the legacy key is explicitly provided in config.
+        Supported keys (priority):
+          1) averaging_max_adds (legacy, if provided)
+          2) averaging_max_additions (new)
+          3) avg_max_adds (very old)
         """
         try:
-            v = getattr(self.p, "averaging_max_additions", None)
-            if v is None:
-                v = getattr(self.p, "averaging_max_adds", None)
-            if v is None:
-                # some old configs used 'averaging_max_adds' under extras
-                v = getattr(self.p, "avg_max_adds", None)
-            n = int(v or 0)
-            return max(0, n)
+            # If legacy key exists in config/extras, prefer it.
+            v_legacy = None
+            try:
+                v_legacy = getattr(self.p, "averaging_max_adds", None)
+            except Exception:
+                v_legacy = None
+
+            # New key (may be defaulted)
+            v_new = getattr(self.p, "averaging_max_additions", None)
+
+            # Heuristic: if legacy is set (not None) and differs from the new default value,
+            # treat legacy as the source of truth.
+            if v_legacy is not None:
+                try:
+                    n_legacy = int(v_legacy)
+                except Exception:
+                    n_legacy = 0
+                try:
+                    n_new = int(v_new) if v_new is not None else None
+                except Exception:
+                    n_new = None
+
+                # If user set legacy and new is missing OR equals Params default (2),
+                # prefer legacy.
+                if n_new is None or n_new == 2 or n_new != n_legacy:
+                    return max(0, int(n_legacy))
+
+            # Otherwise fall back to new key
+            if v_new is not None:
+                return max(0, int(v_new))
+
+            # Very old fallback
+            v_old = getattr(self.p, "avg_max_adds", None)
+            return max(0, int(v_old or 0))
         except Exception:
             return 0
 
@@ -4122,6 +4219,594 @@ class TradeLiquidation:
             return None
         return _safe_float(rows[0].get("close"), default=0.0)
 
+
+    # ----------------------------------------------------------
+    # Indicators helpers (EMA) + levels (used by Hedge mode)
+    # ----------------------------------------------------------
+
+    def _ema_direction(
+        self,
+        symbol_id: int,
+        *,
+        window: int = 20,
+        interval: str = "5m",
+        confirm_bars: int = 1,
+        min_slope_pct: float = 0.0,
+    ) -> Optional[str]:
+        """Return EMA direction: 'UP' | 'DOWN' | 'FLAT' | None.
+
+        Anti-chop knobs:
+        - confirm_bars: require N consecutive EMA moves in same direction.
+        - min_slope_pct: require last-step EMA slope (% of EMA) to be strong enough.
+
+        Uses candles table (close) for given interval.
+        """
+        try:
+            window = int(window)
+            if window < 2:
+                return None
+        except Exception:
+            return None
+
+        try:
+            confirm_bars = int(confirm_bars)
+        except Exception:
+            confirm_bars = 1
+        confirm_bars = max(1, confirm_bars)
+
+        try:
+            min_slope_pct = float(min_slope_pct or 0.0)
+        except Exception:
+            min_slope_pct = 0.0
+
+        q = """
+        SELECT close
+        FROM candles
+        WHERE exchange_id=%(ex)s AND symbol_id=%(sym)s AND interval=%(tf)s
+        ORDER BY open_time ASC
+        LIMIT %(n)s;
+        """
+        # take a bit more history to stabilize EMA
+        n = max(window * 4, window + 5)
+        rows = list(self.store.query_dict(q, {"ex": int(self.p.exchange_id), "sym": int(symbol_id), "tf": str(interval), "n": int(n)}))
+        closes = [float(r.get("close") or 0.0) for r in rows if float(r.get("close") or 0.0) > 0]
+        if len(closes) < window + 2:
+            return None
+
+        alpha = 2.0 / (float(window) + 1.0)
+        # init EMA with SMA(window)
+        ema = sum(closes[:window]) / float(window)
+
+        # keep last (confirm_bars + 1) EMA points for direction validation
+        keep = max(2, confirm_bars + 1)
+        ema_tail: List[float] = [float(ema)]
+
+        for c in closes[window:]:
+            ema = (c - ema) * alpha + ema
+            ema_tail.append(float(ema))
+            if len(ema_tail) > keep:
+                ema_tail = ema_tail[-keep:]
+
+        if len(ema_tail) < 2:
+            return None
+
+        diffs = [ema_tail[i] - ema_tail[i - 1] for i in range(1, len(ema_tail))]
+        if len(diffs) < confirm_bars:
+            return None
+        last_diffs = diffs[-confirm_bars:]
+
+        ema_prev = float(ema_tail[-2])
+        ema_last = float(ema_tail[-1])
+        slope_pct = 0.0
+        if ema_prev != 0:
+            slope_pct = (ema_last - ema_prev) / ema_prev * 100.0
+
+        all_up = all(d > 0 for d in last_diffs)
+        all_down = all(d < 0 for d in last_diffs)
+
+        if all_up and slope_pct >= float(min_slope_pct):
+            return "UP"
+        if all_down and slope_pct <= -float(min_slope_pct):
+            return "DOWN"
+        return "FLAT"
+
+    def _compute_significant_level(self, symbol_id: int, *, side: str, entry_ref: float, timeframe: str) -> float:
+        """Compute a significant support/resistance level using pivot highs/lows (same logic as live ADD1).
+
+        Returns 0.0 if cannot compute.
+        """
+        try:
+            lv_tf = str(getattr(self.p, "averaging_levels_tf", timeframe) or timeframe)
+            lookback_h = int(getattr(self.p, "averaging_levels_lookback_hours", 168) or 168)
+            left = int(getattr(self.p, "averaging_pivot_left", 3) or 3)
+            right = int(getattr(self.p, "averaging_pivot_right", 3) or 3)
+            min_dist_pct = float(getattr(self.p, "averaging_min_level_distance_pct", 15.0) or 15.0)
+            dist_limit_pct = max(5.0, float(min_dist_pct))
+
+            if entry_ref <= 0:
+                return 0.0
+
+            q = """
+            SELECT high, low
+            FROM candles
+            WHERE exchange_id=%(ex)s AND symbol_id=%(sym)s AND interval=%(tf)s
+              AND open_time >= (NOW() AT TIME ZONE 'UTC') - (%(h)s || ' hours')::interval
+            ORDER BY open_time ASC;
+            """
+            rows = list(self.store.query_dict(q, {"ex": int(self.p.exchange_id), "sym": int(symbol_id), "tf": lv_tf, "h": int(lookback_h)}))
+            lows = [float(r.get("low") or 0.0) for r in rows]
+            highs = [float(r.get("high") or 0.0) for r in rows]
+            if len(lows) < (left + right + 5):
+                return 0.0
+
+            piv_lows = []
+            piv_highs = []
+            for i in range(left, len(lows) - right):
+                w = lows[i-left:i+right+1]
+                if lows[i] > 0 and lows[i] == min(w):
+                    piv_lows.append(lows[i])
+                w2 = highs[i-left:i+right+1]
+                if highs[i] > 0 and highs[i] == max(w2):
+                    piv_highs.append(highs[i])
+
+            side_u = str(side or "").upper()
+            level = 0.0
+            if side_u == "LONG":
+                below = [x for x in piv_lows if x > 0 and x < entry_ref * (1.0 - dist_limit_pct/100.0)]
+                if below:
+                    level = max(below)
+                else:
+                    level = entry_ref * (1.0 - (dist_limit_pct / 100.0))
+            else:
+                above = [x for x in piv_highs if x > entry_ref * (1.0 + dist_limit_pct/100.0)]
+                if above:
+                    level = min(above)
+                else:
+                    level = entry_ref * (1.0 + (dist_limit_pct / 100.0))
+
+            return float(level) if level and level > 0 else 0.0
+        except Exception:
+            return 0.0
+
+    def _live_hedge_manage(self) -> Dict[str, int]:
+        """Manage hedge positions in LIVE mode when hedge_enabled is True.
+
+        Rule:
+          - When SL condition would be met, open an opposite market position sized:
+                hedge_qty = abs(main_qty) * hedge_koff
+            but only if EMA(hedge_ema_window) on hedge_ema_interval supports hedge direction.
+          - Close hedge when:
+                a) price reaches significant level (same as averaging level) OR
+                b) EMA flips against hedge (if enabled).
+        """
+        if (not self._is_live) or self._binance is None:
+            return {"checked": 0, "opened": 0, "closed": 0, "skipped": 0}
+
+        if not bool(getattr(self.p, "hedge_enabled", False)):
+            return {"checked": 0, "opened": 0, "closed": 0, "skipped": 0}
+
+        hedge_koff = float(getattr(self.p, "hedge_koff", 1.2) or 1.2)
+        ema_win = int(getattr(self.p, "hedge_ema_window", 20) or 20)
+        ema_tf = str(getattr(self.p, "hedge_ema_interval", "5m") or "5m")
+        ema_confirm = int(getattr(self.p, "hedge_ema_confirm_bars", 3) or 3)
+        ema_min_slope = float(getattr(self.p, "hedge_ema_min_slope_pct", 0.0) or 0.0)
+        ema_flip_mult = float(getattr(self.p, "hedge_ema_flip_slope_mult", 0.7) or 0.7)
+        hedge_cooldown_sec = float(getattr(self.p, "hedge_cooldown_sec", 180) or 180)
+        if ema_flip_mult <= 0:
+            ema_flip_mult = 0.7
+        ema_close_slope = float(ema_min_slope) * float(ema_flip_mult)
+
+        # Exchange snapshot positions (positionRisk)
+        pr = self._rest_snapshot_get("position_risk")
+        pr_rows = pr if isinstance(pr, list) else []
+        pr_map = {}  # (symbol, positionSide)-> dict
+        for r in pr_rows:
+            sym = str(r.get("symbol") or "").strip()
+            ps = str(r.get("positionSide") or ("BOTH" if not bool(getattr(self.p,"hedge_enabled",False)) else "")).strip().upper()
+            if not sym:
+                continue
+            pr_map[(sym, ps)] = r
+
+        # Ledger OPEN positions for strategy
+        led = []
+        # NOTE: position_ledger schema can differ between deployments.
+        # We only need basic fields + optional raw_meta (for hedge state).
+        try:
+            sel = "symbol_id, pos_uid, side, qty_current, avg_price, entry_price"
+            if getattr(self, "_pl_has_raw_meta", False):
+                sel += ", raw_meta"
+            led = list(
+                self.store.query_dict(
+                    f"""
+                    SELECT {sel}
+                    FROM position_ledger
+                    WHERE exchange_id=%(ex)s AND account_id=%(acc)s AND strategy_id=%(sid)s AND status='OPEN' AND source='live'
+                    ORDER BY opened_at DESC;
+                    """,
+                    {"ex": int(self.p.exchange_id), "acc": int(self.account_id), "sid": str(self.STRATEGY_ID)},
+                )
+            )
+        except Exception:
+            # fallback without raw_meta
+            led = list(
+                self.store.query_dict(
+                    """
+                    SELECT symbol_id, pos_uid, side, qty_current, avg_price, entry_price
+                    FROM position_ledger
+                    WHERE exchange_id=%(ex)s AND account_id=%(acc)s AND strategy_id=%(sid)s AND status='OPEN' AND source='live'
+                    ORDER BY opened_at DESC;
+                    """,
+                    {"ex": int(self.p.exchange_id), "acc": int(self.account_id), "sid": str(self.STRATEGY_ID)},
+                )
+            )
+
+        checked = opened = closed = skipped = 0
+        sym_map = self._symbols_map()
+
+        for p in led:
+            checked += 1
+            symbol_id = int(p["symbol_id"])
+            symbol = sym_map.get(symbol_id) or ""
+            if not symbol:
+                skipped += 1
+                continue
+
+            main_side = str(p.get("side") or "").upper()
+            if main_side not in {"LONG","SHORT"}:
+                skipped += 1
+                continue
+
+            qty = abs(float(p.get("qty_current") or 0.0))
+            if qty <= 0:
+                skipped += 1
+                continue
+
+            entry = _safe_float(p.get("avg_price"), default=_safe_float(p.get("entry_price"), default=0.0))
+            if entry <= 0:
+                skipped += 1
+                continue
+
+            # Determine hedge direction and required EMA direction
+            hedge_side = "SHORT" if main_side == "LONG" else "LONG"
+            need_ema = "DOWN" if hedge_side == "SHORT" else "UP"
+            # EMA direction for OPEN must be stricter (min slope); for CLOSE we can use a softer threshold
+            ema_dir_open = self._ema_direction(
+                symbol_id,
+                window=ema_win,
+                interval=ema_tf,
+                confirm_bars=ema_confirm,
+                min_slope_pct=ema_min_slope,
+            )
+            ema_dir_close = self._ema_direction(
+                symbol_id,
+                window=ema_win,
+                interval=ema_tf,
+                confirm_bars=ema_confirm,
+                min_slope_pct=ema_close_slope,
+            )
+            hedge_ok = (ema_dir_open == need_ema)
+
+            # Detect existing hedge position on exchange
+            # In hedge mode we should have positionSide LONG/SHORT.
+            main_ps = main_side
+            hedge_ps = hedge_side
+            main_pos = pr_map.get((symbol, main_ps))
+            hedge_pos = pr_map.get((symbol, hedge_ps))
+
+            hedge_amt = 0.0
+            hedge_entry = 0.0
+            if hedge_pos:
+                try:
+                    hedge_amt = abs(float(hedge_pos.get("positionAmt") or 0.0))
+                except Exception:
+                    hedge_amt = 0.0
+                try:
+                    hedge_entry = abs(float(hedge_pos.get("entryPrice") or hedge_pos.get("avgEntryPrice") or 0.0))
+                except Exception:
+                    hedge_entry = 0.0
+
+            # Main position info (for PnL controls) + hedge base qty from ledger raw_meta
+            main_amt = 0.0
+            main_entry_ex = 0.0
+            main_upnl_ex: Optional[float] = None
+            if main_pos:
+                try:
+                    main_amt = abs(float(main_pos.get("positionAmt") or 0.0))
+                except Exception:
+                    main_amt = 0.0
+                try:
+                    main_entry_ex = abs(float(main_pos.get("entryPrice") or main_pos.get("avgEntryPrice") or 0.0))
+                except Exception:
+                    main_entry_ex = 0.0
+                try:
+                    v = main_pos.get("unRealizedProfit")
+                    if v is not None:
+                        main_upnl_ex = float(v)
+                except Exception:
+                    main_upnl_ex = None
+
+            hedge_upnl_ex: Optional[float] = None
+            if hedge_pos:
+                try:
+                    v = hedge_pos.get("unRealizedProfit")
+                    if v is not None:
+                        hedge_upnl_ex = float(v)
+                except Exception:
+                    hedge_upnl_ex = None
+
+            hedge_base_qty: Optional[float] = None
+            hedge_last_action_ts: float = 0.0
+            hedge_last_open_ts: float = 0.0
+            hedge_last_close_ts: float = 0.0
+            raw_meta = p.get("raw_meta") if isinstance(p, dict) else None
+            if raw_meta is not None:
+                try:
+                    rm = raw_meta
+                    if isinstance(rm, str):
+                        import json as _json
+                        rm = _json.loads(rm) if rm.strip() else {}
+                    if isinstance(rm, dict):
+                        h = rm.get("hedge") or {}
+                        if isinstance(h, dict):
+                            if h.get("base_qty") is not None:
+                                try:
+                                    hedge_base_qty = float(h.get("base_qty"))
+                                except Exception:
+                                    hedge_base_qty = None
+                            try:
+                                hedge_last_action_ts = float(h.get("last_action_ts") or 0.0)
+                            except Exception:
+                                hedge_last_action_ts = 0.0
+                            try:
+                                hedge_last_open_ts = float(h.get("last_open_ts") or 0.0)
+                            except Exception:
+                                hedge_last_open_ts = 0.0
+                            try:
+                                hedge_last_close_ts = float(h.get("last_close_ts") or 0.0)
+                            except Exception:
+                                hedge_last_close_ts = 0.0
+                except Exception:
+                    hedge_base_qty = None
+
+            all_pl_limit = float(getattr(self.p, "all_P_L", 0.0) or 0.0)
+
+            mark = 0.0
+            try:
+                mark = float(self._get_mark_price(symbol, hedge_ps) or self._get_mark_price(symbol, main_ps) or 0.0)
+            except Exception:
+                mark = 0.0
+            if mark <= 0:
+                skipped += 1
+                continue
+
+            # Compute unrealized PnL (prefer exchange fields; fallback to mark/entry)
+            def _calc_upnl(side: str, entry_px: float, amt: float, upnl_ex: Optional[float]) -> float:
+                if upnl_ex is not None:
+                    try:
+                        return float(upnl_ex)
+                    except Exception:
+                        pass
+                if entry_px <= 0 or amt <= 0:
+                    return 0.0
+                if side == "LONG":
+                    return (mark - entry_px) * amt
+                return (entry_px - mark) * amt
+
+            main_entry_use = float(main_entry_ex or entry or 0.0)
+            main_upnl = _calc_upnl(main_side, main_entry_use, float(main_amt or qty), main_upnl_ex)
+            hedge_upnl = 0.0
+            if hedge_amt > 0:
+                hedge_entry_use = float(hedge_entry or 0.0)
+                if hedge_entry_use <= 0 and hedge_pos:
+                    try:
+                        hedge_entry_use = abs(float(hedge_pos.get("entryPrice") or hedge_pos.get("avgEntryPrice") or 0.0))
+                    except Exception:
+                        hedge_entry_use = 0.0
+                hedge_upnl = _calc_upnl(hedge_side, hedge_entry_use, float(hedge_amt), hedge_upnl_ex)
+
+            combined_upnl = float(main_upnl) + float(hedge_upnl)
+
+            # Close BOTH positions if combined unrealized PnL >= configured limit (USDT)
+            if all_pl_limit and all_pl_limit > 0 and combined_upnl >= float(all_pl_limit):
+                try:
+                    # close hedge first (if exists), then main
+                    if hedge_amt > 0:
+                        close_side = "BUY" if hedge_side == "SHORT" else "SELL"
+                        self._binance.new_order(
+                            symbol=symbol,
+                            side=close_side,
+                            type="MARKET",
+                            quantity=float(hedge_amt),
+                            positionSide=hedge_ps,
+                        )
+                        closed += 1
+                    if main_amt > 0:
+                        close_side = "BUY" if main_side == "SHORT" else "SELL"
+                        self._binance.new_order(
+                            symbol=symbol,
+                            side=close_side,
+                            type="MARKET",
+                            quantity=float(main_amt),
+                            positionSide=main_ps,
+                        )
+                        closed += 1
+                    log.info("[TL][HEDGE] closed ALL %s combined_upnl=%.4f >= %.4f (main=%.4f hedge=%.4f)",
+                             symbol, float(combined_upnl), float(all_pl_limit), float(main_upnl), float(hedge_upnl))
+                except Exception:
+                    log.exception("[TL][HEDGE] failed to close ALL for %s", symbol)
+                    skipped += 1
+                continue
+
+            # Close hedge if main position is already positive unrealized PnL
+            main_positive = (float(main_upnl) > 0.0)
+
+            # Compute would-be SL price (same as default SL)
+            if main_side == "LONG":
+                sl_price = entry * (1.0 - _pct_to_mult(self.p.stop_loss_pct))
+                sl_hit = (mark <= sl_price)
+            else:
+                sl_price = entry * (1.0 + _pct_to_mult(self.p.stop_loss_pct))
+                sl_hit = (mark >= sl_price)
+
+            # 1) Open hedge instead of SL
+            # Open hedge instead of SL (or reopen after prior close) when conditions met
+            open_trigger = bool(sl_hit)
+            if (not open_trigger) and bool(getattr(self.p, "hedge_reopen_enabled", True)):
+                # reopen hedge if main is in loss and drawdown beyond configured threshold
+                try:
+                    dd_thr = float(getattr(self.p, "hedge_reopen_drawdown_pct", 0.0) or 0.0)
+                except Exception:
+                    dd_thr = 0.0
+                dd = 0.0
+                if main_entry_use > 0:
+                    if main_side == "LONG" and mark < main_entry_use:
+                        dd = (main_entry_use - mark) / main_entry_use * 100.0
+                    if main_side == "SHORT" and mark > main_entry_use:
+                        dd = (mark - main_entry_use) / main_entry_use * 100.0
+                if float(main_upnl) < 0.0 and (dd_thr <= 0.0 or dd >= dd_thr):
+                    open_trigger = True
+
+            if hedge_amt <= 0 and open_trigger:
+                # cooldown check (open)
+                if hedge_cooldown_sec and hedge_last_action_ts and (time.time() - float(hedge_last_action_ts)) < float(hedge_cooldown_sec):
+                    skipped += 1
+                    continue
+                if not hedge_ok:
+                    skipped += 1
+                    continue
+
+                # qty and rounding
+                qty_step = float(self._qty_step_for_symbol(symbol) or 0.0) or 0.0
+                # hedge qty: use stored base qty if available (same as first open), otherwise compute from current main qty
+                hedge_qty = float(hedge_base_qty) if (hedge_base_qty is not None and float(hedge_base_qty) > 0) else (qty * float(hedge_koff))
+                if qty_step and qty_step > 0:
+                    hedge_qty = _round_qty_to_step(hedge_qty, qty_step, mode="down")
+                if hedge_qty <= 0 or (qty_step and hedge_qty < qty_step):
+                    skipped += 1
+                    continue
+
+                side_ord = "SELL" if hedge_side == "SHORT" else "BUY"
+                try:
+                    resp = self._binance.new_order(
+                        symbol=symbol,
+                        side=side_ord,
+                        type="MARKET",
+                        quantity=float(hedge_qty),
+                        positionSide=hedge_ps,
+                    )
+                    opened += 1
+                    # persist hedge base qty (same for reopens) into position_ledger.raw_meta if available
+                    try:
+                        if getattr(self, "_pl_has_raw_meta", False):
+                            import json as _json
+                            reason = "SL" if bool(sl_hit) else "REOPEN"
+                            meta = {"hedge": {"base_qty": float(hedge_qty), "last_open_reason": str(reason), "last_open_ts": float(time.time()), "last_action_ts": float(time.time())}}
+                            uqm = '''
+                            UPDATE position_ledger
+                            SET raw_meta = COALESCE(raw_meta,'{}'::jsonb) || %(meta)s::jsonb,
+                                updated_at = now()
+                            WHERE exchange_id=%(ex)s AND account_id=%(acc)s AND pos_uid=%(pos_uid)s AND status='OPEN';
+                            '''
+                            self.store.execute(
+                                uqm,
+                                {
+                                    "meta": _json.dumps(meta),
+                                    "ex": int(self.p.exchange_id),
+                                    "acc": int(self.account_id),
+                                    "pos_uid": str(p.get("pos_uid")),
+                                },
+                            )
+                    except Exception:
+                        pass
+                    log.info("[TL][HEDGE] opened %s %s qty=%.8f (main=%s qty=%.8f) mark=%.6f sl=%.6f ema_open=%s ema_close=%s",
+                             symbol, hedge_ps, float(hedge_qty), main_side, float(qty), float(mark), float(sl_price), str(ema_dir_open), str(ema_dir_close))
+                except Exception as e:
+                    log.exception("[TL][HEDGE] failed to open hedge for %s: %s", symbol, e)
+                    skipped += 1
+                continue  # next position
+
+            # 2) Close hedge if exists and conditions met
+            if hedge_amt > 0:
+                close_reason = None
+
+                # close hedge if main became profitable
+                if main_positive:
+                    close_reason = "MAIN_POSITIVE"
+
+                # a) close on significant level
+                if bool(getattr(self.p, "hedge_close_on_level", True)):
+                    tf_main = str(p.get("timeframe") or "15m")
+                    level = self._compute_significant_level(symbol_id, side=main_side, entry_ref=float(entry), timeframe=tf_main)
+                    tol = float(getattr(self.p, "hedge_level_tolerance_pct", 0.10) or 0.10) / 100.0
+                    if level > 0:
+                        if main_side == "LONG":
+                            # close SHORT hedge when price reaches support level (or slightly above)
+                            if mark <= level * (1.0 + tol):
+                                close_reason = "LEVEL"
+                        else:
+                            # close LONG hedge when price reaches resistance level (or slightly below)
+                            if mark >= level * (1.0 - tol):
+                                close_reason = "LEVEL"
+
+                # b) close on EMA flip against hedge
+                if close_reason is None and bool(getattr(self.p, "hedge_close_on_ema_flip", True)):
+                    # use softer slope threshold for close to avoid missing real flips,
+                    # but still ignore micro-flips when slope is too small.
+                    if ema_dir_close and ema_dir_close in {"UP", "DOWN"}:
+                        if ema_dir_close != need_ema:
+                            close_reason = "EMA_FLIP"
+
+                if close_reason:
+                    # cooldown check (close)
+                    if hedge_cooldown_sec and hedge_last_action_ts and (time.time() - float(hedge_last_action_ts)) < float(hedge_cooldown_sec):
+                        skipped += 1
+                        continue
+                    close_side = "BUY" if hedge_side == "SHORT" else "SELL"
+                    qty_step = float(self._qty_step_for_symbol(symbol) or 0.0) or 0.0
+                    close_qty = float(hedge_amt)
+                    if qty_step and qty_step > 0:
+                        close_qty = _round_qty_to_step(close_qty, qty_step, mode="down")
+                    if close_qty <= 0 or (qty_step and close_qty < qty_step):
+                        skipped += 1
+                        continue
+                    try:
+                        resp = self._binance.new_order(
+                            symbol=symbol,
+                            side=close_side,
+                            type="MARKET",
+                            quantity=float(close_qty),
+                            positionSide=hedge_ps,
+                        )
+                        closed += 1
+                        # persist last hedge close reason into raw_meta if available
+                        try:
+                            if getattr(self, "_pl_has_raw_meta", False):
+                                import json as _json
+                                meta = {"hedge": {"base_qty": float(hedge_base_qty) if (hedge_base_qty is not None and float(hedge_base_qty) > 0) else float(hedge_amt), "last_close_reason": str(close_reason), "last_close_ts": float(time.time()), "last_action_ts": float(time.time())}}
+                                uqm = '''
+                                UPDATE position_ledger
+                                SET raw_meta = COALESCE(raw_meta,'{}'::jsonb) || %(meta)s::jsonb,
+                                    updated_at = now()
+                                WHERE exchange_id=%(ex)s AND account_id=%(acc)s AND pos_uid=%(pos_uid)s AND status='OPEN';
+                                '''
+                                self.store.execute(
+                                    uqm,
+                                    {
+                                        "meta": _json.dumps(meta),
+                                        "ex": int(self.p.exchange_id),
+                                        "acc": int(self.account_id),
+                                        "pos_uid": str(p.get("pos_uid")),
+                                    },
+                                )
+                        except Exception:
+                            pass
+                        log.info("[TL][HEDGE] closed %s %s qty=%.8f reason=%s mark=%.6f ema_close=%s ema_open=%s",
+                                 symbol, hedge_ps, float(close_qty), str(close_reason), float(mark), str(ema_dir_close), str(ema_dir_open))
+                    except Exception as e:
+                        log.exception("[TL][HEDGE] failed to close hedge for %s: %s", symbol, e)
+                        skipped += 1
+
+        return {"checked": checked, "opened": opened, "closed": closed, "skipped": skipped}
     # ----------------------------------------------------------
     # Risk-table helpers (paper)
     # ----------------------------------------------------------
@@ -4232,7 +4917,11 @@ class TradeLiquidation:
     def _process_open_positions(self) -> Dict[str, int]:
         # Paper: uses candle prices + paper_position_risk
         if self._is_live:
-            # LIVE close handled by order-events/fills + cleanup; no candle-based forced close here.
+            # In LIVE mode SL/TP is usually handled by exchange orders and cleanup.
+            # But if hedge_enabled is True, we actively manage hedge open/close here.
+            if bool(getattr(self.p, "hedge_enabled", False)):
+                hs = self._live_hedge_manage()
+                return {"checked": int(hs.get("checked", 0)), "closed": int(hs.get("closed", 0)), "hedge": hs}
             return {"checked": 0, "closed": 0}
 
         positions = self._get_open_positions()
@@ -5097,6 +5786,10 @@ class TradeLiquidation:
             if sl_price <= 0:
                 return None
 
+            # Hedge strategy mode: do NOT place SL bracket order (we open opposite hedge on SL-hit)
+            if bool(getattr(self.p, "hedge_enabled", False)):
+                return None
+
             # LIVE trailing stop (Binance Futures): TRAILING_STOP_MARKET
             # Note: in Hedge Mode Binance forbids reduceOnly param, so we omit it there.
             if sl_mode in {"trailing_stop_market", "trailing", "tsm"}:
@@ -5322,6 +6015,20 @@ class TradeLiquidation:
         try:
             if bool(getattr(self.p, "averaging_enabled", False)) and int(self._cfg_max_adds() or 0) > 0:
                 mult = float(getattr(self.p, "averaging_add_position_multiplier", 1.0) or 1.0)
+                # Safety: respect max additions cap even at ENTRY time (prevents duplicate ADD1 after retries/restarts).
+                max_adds_cfg = int(self._cfg_max_adds() or 0)
+                if max_adds_cfg < 1:
+                    mult = 1.0  # disable add placement
+                else:
+                    try:
+                        rows_sc = list(self.store.query_dict(
+                            "SELECT COALESCE(scale_in_count, 0) AS scale_in_count FROM position_ledger WHERE pos_uid=%(u)s LIMIT 1;",
+                            {"u": str(pos_uid)},
+                        ))
+                        if rows_sc and int(rows_sc[0].get("scale_in_count") or 0) >= max_adds_cfg:
+                            mult = 1.0  # cap reached -> disable add placement
+                    except Exception:
+                        pass
                 if mult > 1.0:
                     # pick a significant level from candles (support/resistance)
                     lv_tf = str(getattr(self.p, "averaging_levels_tf", timeframe) or timeframe)

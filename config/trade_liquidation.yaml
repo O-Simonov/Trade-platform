@@ -108,9 +108,22 @@ traders:
       # Риск и ограничения на позиции
       # ----------------------------
 
-      leverage: 10                                  # Плечо (leverage) для символа
-      margin_type: CROSSED                          # Тип маржи: CROSSED или ISOLATED
-      hedge_enabled: true                           # Hedge mode: true => positionSide LONG/SHORT
+      leverage: 10                                 # Плечо (leverage) для символа
+      margin_type: CROSSED                         # Тип маржи: CROSSED или ISOLATED
+      hedge_enabled: true                          # Hedge mode: true => positionSide LONG/SHORT
+      hedge_koff: 1.5                              # Hedge qty multiplier vs main position qty
+      hedge_ema_window: 20                         # EMA window
+      hedge_ema_interval: "5m"                     # EMA timeframe (candles.interval)
+      hedge_ema_confirm_bars: 3                    # EMA direction confirmation bars (anti-chop)
+      hedge_ema_min_slope_pct: 0.08                # Minimal EMA slope (% per 5m bar) to treat direction as valid (anti-chop, good for alts)
+      hedge_ema_flip_slope_mult: 0.7               # Close-on-flip uses min_slope * mult (softer threshold for closes)
+      hedge_cooldown_sec: 180                      # Cooldown between hedge open/close actions (anti-chop)
+      hedge_close_on_level: true                   # Close hedge near significant averaging level
+      hedge_close_on_ema_flip: true                # Close hedge if EMA flips against hedge
+      hedge_level_tolerance_pct: 0.10              # Tolerance (%) around level for hedge close
+      hedge_reopen_enabled: true                   # Reopen hedge after it was closed if main still in loss
+      hedge_reopen_drawdown_pct: 0.0               # Reopen threshold drawdown (%). 0 => any negative unrealized PnL
+      all_P_L: 10.0                                # Close BOTH (main+hedge) if combined unrealized PnL >= this USDT
 
       max_open_positions: 3                         # Максимум одновременно открытых позиций
 
@@ -176,7 +189,7 @@ traders:
       # ----------------------------
 
       averaging_enabled: true                        # Разрешить добавки к позиции
-      averaging_max_adds: 2                          # Максимум добавок (сколько раз усредняться)
+      averaging_max_adds: 1                          # Максимум добавок (сколько раз усредняться)
 
 #      averaging_add_size_mode: risk_pct             # Режим размера добавки: risk_pct / fixed / wallet_pct (зависит от реализации)
 #      averaging_add_size_value: 10                  # Значение для выбранного режима (например, %)

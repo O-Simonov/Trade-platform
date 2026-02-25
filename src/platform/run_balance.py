@@ -439,12 +439,18 @@ class BinanceFuturesUserStream:
         on_order_trade_update=None,
         *,
         debug_messages: bool = False,
+        on_open=None,
+        on_close=None,
     ) -> None:
         self._rest = rest
         self._asset = asset.upper()
         self._on_account_update = on_account_update
         self._on_order_trade_update = on_order_trade_update
         self._debug_messages = debug_messages
+
+        # Optional external callbacks (e.g. BalanceWriter wants to mark WS as alive)
+        self._user_on_open = on_open
+        self._user_on_close = on_close
 
         self._stop = threading.Event()
         self._ws: Optional[websocket.WebSocketApp] = None
@@ -492,9 +498,19 @@ class BinanceFuturesUserStream:
 
         def on_close(_ws, status, msg):
             log.warning("[BINANCE WS] closed: status=%s msg=%s", status, msg)
+            if self._user_on_close:
+                try:
+                    self._user_on_close()
+                except Exception:
+                    log.warning("[BINANCE WS] user on_close callback failed", exc_info=True)
 
         def on_open(_ws):
             log.info("[BINANCE WS] opened")
+            if self._user_on_open:
+                try:
+                    self._user_on_open()
+                except Exception:
+                    log.warning("[BINANCE WS] user on_open callback failed", exc_info=True)
 
         # Store callbacks so we can rebuild WS app on listenKey rotation.
         self._cb_on_open = on_open
@@ -787,14 +803,17 @@ class AccountBalanceWriter:
             wallet = _safe_float(b.get("wb")) if b else None  # walletBalance
             if wallet is None and b:
                 wallet = _safe_float(b.get("cw"))  # crossWalletBalance (fallback)
-            # WS doesn't give availableBalance directly. We can approximate:
-            # equity = wallet + sum(upnl across positions)
-            upnl = 0.0
+            # WS doesn't always include position uPnL. If it's missing, reuse last known uPnL from heartbeat/REST.
+            found_up = False
+            upnl_sum = 0.0
             for p in positions:
                 v = _safe_float(p.get("up"))
                 if v is not None:
-                    upnl += v
-            equity = (wallet + upnl) if (wallet is not None) else None
+                    upnl_sum += v
+                    found_up = True
+
+            upnl = upnl_sum if found_up else self._last_upnl
+            equity = (wallet + upnl) if (wallet is not None and upnl is not None) else (self._last_equity if wallet is not None else None)
 
             # Available balance is not present in WS payload; keep last REST value if available.
             avail = self._last_avail
@@ -828,6 +847,14 @@ class AccountBalanceWriter:
                 )
         except Exception as e:
             log.warning("[BINANCE WS] parse/write failed: %s", e)
+
+    def _on_ws_open(self) -> None:
+        # Mark WS as alive even before the first ACCOUNT_UPDATE arrives.
+        self._last_ws_ts = _utc_now()
+
+    def _on_ws_close(self) -> None:
+        # Also update timestamp on close so monitoring can see the last WS activity.
+        self._last_ws_ts = _utc_now()
 
     # ---- Orders/Trades via WS user stream
 
@@ -1337,7 +1364,27 @@ class AccountBalanceWriter:
     ) -> None:
         strategy_id = "unknown"
         pos_uid = None
+        is_new = (str(status).upper() == 'NEW') if status is not None else False
         if client_order_id:
+            # choose upsert strategy based on status; client_order_id conflict path is only safe for NEW
+            if is_new:
+                # Keep INFO only for WS NEW updates (high-signal). REST bootstrap/reconcile can be noisy.
+                if str(source).lower().startswith("ws"):
+                    log.info(
+                        "[ORDERS][upsert] by client_order_id (NEW) partial unique: coid=%s status=%s oid=%s",
+                        client_order_id,
+                        status,
+                        order_id,
+                    )
+                else:
+                    log.debug(
+                        "[ORDERS][upsert] by client_order_id (NEW) partial unique (non-ws): coid=%s status=%s oid=%s",
+                        client_order_id,
+                        status,
+                        order_id,
+                    )
+            else:
+                log.debug("[ORDERS][upsert] client_order_id present but status!=NEW; will upsert by primary key: oid=%s coid=%s status=%s", order_id, client_order_id, status)
             # Prefer metadata from existing real orders with the same client_order_id (common when one client id
             # is reused across multiple exchange orders).
             r = _db_fetch_one(
@@ -1378,71 +1425,122 @@ class AccountBalanceWriter:
 
         raw_json_text = json.dumps(raw_json_obj, ensure_ascii=False)
 
-        _db_exec(
-            self._pool,
-            '''
-            INSERT INTO public.orders(
-              exchange_id, account_id, order_id, symbol_id,
-              strategy_id, pos_uid, client_order_id,
-              side, type, reduce_only, price, qty, filled_qty,
-              status, created_at, updated_at, source, ts_ms, raw_json, avg_price
-            )
-            VALUES (
-              %(ex)s, %(ac)s, %(oid)s, %(sid)s,
-              %(strategy)s, %(pos_uid)s, %(coid)s,
-              %(side)s, %(typ)s, %(ro)s, %(price)s, %(qty)s, %(fqty)s,
-              %(st)s, now(), now(), %(src)s, %(ts_ms)s, %(raw)s::jsonb, %(avg_price)s
-            )
-            ON CONFLICT (exchange_id, account_id, order_id)
-            DO UPDATE SET
-              symbol_id = EXCLUDED.symbol_id,
-              strategy_id = COALESCE(NULLIF(EXCLUDED.strategy_id,'unknown'), public.orders.strategy_id),
-              pos_uid = COALESCE(EXCLUDED.pos_uid, public.orders.pos_uid),
-              client_order_id = COALESCE(EXCLUDED.client_order_id, public.orders.client_order_id),
-              side = COALESCE(EXCLUDED.side, public.orders.side),
-              type = COALESCE(EXCLUDED.type, public.orders.type),
-              reduce_only = COALESCE(EXCLUDED.reduce_only, public.orders.reduce_only),
-              price = COALESCE(EXCLUDED.price, public.orders.price),
-              qty = COALESCE(EXCLUDED.qty, public.orders.qty),
-              filled_qty = COALESCE(EXCLUDED.filled_qty, public.orders.filled_qty),
-              status = COALESCE(EXCLUDED.status, public.orders.status),
-              updated_at = now(),
-              ts_ms = COALESCE(EXCLUDED.ts_ms, public.orders.ts_ms),
-              raw_json = COALESCE(EXCLUDED.raw_json, public.orders.raw_json),
-              avg_price = COALESCE(EXCLUDED.avg_price, public.orders.avg_price)
-            ''',
-            {
-                "ex": self.exchange_id,
-                "ac": self.account_id,
-                "oid": order_id,
-                "sid": symbol_id,
-                "strategy": strategy_id or "unknown",
-                "pos_uid": pos_uid,
-                "coid": client_order_id,
-                "side": side,
-                "typ": type_,
-                "ro": reduce_only,
-                "price": price,
-                "qty": qty,
-                "fqty": filled_qty,
-                "st": status,
-                "src": source,
-                "ts_ms": int(ts_ms) if ts_ms is not None else None,
-                "raw": raw_json_text,
-                "avg_price": avg_price,
-            },
-        )
+        # IMPORTANT:
+        # There is a UNIQUE constraint uq_orders_one_new_per_client_order_id on (exchange_id, account_id, client_order_id)
+        # for NEW/placeholder rows. Binance WS can deliver order updates that race with placeholder inserts.
+        # If we upsert only by (exchange_id, account_id, order_id), we can hit UniqueViolation on client_order_id.
+        # Fix: when client_order_id is present, upsert primarily by that constraint.
 
-        if client_order_id:
+        params = {
+            "ex": self.exchange_id,
+            "ac": self.account_id,
+            "oid": order_id,
+            "sid": symbol_id,
+            "strategy": strategy_id or "unknown",
+            "pos_uid": pos_uid,
+            "coid": client_order_id,
+            "side": side,
+            "typ": type_,
+            "ro": reduce_only,
+            "price": price,
+            "qty": qty,
+            "fqty": filled_qty,
+            "st": status,
+            "src": source,
+            "ts_ms": int(ts_ms) if ts_ms is not None else None,
+            "raw": raw_json_text,
+            "avg_price": avg_price,
+        }
+
+        if client_order_id and is_new:
             _db_exec(
                 self._pool,
                 '''
-                DELETE FROM public.orders
-                WHERE exchange_id = %(ex)s AND account_id = %(ac)s
-                  AND (order_id IS NULL OR btrim(order_id) = '')
-                  AND client_order_id = %(coid)s
+                INSERT INTO public.orders(
+                  exchange_id, account_id, order_id, symbol_id,
+                  strategy_id, pos_uid, client_order_id,
+                  side, type, reduce_only, price, qty, filled_qty,
+                  status, created_at, updated_at, source, ts_ms, raw_json, avg_price
+                )
+                VALUES (
+                  %(ex)s, %(ac)s, %(oid)s, %(sid)s,
+                  %(strategy)s, %(pos_uid)s, %(coid)s,
+                  %(side)s, %(typ)s, %(ro)s, %(price)s, %(qty)s, %(fqty)s,
+                  %(st)s, now(), now(), %(src)s, %(ts_ms)s, %(raw)s::jsonb, %(avg_price)s
+                )
+                ON CONFLICT (exchange_id, account_id, client_order_id)
+                WHERE (client_order_id IS NOT NULL AND client_order_id <> '' AND status = 'NEW')
+                DO UPDATE SET
+                  -- We may receive a NEW update for the same client_order_id with a different order_id.
+                  -- The NEW-placeholder unique constraint is on (exchange_id, account_id, client_order_id) WHERE status='NEW'.
+                  -- Sometimes a placeholder row exists first, then WS brings a real order_id.
+                  -- Update order_id only if it won't violate the primary key (exchange_id, account_id, order_id).
+                  order_id = CASE
+                    WHEN COALESCE(NULLIF(EXCLUDED.order_id,''), '') = '' THEN public.orders.order_id
+                    WHEN public.orders.order_id = EXCLUDED.order_id THEN public.orders.order_id
+                    WHEN NOT EXISTS (
+                      SELECT 1
+                      FROM public.orders o2
+                      WHERE o2.exchange_id = EXCLUDED.exchange_id
+                        AND o2.account_id  = EXCLUDED.account_id
+                        AND o2.order_id    = EXCLUDED.order_id
+                    ) THEN EXCLUDED.order_id
+                    ELSE public.orders.order_id
+                  END,
+                  symbol_id = EXCLUDED.symbol_id,
+                  strategy_id = COALESCE(NULLIF(EXCLUDED.strategy_id,'unknown'), public.orders.strategy_id),
+                  pos_uid = COALESCE(EXCLUDED.pos_uid, public.orders.pos_uid),
+                  client_order_id = COALESCE(EXCLUDED.client_order_id, public.orders.client_order_id),
+                  side = COALESCE(EXCLUDED.side, public.orders.side),
+                  type = COALESCE(EXCLUDED.type, public.orders.type),
+                  reduce_only = COALESCE(EXCLUDED.reduce_only, public.orders.reduce_only),
+                  price = COALESCE(EXCLUDED.price, public.orders.price),
+                  qty = COALESCE(EXCLUDED.qty, public.orders.qty),
+                  filled_qty = COALESCE(EXCLUDED.filled_qty, public.orders.filled_qty),
+                  status = COALESCE(EXCLUDED.status, public.orders.status),
+                  updated_at = now(),
+                  ts_ms = COALESCE(EXCLUDED.ts_ms, public.orders.ts_ms),
+                  raw_json = COALESCE(EXCLUDED.raw_json, public.orders.raw_json),
+                  avg_price = COALESCE(EXCLUDED.avg_price, public.orders.avg_price)
                 ''',
-                {"ex": self.exchange_id, "ac": self.account_id, "coid": client_order_id},
+                params,
+            )
+        else:
+            log.debug("[ORDERS][upsert] by primary key: oid=%s coid=%s status=%s", order_id, client_order_id, status)
+            _db_exec(
+                self._pool,
+                '''
+                INSERT INTO public.orders(
+                  exchange_id, account_id, order_id, symbol_id,
+                  strategy_id, pos_uid, client_order_id,
+                  side, type, reduce_only, price, qty, filled_qty,
+                  status, created_at, updated_at, source, ts_ms, raw_json, avg_price
+                )
+                VALUES (
+                  %(ex)s, %(ac)s, %(oid)s, %(sid)s,
+                  %(strategy)s, %(pos_uid)s, %(coid)s,
+                  %(side)s, %(typ)s, %(ro)s, %(price)s, %(qty)s, %(fqty)s,
+                  %(st)s, now(), now(), %(src)s, %(ts_ms)s, %(raw)s::jsonb, %(avg_price)s
+                )
+                ON CONFLICT (exchange_id, account_id, order_id)
+                DO UPDATE SET
+                  symbol_id = EXCLUDED.symbol_id,
+                  strategy_id = COALESCE(NULLIF(EXCLUDED.strategy_id,'unknown'), public.orders.strategy_id),
+                  pos_uid = COALESCE(EXCLUDED.pos_uid, public.orders.pos_uid),
+                  client_order_id = COALESCE(EXCLUDED.client_order_id, public.orders.client_order_id),
+                  side = COALESCE(EXCLUDED.side, public.orders.side),
+                  type = COALESCE(EXCLUDED.type, public.orders.type),
+                  reduce_only = COALESCE(EXCLUDED.reduce_only, public.orders.reduce_only),
+                  price = COALESCE(EXCLUDED.price, public.orders.price),
+                  qty = COALESCE(EXCLUDED.qty, public.orders.qty),
+                  filled_qty = COALESCE(EXCLUDED.filled_qty, public.orders.filled_qty),
+                  status = COALESCE(EXCLUDED.status, public.orders.status),
+                  updated_at = now(),
+                  ts_ms = COALESCE(EXCLUDED.ts_ms, public.orders.ts_ms),
+                  raw_json = COALESCE(EXCLUDED.raw_json, public.orders.raw_json),
+                  avg_price = COALESCE(EXCLUDED.avg_price, public.orders.avg_price)
+                ''',
+                params,
             )
 
     def _merge_orphan_placeholders_once(self, *, limit: int = 50) -> int:
@@ -1729,6 +1827,11 @@ class AccountBalanceWriter:
         heartbeat_sec = max(0.0, float(getattr(self.cfg, "rest_heartbeat_sec", 60.0) or 0.0))
         debug = os.getenv("DEBUG_BALANCE_WRITER", "0") == "1"
 
+        # Periodic debug print of in-memory cache (helps to see cached uPnL/equity even when WS is quiet).
+        # Enabled only when DEBUG_BALANCE_WRITER=1.
+        cache_log_every_sec = float(os.getenv("DEBUG_UPNL_CACHE_EVERY_SEC", "60") or 60)
+        next_cache_log = time.time() + (cache_log_every_sec if debug and cache_log_every_sec > 0 else 1e30)
+
         # placeholder merge cadence (helps when strategy inserts placeholders after WS already has real orders)
         merge_every_sec = float(os.getenv("MERGE_PLACEHOLDERS_EVERY_SEC", "60") or 60)
         next_merge = time.time() + 5.0
@@ -1754,7 +1857,17 @@ class AccountBalanceWriter:
                 self._propagate_order_meta_once()
             except Exception:
                 log.warning("[meta] propagate failed", exc_info=True)
-            self._ws = BinanceFuturesUserStream(self._rest, self.cfg.asset, self._on_ws_account_update, self._on_ws_order_trade_update)
+            self._ws = BinanceFuturesUserStream(
+                self._rest,
+                self.cfg.asset,
+                self._on_ws_account_update,
+                self._on_ws_order_trade_update,
+                # NOTE: keep WS debug in sync with DEBUG_BALANCE_WRITER.
+                # Older versions used an internal flag (_debug_ws_messages) which may be absent.
+                debug_messages=bool(debug),
+                on_open=self._on_ws_open,
+                on_close=self._on_ws_close,
+            )
             self._ws.start()
 
         # For "ws": write when events arrive; do occasional REST heartbeat to refresh available balance.
@@ -1765,6 +1878,19 @@ class AccountBalanceWriter:
         while not self._stop.is_set():
             try:
                 now = time.time()
+
+                # Periodic visibility into cached state (even without WS events).
+                if debug and cache_log_every_sec > 0 and now >= next_cache_log:
+                    log.info(
+                        "[debug] cache state: last_rest_ts=%s last_ws_ts=%s wallet=%s equity=%s avail=%s upnl=%s",
+                        self._last_rest_ts.isoformat() if self._last_rest_ts else None,
+                        self._last_ws_ts.isoformat() if self._last_ws_ts else None,
+                        self._last_wallet,
+                        self._last_equity,
+                        self._last_avail,
+                        self._last_upnl,
+                    )
+                    next_cache_log = now + cache_log_every_sec
 
                 do_rest_write = False
                 do_rest_cache = False

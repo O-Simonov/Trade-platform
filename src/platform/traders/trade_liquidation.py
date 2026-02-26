@@ -23,6 +23,41 @@ from concurrent.futures import ThreadPoolExecutor, Future
 import requests
 
 from src.platform.data.storage.postgres.storage import PostgreSQLStorage
+def _tl_place_algo_with_retry(place_fn, max_tries: int = 3, base_sleep_sec: float = 0.25, log_obj=None):
+    """Retry wrapper for placing Binance conditional/algo orders.
+
+    Some code paths call this helper from different methods. Earlier versions had
+    it as a nested function, which caused NameError in other methods.
+    """
+    import time
+
+    tries = max(1, int(max_tries or 1))
+    last_exc = None
+    for attempt in range(1, tries + 1):
+        try:
+            # Backward compatible: some call sites define place_fn(attempt)
+            try:
+                import inspect
+                _sig = inspect.signature(place_fn)
+                _nparams = len([p for p in _sig.parameters.values() if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)])
+            except Exception:
+                _nparams = 0
+
+            if _nparams >= 1:
+                return place_fn(attempt)
+            return place_fn()
+        except Exception as e:  # noqa: BLE001
+            last_exc = e
+            if log_obj is not None:
+                try:
+                    log_obj.warning("[TL] algo place retry %s/%s failed: %s", attempt, tries, e)
+                except Exception:
+                    pass
+            if attempt < tries:
+                time.sleep(base_sleep_sec * attempt)
+    # re-raise last error (keeps stack in logs)
+    raise last_exc
+
 
 log = logging.getLogger("traders.trade_liquidation")
 
@@ -339,7 +374,7 @@ class TradeLiquidationParams:
     averaging_enabled: bool = True
     averaging_add_notional_usdt: float = 0.0
     averaging_add_pct_of_position: float = 35.0
-    averaging_max_additions: int = 2
+    averaging_max_additions: int = 1
     averaging_cooldown_minutes: int = 20
 
     levels_timeframe: str = "4h"
@@ -948,6 +983,9 @@ class TradeLiquidation:
     def __init__(self, store: PostgreSQLStorage, params: TradeLiquidationParams | Dict[str, Any]):
         self.store = store
 
+        # logger alias (module-level logger is `log`)
+        self.log = log
+
         # cache symbol precision filters from DB (price_tick / qty_step)
         self.p = params if isinstance(params, TradeLiquidationParams) else TradeLiquidationParams.from_dict(params or {})
         self._symbol_filters_map: Dict[str, Dict[str, Any]] = self._load_symbol_filters_map()
@@ -1017,6 +1055,8 @@ class TradeLiquidation:
         # Runtime caches
         #   pos_uid -> last avg_price that TP/TRAIL were anchored to
         self._avg_anchor_cache: Dict[str, float] = {}
+        # throttle bracket order replace (TP/Trailing) to avoid churn
+        self._bracket_replace_last_ts: Dict[Tuple[str, str], float] = {}
 
         # cached symbol map (symbol_id -> symbol)
         self._symbols_cache: Optional[Dict[int, str]] = None
@@ -1118,7 +1158,7 @@ class TradeLiquidation:
         """Info-log helper used by some reconciliation/backfill paths.
 
         Some builds historically referenced self._ilog; to avoid AttributeError we
-        provide a thin wrapper around the module logger.
+        provide a thin wrapper around the module log.
         """
         try:
             if args:
@@ -1767,6 +1807,12 @@ class TradeLiquidation:
         sym_map = self._symbols_map()
         prefix = _sanitize_coid_prefix(str(getattr(self.p, "client_order_id_prefix", "TL") or "TL"))
 
+        # --- bracket replace throttling / tolerance knobs ---
+        REPLACE_COOLDOWN_SEC = float(getattr(self.p, "replace_cooldown_sec", 60) or 60)
+        AVG_EPS_PCT = float(getattr(self.p, "avg_eps_pct", 0.02) or 0.02)  # percent
+        PRICE_EPS_TICKS = int(getattr(self.p, "price_eps_ticks", 2) or 2)
+        now_ts = time.time()
+
         max_age_h = float(getattr(self.p, "recovery_max_age_hours", 48) or 48)
         place_sl = bool(getattr(self.p, "recovery_place_sl", True))
         # Hedge strategy: do not auto-place SL brackets (hedge replaces SL)
@@ -2100,6 +2146,55 @@ class TradeLiquidation:
             # Hard guarantee: TP must be on the correct side of entry.
             # (Some safety/rounding logic can otherwise push it across.)
             tp_price = _ensure_tp_trail_side(tp_price, entry, tick, side, kind="tp")
+            # If our TP exists but trigger price no longer matches (e.g. after averaging fill),
+            # cancel it so we can recreate at the new correct level.
+            try:
+                tp_order = None
+                for ao in (open_algo_by_symbol.get(sym) or []):
+                    if str(ao.get("clientAlgoId") or "") == cid_tp:
+                        tp_order = ao
+                        break
+                if tp_order is not None:
+                    try:
+                        tp_trg = float(tp_order.get("triggerPrice") or tp_order.get("stopPrice") or 0.0)
+                    except Exception:
+                        tp_trg = 0.0
+                    tol = max(
+                        float(tick or 0.0) * float(PRICE_EPS_TICKS),
+                        abs(float(tp_price)) * (float(AVG_EPS_PCT) / 100.0),
+                        1e-12,
+                    )
+                    if tp_trg > 0.0 and abs(tp_trg - float(tp_price)) > tol:
+                        # cancel stale TP (throttle to avoid churn)
+                        _last = float(self._bracket_replace_last_ts.get((pos_uid, "tp"), 0.0) or 0.0)
+                        if (now_ts - _last) >= float(REPLACE_COOLDOWN_SEC):
+                            try:
+                                self._binance.cancel_algo_order(symbol=sym, clientAlgoId=cid_tp)
+                            except Exception:
+                                pass
+                            has_tp = False
+                            self._bracket_replace_last_ts[(pos_uid, "tp")] = now_ts
+            except Exception:
+                pass
+
+            # Ensure TP exists (and matches current avg/entry-based level)
+            if not has_tp:
+                try:
+                    tp_side = "SELL" if side == "LONG" else "BUY"
+                    self._binance.new_algo_order(
+                        symbol=sym,
+                        side=tp_side,
+                        type="TAKE_PROFIT_MARKET",
+                        closePosition="true",
+                        workingType="MARK_PRICE",
+                        positionSide=side,
+                        algoType="CONDITIONAL",
+                        clientAlgoId=cid_tp,
+                        triggerPrice=str(tp_price),
+                    )
+                    has_tp = True
+                except Exception as _e:
+                    log.warning("[trade_liquidation][RECOVER] failed to place TP %s %s: %s", sym, side, _e)
 
             # place missing orders
             
@@ -2187,18 +2282,34 @@ class TradeLiquidation:
                             resp = _tl_place_algo_with_retry(_place, max_tries=int(getattr(self.p, "trailing_place_retries", 3) or 3))
 
                         else:
-                            params = dict(
-                                symbol=sym,
-                                side=close_side,
-                                type="STOP_MARKET",
-                                stopPrice=float(sl_price),
-                                closePosition=True,
-                                workingType=str(getattr(self.p, "working_type", "MARK_PRICE")),
-                                newClientOrderId=cid_trl,
-                                positionSide=position_side if hedge_mode else None,
-                            )
-                            if (not hedge_mode) and bool(self.p.reduce_only):
-                                params["reduceOnly"] = True
+                            # In hedge mode, SL is implemented as a conditional market order that OPENS the opposite hedge leg.
+                            if hedge_mode and bool(getattr(self.p, "hedge_enabled", False)):
+                                hedge_koff = float(getattr(self.p, "hedge_koff", 1.0) or 1.0)
+                                hedge_qty = float(abs(float(qty_use)) * hedge_koff)
+                                hedge_ps = "SHORT" if position_side == "LONG" else "LONG"
+                                params = dict(
+                                    symbol=sym,
+                                    side=close_side,
+                                    type="STOP_MARKET",
+                                    stopPrice=float(sl_price),
+                                    quantity=hedge_qty,
+                                    workingType=str(getattr(self.p, "working_type", "MARK_PRICE")),
+                                    newClientOrderId=cid_trl,
+                                    positionSide=hedge_ps,
+                                )
+                            else:
+                                params = dict(
+                                    symbol=sym,
+                                    side=close_side,
+                                    type="STOP_MARKET",
+                                    stopPrice=float(sl_price),
+                                    closePosition=True,
+                                    workingType=str(getattr(self.p, "working_type", "MARK_PRICE")),
+                                    newClientOrderId=cid_trl,
+                                    positionSide=position_side if hedge_mode else None,
+                                )
+                                if (not hedge_mode) and bool(self.p.reduce_only):
+                                    params["reduceOnly"] = True
                             def _place_sl2(i: int):
                                 p2 = dict(params)
                                 try:
@@ -2206,12 +2317,12 @@ class TradeLiquidation:
                                     # Mark-based protection from -2021: force stop further away from current mark.
                                     mark_sl = 0.0
                                     try:
-                                        mark_sl = float(self._get_mark_price(symbol) or 0.0)
+                                        mark_sl = float(self._get_mark_price(sym) or 0.0)
                                     except Exception:
                                         mark_sl = 0.0
                                     if mark_sl <= 0:
                                         try:
-                                            mark_sl = float(self._get_last_price(symbol) or 0.0)
+                                            mark_sl = float(self._get_last_price(sym) or 0.0)
                                         except Exception:
                                             mark_sl = 0.0
 
@@ -2351,6 +2462,66 @@ class TradeLiquidation:
                 except Exception:
                     log.exception("[trade_liquidation][RECOVERY] failed to place TP %s %s pos_uid=%s", sym, side, pos_uid)
 
+            # If TRAILING exists but based on old entry/avg price, cancel so it can be re-placed on the new level.
+            # This also covers manual position additions that change avgEntryPrice on the exchange.
+            if cid_trl and has_trl:
+                try:
+                    # Find existing trailing algo order (if any)
+                    trl_ao = None
+                    for ao in open_algo_by_symbol.get(sym, []) or []:
+                        if str(ao.get("clientAlgoId") or "") == str(cid_trl):
+                            trl_ao = ao
+                            break
+
+                    if trl_ao is not None:
+                        # Desired activation price from current exchange entry price
+                        mark = float(ex_mark_map.get(sym) or 0.0)
+                        activation_pct = float(getattr(self.p, "trailing_activation_pct", 0.0) or 0.0)
+                        activation_buf_pct = float(getattr(self.p, "trailing_activation_buffer_pct", 0.0) or 0.0)
+                        activation = max(0.0, activation_pct - activation_buf_pct)
+                        ref_price = float(entry)
+
+                        if close_side == "SELL":
+                            desired_act = ref_price * (1.0 + activation / 100.0)
+                            desired_act = _tl_safe_trigger_price(desired_act, mark, "above", tick=tick)
+                        else:
+                            desired_act = ref_price * (1.0 - activation / 100.0)
+                            desired_act = _tl_safe_trigger_price(desired_act, mark, "below", tick=tick)
+
+                        # Compare with current activation price
+                        cur_act = trl_ao.get("activatePrice") or trl_ao.get("triggerPrice")
+                        try:
+                            cur_act_f = float(cur_act) if cur_act is not None else None
+                        except Exception:
+                            cur_act_f = None
+
+                        # Tolerance: 2 ticks
+                        tol = max(
+                    float(tick or 0.0) * float(PRICE_EPS_TICKS),
+                    abs(float(tr_activate)) * (float(AVG_EPS_PCT) / 100.0),
+                    1e-12,
+                )
+                        if cur_act_f is None or abs(cur_act_f - float(desired_act)) > tol:
+                            self.log.info(
+                                f"[trade_liquidation][auto-recovery] stale TRL {sym} {pos_side}: "
+                                f"cur_activate={cur_act_f} desired_activate={desired_act} -> cancel+recreate"
+                            )
+                            _last = float(self._bracket_replace_last_ts.get((pos_uid, "trl"), 0.0) or 0.0)
+                            if (now_ts - _last) < float(REPLACE_COOLDOWN_SEC):
+                                continue
+                            self._bracket_replace_last_ts[(pos_uid, "trl")] = now_ts
+                            try:
+                                self._binance.cancel_algo_order(symbol=sym, clientAlgoId=cid_trl)
+                            except Exception:
+                                # fallback - might be a regular order
+                                try:
+                                    self._binance.cancel_order(symbol=sym, origClientOrderId=cid_trl)
+                                except Exception:
+                                    pass
+                            has_trl = False
+                except Exception:
+                    # Don't break recovery loop on debug/compare errors
+                    pass
             # Trailing stop recovery (independent from SL deferral): ensure TRAILING is present if enabled
             try:
                 trailing_enabled = bool(getattr(self.p, "trailing_enabled", False))
@@ -2366,7 +2537,7 @@ class TradeLiquidation:
                         mark = self._get_mark_price(sym, position_side if hedge_mode else None)
                         tick = float(getattr(self, "_symbol_tick", {}).get(sym, 0) or 0) or float(getattr(self, "_symbol_tick_size", {}).get(sym, 0) or 0) or 0.0
                         if tick <= 0:
-                            # fallback: reuse ticks from symbol meta if present
+                            # fallback: reuse ticks from sym meta if present
                             tick = float((raw_meta or {}).get("tick_size") or 0) or 0.0
                         act_pct = float(getattr(self.p, "trailing_activation_pct", 0.5) or 0.5)
                         act_des = ref_price * (1 + act_pct / 100.0) if side == "LONG" else ref_price * (1 - act_pct / 100.0)
@@ -2634,9 +2805,9 @@ class TradeLiquidation:
                 except Exception:
                     n_new = None
 
-                # If user set legacy and new is missing OR equals Params default (2),
+                # If user set legacy and new is missing OR equals Params default (1),
                 # prefer legacy.
-                if n_new is None or n_new == 2 or n_new != n_legacy:
+                if n_new is None or n_new == 1 or n_new != n_legacy:
                     return max(0, int(n_legacy))
 
             # Otherwise fall back to new key
@@ -2649,6 +2820,55 @@ class TradeLiquidation:
         except Exception:
             return 0
 
+
+    def _cfg_averaging_min_level_distance_pct(self) -> float:
+        """Read averaging min level distance percent from config with backward-compatible keys.
+
+        Reason:
+          `averaging_min_level_distance_pct` has a non-zero default (15.0). If older configs use
+          a legacy key, we must not accidentally ignore it just because the new key is defaulted.
+
+        Supported keys (priority):
+          1) averaging_min_level_distance_pct (new)
+          2) min_level_distance_pct (legacy / older configs)
+          3) avg_min_level_distance_pct (very old)
+        """
+        DEFAULT = 15.0
+        try:
+            v_new = getattr(self.p, "averaging_min_level_distance_pct", None)
+
+            v_legacy = None
+            try:
+                v_legacy = getattr(self.p, "min_level_distance_pct", None)
+            except Exception:
+                v_legacy = None
+
+            v_old = getattr(self.p, "avg_min_level_distance_pct", None)
+
+            # If user provided legacy key and the new value looks like the default, prefer legacy.
+            if v_legacy is not None:
+                try:
+                    n_legacy = float(v_legacy)
+                except Exception:
+                    n_legacy = DEFAULT
+                try:
+                    n_new = float(v_new) if v_new is not None else None
+                except Exception:
+                    n_new = None
+
+                if n_new is None or abs(n_new - DEFAULT) < 1e-9 or abs(n_new - n_legacy) > 1e-9:
+                    return max(0.0, float(n_legacy))
+
+            if v_new is not None:
+                return max(0.0, float(v_new))
+
+            if v_old is not None:
+                return max(0.0, float(v_old))
+
+            return DEFAULT
+        except Exception:
+            return DEFAULT
+
     def _parse_add_n(self, client_id: str) -> int:
         """Extract ADD number from client_order_id (.._ADD1/.._ADD2..)."""
         try:
@@ -2659,54 +2879,142 @@ class TradeLiquidation:
         except Exception:
             return 0
 
-    def _live_refresh_scale_in_count(self, *, pos_uid: str, prefix: str, tok: str) -> int:
-        """Best-effort compute how many averaging adds were actually FILLED and store into ledger.
+    def _live_refresh_scale_in_count(self, *, pos_uid: str, prefix: str, sym: str, pos_side: str) -> int:
+        """Best-effort compute how many averaging adds were actually executed and store into ledger.
 
-        We consider a scale-in 'done' when there is at least one fill for an ADD order.
-        This protects against double-counting and ensures we never exceed the configured cap.
+        Robust rule (matches our DB validation):
+          - Work only with the correct *order side* for the position (LONG->BUY, SHORT->SELL).
+          - Pick the active series token from the most recent ADD with status NEW/PARTIALLY_FILLED;
+            if none exists, fallback to the most recent FILLED/PARTIALLY_FILLED ADD.
+          - Compute adds_done = MAX(ADDn) among FILLED/PARTIALLY_FILLED for that token.
+
+        This avoids:
+          - double-counting duplicate rows for the same client_order_id,
+          - mixing BUY/SELL series,
+          - mixing different TL_<token>_* series after restarts/rollovers.
         """
         if not self._is_live:
             return 0
 
-        # Pull latest filled ADD orders for this pos_uid.
-        q = """
-        SELECT o.client_order_id
-        FROM public.order_fills f
-        JOIN public.orders o
-          ON o.exchange_id = f.exchange_id
-         AND o.account_id  = f.account_id
-         AND o.order_id    = f.order_id
-        WHERE o.exchange_id=%(ex)s
-          AND o.account_id=%(acc)s
-          AND o.pos_uid=%(pos_uid)s
-          AND o.strategy_id=%(sid)s
-          AND o.client_order_id LIKE %(like)s
-        ORDER BY f.ts DESC
-        LIMIT 500;
-        """
-        like = f"{prefix}_{tok}_ADD%"
-        rows = list(
-            self.store.query_dict(
-                q,
-                {
-                    "ex": int(self.exchange_id),
-                    "acc": int(self.account_id),
-                    "pos_uid": str(pos_uid),
-                    "sid": self.STRATEGY_ID,
-                    "like": like,
-                },
+        sym_u = str(sym or "").upper()
+        pos_side_u = str(pos_side or "").upper()
+        desired_order_side = "BUY" if pos_side_u == "LONG" else "SELL"
+
+        token: str | None = None
+
+        # 1) Prefer active series token (NEW/PARTIALLY_FILLED)
+        try:
+            qtok = """
+            SELECT client_order_id
+            FROM public.orders
+            WHERE exchange_id=%(ex)s
+              AND account_id=%(acc)s
+              AND strategy_id=%(sid)s
+              AND upper(symbol)=%(sym)s
+              AND upper(side)=%(oside)s
+              AND client_order_id LIKE %(like_any)s
+              AND upper(coalesce(status,'')) IN ('NEW','PARTIALLY_FILLED')
+            ORDER BY updated_at DESC
+            LIMIT 50;
+            """
+            rows = list(
+                self.store.query_dict(
+                    qtok,
+                    {
+                        "ex": int(self.exchange_id),
+                        "acc": int(self.account_id),
+                        "sid": self.STRATEGY_ID,
+                        "sym": sym_u,
+                        "oside": desired_order_side,
+                        "like_any": f"{prefix}_%_ADD%",
+                    },
+                )
             )
-        )
+            for r in rows:
+                cid = str(r.get("client_order_id") or "")
+                m = re.match(rf"^{re.escape(prefix)}_([^_]+)_ADD\d+$", cid)
+                if m:
+                    token = m.group(1)
+                    break
+        except Exception:
+            token = None
 
-        done: set[int] = set()
-        for r in rows:
-            n = self._parse_add_n(str(r.get("client_order_id") or ""))
-            if n > 0:
-                done.add(n)
+        # 2) Fallback to the most recent completed series token
+        if token is None:
+            try:
+                qtok2 = """
+                SELECT client_order_id
+                FROM public.orders
+                WHERE exchange_id=%(ex)s
+                  AND account_id=%(acc)s
+                  AND strategy_id=%(sid)s
+                  AND upper(symbol)=%(sym)s
+                  AND upper(side)=%(oside)s
+                  AND client_order_id LIKE %(like_any)s
+                  AND upper(coalesce(status,'')) IN ('FILLED','PARTIALLY_FILLED')
+                ORDER BY updated_at DESC
+                LIMIT 50;
+                """
+                rows = list(
+                    self.store.query_dict(
+                        qtok2,
+                        {
+                            "ex": int(self.exchange_id),
+                            "acc": int(self.account_id),
+                            "sid": self.STRATEGY_ID,
+                            "sym": sym_u,
+                            "oside": desired_order_side,
+                            "like_any": f"{prefix}_%_ADD%",
+                        },
+                    )
+                )
+                for r in rows:
+                    cid = str(r.get("client_order_id") or "")
+                    m = re.match(rf"^{re.escape(prefix)}_([^_]+)_ADD\d+$", cid)
+                    if m:
+                        token = m.group(1)
+                        break
+            except Exception:
+                token = None
 
-        # Use MAX(ADDn) instead of COUNT(DISTINCT), because some exchanges/strategies may
-        # skip numbers after restarts. MAX is a safer "how far did we already scale in".
-        adds_done = max(done) if done else 0
+        # 3) Compute adds_done as MAX(ADDn) among FILLED/PARTIALLY_FILLED for that token
+        adds_done = 0
+        if token:
+            try:
+                qmax = """
+                SELECT client_order_id
+                FROM public.orders
+                WHERE exchange_id=%(ex)s
+                  AND account_id=%(acc)s
+                  AND strategy_id=%(sid)s
+                  AND upper(symbol)=%(sym)s
+                  AND upper(side)=%(oside)s
+                  AND client_order_id LIKE %(like_tok)s
+                  AND upper(coalesce(status,'')) IN ('FILLED','PARTIALLY_FILLED')
+                ORDER BY updated_at DESC
+                LIMIT 1000;
+                """
+                rows = list(
+                    self.store.query_dict(
+                        qmax,
+                        {
+                            "ex": int(self.exchange_id),
+                            "acc": int(self.account_id),
+                            "sid": self.STRATEGY_ID,
+                            "sym": sym_u,
+                            "oside": desired_order_side,
+                            "like_tok": f"{prefix}_{token}_ADD%",
+                        },
+                    )
+                )
+                done: set[int] = set()
+                for r in rows:
+                    n = self._parse_add_n(str(r.get("client_order_id") or ""))
+                    if n > 0:
+                        done.add(n)
+                adds_done = max(done) if done else 0
+            except Exception:
+                adds_done = 0
         try:
             self.store.execute(
                 """
@@ -2729,6 +3037,672 @@ class TradeLiquidation:
             pass
 
         return int(adds_done)
+
+
+    def _live_last_add_fill_price(
+        self,
+        *,
+        sym: str,
+        prefix: str,
+        tok: str,
+        add_n: int,
+    ) -> float:
+        """Return VWAP fill price for the given ADDn using order_fills.
+
+        We rely on DB order_fills (client_order_id is duplicated there) to avoid
+        exchange REST calls during recovery/loops.
+        """
+        try:
+            cid = f"{prefix}_{tok}_ADD{int(add_n)}"
+
+            # order_fills stores symbol_id (no 'symbol' text column). Resolve it once.
+            sym_row = self.store.query_one(
+                """
+                SELECT symbol_id
+                FROM public.symbols
+                WHERE exchange_id=%(ex)s AND upper(symbol)=%(sym)s
+                LIMIT 1;
+                """,
+                {"ex": int(self.exchange_id), "sym": str(sym).upper()},
+            )
+            symbol_id = int(sym_row[0]) if sym_row and sym_row[0] is not None else 0
+            if symbol_id <= 0:
+                return 0.0
+
+            row = self.store.query_one(
+                """
+                SELECT
+                  SUM(price * qty) / NULLIF(SUM(qty), 0) AS vwap
+                FROM public.order_fills
+                WHERE exchange_id=%(ex)s
+                  AND account_id=%(acc)s
+                  AND symbol_id=%(symbol_id)s
+                  AND client_order_id=%(cid)s
+                  AND qty > 0;
+                """,
+                {"ex": int(self.exchange_id), "acc": int(self.account_id), "symbol_id": int(symbol_id), "cid": cid},
+            )
+            if not row:
+                return 0.0
+            vwap = row[0]
+            return float(vwap or 0.0)
+        except Exception:
+            return 0.0
+
+
+    def _live_ensure_hedge_after_last_add(
+        self,
+        *,
+        pos: dict,
+        sym: str,
+        pos_side: str,
+        pos_uid: str,
+        prefix: str,
+        tok: str,
+        adds_done: int,
+        max_adds: int,
+    ) -> bool:
+        """After the last allowed add, place a *conditional market* hedge opener.
+
+        This is NOT the main trailing order. We use a dedicated client id:
+          - {prefix}_{tok}_HEDGE
+
+        Trigger is derived from the last add fill and `sl_after_last_add_distance_pct`.
+        Quantity is derived from the *exchange* position size (positionRisk.positionAmt)
+        multiplied by `hedge_koff` and rounded to qty step.
+
+        We also cancel a legacy hedge order that used `{prefix}_{tok}_TRL` with type STOP_MARKET.
+        """
+        try:
+            dist_pct = float(getattr(self.p, "sl_after_last_add_distance_pct", 0.0) or 0.0)
+        except Exception:
+            dist_pct = 0.0
+        if dist_pct <= 0:
+            return False
+
+        if int(adds_done) < int(max_adds) or int(max_adds) <= 0:
+            return False
+
+        last_n = int(min(int(adds_done), int(max_adds)))
+        last_fill = float(self._live_last_add_fill_price(sym=sym, prefix=prefix, tok=tok, add_n=last_n) or 0.0)
+        if last_fill <= 0:
+            return False
+
+        # Resolve symbol_id for DB filtering (orders/order_fills store symbol_id)
+        symbol_id = 0
+        try:
+            sym_row = self.store.query_one(
+                """
+                SELECT symbol_id
+                FROM public.symbols
+                WHERE exchange_id=%(ex)s AND upper(symbol)=%(sym)s
+                LIMIT 1;
+                """,
+                {"ex": int(self.exchange_id), "sym": str(sym).upper()},
+            )
+            symbol_id = int(sym_row[0]) if sym_row and sym_row[0] is not None else 0
+        except Exception:
+            symbol_id = 0
+        if symbol_id <= 0:
+            return False
+
+        # Compare by DB write time (orders.updated_at), not fill time (order_fills.ts).
+        last_add_seen_at = None
+        hedge_seen_at = None
+        try:
+            cid_add = f"{prefix}_{tok}_ADD{int(last_n)}"
+            row = self.store.query_one(
+                """
+                SELECT MAX(updated_at)
+                  FROM public.orders
+                 WHERE exchange_id=%(ex)s
+                   AND account_id=%(acc)s
+                   AND symbol_id=%(symbol_id)s
+                   AND client_order_id=%(cid)s
+                   AND status IN ('FILLED','PARTIALLY_FILLED');
+                """,
+                {"ex": int(self.exchange_id), "acc": int(self.account_id), "symbol_id": int(symbol_id), "cid": cid_add},
+            )
+            last_add_seen_at = row[0] if row else None
+        except Exception:
+            last_add_seen_at = None
+
+        cid_hedge = f"{prefix}_{tok}_HEDGE"
+        try:
+            row = self.store.query_one(
+                """
+                SELECT MAX(updated_at)
+                  FROM public.orders
+                 WHERE exchange_id=%(ex)s
+                   AND account_id=%(acc)s
+                   AND symbol_id=%(symbol_id)s
+                   AND client_order_id=%(cid)s;
+                """,
+                {"ex": int(self.exchange_id), "acc": int(self.account_id), "symbol_id": int(symbol_id), "cid": cid_hedge},
+            )
+            hedge_seen_at = row[0] if row else None
+        except Exception:
+            hedge_seen_at = None
+
+        must_refresh = False
+        try:
+            if last_add_seen_at is not None and (hedge_seen_at is None or hedge_seen_at < last_add_seen_at):
+                must_refresh = True
+        except Exception:
+            must_refresh = False
+
+        # Anti-churn: if we very recently placed after-last-add hedge, don't cancel/recreate it
+        # even if DB snapshots lag behind. This uses hedge_cooldown_sec from config.
+        try:
+            cd_sec = float(getattr(self.p, "hedge_cooldown_sec", 0.0) or 0.0)
+        except Exception:
+            cd_sec = 0.0
+        if cd_sec and cd_sec > 0 and self._pl_has_raw_meta:
+            try:
+                rm = pos.get("raw_meta") if isinstance(pos.get("raw_meta"), dict) else {}
+                ts_s = ((rm.get("live_entry") or {}).get("after_last_add_hedge") or {}).get("ts")
+                if ts_s:
+                    now_ms = self._to_epoch_ms(_utc_now()) or 0
+                    ts_ms = self._to_epoch_ms(ts_s) or 0
+                    if now_ms and ts_ms and (now_ms - ts_ms) < int(cd_sec * 1000):
+                        # don't touch the hedge too often
+                        must_refresh = False
+            except Exception:
+                pass
+
+        side_u = str(pos_side or "").upper()
+        close_side = "SELL" if side_u == "LONG" else "BUY"
+
+        # Trigger price from last add fill
+        if side_u == "LONG":
+            stop_price = last_fill * (1.0 - dist_pct / 100.0)
+        else:
+            stop_price = last_fill * (1.0 + dist_pct / 100.0)
+
+        # Tick rounding
+        tick = 0.0
+        try:
+            tick = float(self._price_tick_for_symbol(sym) or 0.0)
+        except Exception:
+            tick = 0.0
+        if tick and tick > 0:
+            stop_price = float(_round_price_to_tick(stop_price, tick, mode=("down" if close_side == "SELL" else "up")))
+
+        # Avoid immediate trigger wrt mark
+        mark = 0.0
+        try:
+            pr = self._rest_snapshot_get("position_risk") or []
+            for r in pr if isinstance(pr, list) else []:
+                if str(r.get("symbol") or "").upper() != str(sym).upper():
+                    continue
+                ps = str(r.get("positionSide") or "").upper()
+                if ps and ps in {"LONG", "SHORT"} and ps != side_u:
+                    continue
+                mark = float(r.get("markPrice") or 0.0)
+                if mark > 0:
+                    break
+        except Exception:
+            mark = 0.0
+        if mark > 0 and tick and tick > 0:
+            if close_side == "BUY" and stop_price <= mark:
+                stop_price = float(_round_price_to_tick(mark + tick, tick, mode="up"))
+            if close_side == "SELL" and stop_price >= mark:
+                stop_price = float(_round_price_to_tick(mark - tick, tick, mode="down"))
+
+        # Find open algos by clientAlgoId
+        open_algos = self._rest_snapshot_get("open_algo_orders_all") or []
+        found_hedge = None
+        found_legacy = None
+        legacy_cid = f"{prefix}_{tok}_TRL"
+        for ao in open_algos if isinstance(open_algos, list) else []:
+            try:
+                if str(ao.get("symbol") or "").upper() != str(sym).upper():
+                    continue
+                cid = str(ao.get("clientAlgoId") or "")
+                otype = str(ao.get("orderType") or ao.get("type") or "").upper()
+                if cid == cid_hedge:
+                    found_hedge = ao
+                if cid == legacy_cid and otype in {"STOP_MARKET", "STOP"}:
+                    found_legacy = ao
+            except Exception:
+                continue
+
+        # If hedge exists and trigger already matches, keep it (ignore must_refresh).
+        # DB may lag behind exchange; we prefer exchange snapshot here.
+        if found_hedge is not None:
+            try:
+                cur = found_hedge.get("triggerPrice") or found_hedge.get("stopPrice")
+                cur_f = float(cur) if cur is not None else 0.0
+                tol = max(float(tick or 0.0) * 2.0, abs(stop_price) * 0.0002, 1e-8)
+                if cur_f > 0 and abs(cur_f - float(stop_price)) <= tol:
+                    return False
+            except Exception:
+                pass
+
+        # Cancel existing hedge (best-effort) only if we really want to refresh it.
+        if must_refresh or found_hedge is not None:
+            for cid in (cid_hedge,):
+                try:
+                    self._binance.cancel_algo_order(symbol=sym, clientAlgoId=cid)
+                except Exception:
+                    try:
+                        self._binance.cancel_order(symbol=sym, origClientOrderId=cid)
+                    except Exception:
+                        pass
+
+        # Cancel legacy hedge stored under _TRL if it's STOP_MARKET
+        if found_legacy is not None:
+            try:
+                self._binance.cancel_algo_order(symbol=sym, clientAlgoId=legacy_cid)
+            except Exception:
+                pass
+
+        # Quantity: must be based on exchange position size
+        qty_main = 0.0
+        try:
+            pr = self._rest_snapshot_get("position_risk") or []
+            for r in pr if isinstance(pr, list) else []:
+                if str(r.get("symbol") or "").upper() != str(sym).upper():
+                    continue
+                ps = str(r.get("positionSide") or "").upper()
+                if ps in {"LONG", "SHORT"} and ps != side_u:
+                    continue
+                amt = float(r.get("positionAmt") or 0.0)
+                if abs(amt) > 0:
+                    qty_main = abs(float(amt))
+                    break
+        except Exception:
+            qty_main = 0.0
+        if qty_main <= 0:
+            qty_main = _safe_float(pos.get("qty_current") or 0.0, 0.0)
+        if qty_main <= 0:
+            return False
+
+        hedge_koff = float(getattr(self.p, "hedge_koff", 1.0) or 1.0)
+        hedge_qty = float(abs(float(qty_main)) * hedge_koff)
+
+        # qty step rounding
+        try:
+            qty_step = float(self._qty_step_for_symbol(sym) or 0.0)
+        except Exception:
+            qty_step = 0.0
+        if qty_step and qty_step > 0:
+            hedge_qty = float(_round_qty_to_step(hedge_qty, qty_step, mode="down"))
+        if hedge_qty <= 0:
+            return False
+
+        # Hedge position side is opposite
+        hedge_ps = "SHORT" if side_u == "LONG" else "LONG"
+
+        try:
+            self._binance.new_order(
+                symbol=sym,
+                side=close_side,
+                type="STOP_MARKET",
+                stopPrice=float(stop_price),
+                quantity=float(hedge_qty),
+                workingType=str(getattr(self.p, "working_type", "MARK_PRICE")),
+                newClientOrderId=cid_hedge,
+                positionSide=hedge_ps,
+            )
+        except Exception:
+            return False
+
+        # store meta flag (best-effort)
+        try:
+            if self._pl_has_raw_meta:
+                meta = {
+                    "after_last_add_hedge": {
+                        "add_n": int(last_n),
+                        "fill": float(last_fill),
+                        "stop": float(stop_price),
+                        "pct": float(dist_pct),
+                        "qty_main": float(qty_main),
+                        "qty_hedge": float(hedge_qty),
+                        "ts": _utc_now().isoformat(),
+                    }
+                }
+                self.store.execute(
+                    """
+                    UPDATE public.position_ledger
+                       SET raw_meta = COALESCE(raw_meta, '{}'::jsonb) || %(meta)s::jsonb
+                     WHERE exchange_id=%(ex)s AND account_id=%(acc)s AND strategy_id=%(st)s
+                       AND symbol_id=%(symbol_id)s AND side=%(side)s AND source='live'
+                       AND updated_at = (
+                           SELECT MAX(updated_at) FROM public.position_ledger
+                            WHERE exchange_id=%(ex)s AND account_id=%(acc)s AND strategy_id=%(st)s
+                              AND symbol_id=%(symbol_id)s AND side=%(side)s AND source='live'
+                       );
+                    """,
+                    {
+                        "meta": json.dumps(meta),
+                        "ex": int(self.exchange_id),
+                        "acc": int(self.account_id),
+                        "st": str(self.strategy_id),
+                        "symbol_id": int(symbol_id),
+                        "side": str(side_u),
+                    },
+                )
+        except Exception:
+            pass
+
+        self.log.info(
+            "[trade_liquidation][LIVE][HEDGE] placed after-last-add STOP_MARKET %s %s stop=%.8f (last_add=%.8f add_n=%s pct=%.4f qty=%.8f koff=%.4f)",
+            str(sym).upper(),
+            str(side_u),
+            float(stop_price),
+            float(last_fill),
+            str(last_n),
+            float(dist_pct),
+            float(hedge_qty),
+            float(hedge_koff),
+        )
+        return True
+
+    def _live_ensure_tp_trailing_after_last_add(
+        self,
+        *,
+        sym: str,
+        pos_side: str,
+        prefix: str,
+        tok: str,
+        adds_done: int,
+        max_adds: int,
+    ) -> bool:
+        """After the last allowed add, (re)place a trailing order for the MAIN position to take profit.
+
+        Uses config:
+          - trailing_enabled
+          - trailing_activation_pct
+          - trailing_trail_pct
+          - trailing_activation_buffer_pct (anti -2021)
+
+        Client id:
+          - {prefix}_{tok}_TRL   (kept for backwards compatibility)
+        """
+        if not bool(getattr(self.p, "trailing_enabled", False)):
+            return False
+        if int(adds_done) < int(max_adds) or int(max_adds) <= 0:
+            return False
+
+        # last add fill (used only as a "freshness" anchor + debug)
+        last_n = int(min(int(adds_done), int(max_adds)))
+        last_fill = float(self._live_last_add_fill_price(sym=sym, prefix=prefix, tok=tok, add_n=last_n) or 0.0)
+        if last_fill <= 0:
+            return False
+
+        side_u = str(pos_side or "").upper()
+        close_side = "SELL" if side_u == "LONG" else "BUY"
+
+        # Activation base MUST be the average entry price (per config requirement).
+        # In Binance positionRisk, entryPrice is the (avg) entry price for that position side.
+        entry_price = 0.0
+        try:
+            pr = self._rest_snapshot_get("position_risk") or []
+            for r in pr if isinstance(pr, list) else []:
+                if str(r.get("symbol") or "").upper() != str(sym).upper():
+                    continue
+                ps = str(r.get("positionSide") or "").upper()
+                if ps and ps in {"LONG", "SHORT"} and ps != side_u:
+                    continue
+                entry_price = float(r.get("entryPrice") or 0.0)
+                if entry_price > 0:
+                    break
+        except Exception:
+            entry_price = 0.0
+
+        # Fallback (shouldn't happen for our positions, but keep safe): use last add fill.
+        if entry_price <= 0:
+            entry_price = float(last_fill)
+
+        act_pct = float(getattr(self.p, "trailing_activation_pct", 0.0) or 0.0)
+        trail_pct = float(getattr(self.p, "trailing_trail_pct", 0.0) or 0.0)
+        buf_pct = float(getattr(self.p, "trailing_activation_buffer_pct", 0.0) or 0.0)
+        if act_pct <= 0 or trail_pct <= 0:
+            return False
+
+        # Activation towards profit direction, based on AVG ENTRY PRICE (not last add fill).
+        if side_u == "LONG":
+            activation = entry_price * (1.0 + act_pct / 100.0)
+        else:
+            activation = entry_price * (1.0 - act_pct / 100.0)
+
+        # Tick rounding
+        tick = 0.0
+        try:
+            tick = float(self._price_tick_for_symbol(sym) or 0.0)
+        except Exception:
+            tick = 0.0
+        if tick and tick > 0:
+            activation = float(_round_price_to_tick(activation, tick, mode=("up" if side_u == "LONG" else "down")))
+
+        # Ensure activation doesn't immediately trigger relative to mark price (buffer)
+        mark = 0.0
+        try:
+            pr = self._rest_snapshot_get("position_risk") or []
+            for r in pr if isinstance(pr, list) else []:
+                if str(r.get("symbol") or "").upper() != str(sym).upper():
+                    continue
+                ps = str(r.get("positionSide") or "").upper()
+                if ps and ps in {"LONG", "SHORT"} and ps != side_u:
+                    continue
+                mark = float(r.get("markPrice") or 0.0)
+                if mark > 0:
+                    break
+        except Exception:
+            mark = 0.0
+
+        if mark > 0 and tick and tick > 0:
+            if side_u == "LONG":
+                # activation must be ABOVE mark
+                min_act = mark * (1.0 + buf_pct / 100.0)
+                if activation <= min_act:
+                    activation = float(_round_price_to_tick(min_act + tick, tick, mode="up"))
+            else:
+                # activation must be BELOW mark
+                max_act = mark * (1.0 - buf_pct / 100.0)
+                if activation >= max_act:
+                    activation = float(_round_price_to_tick(max_act - tick, tick, mode="down"))
+
+        cid_trl = f"{prefix}_{tok}_TRL"
+
+        # If existing TRL is already TRAILING_STOP_MARKET, do not re-place unless older than last add in DB.
+        # (We compare by orders.updated_at.)
+        symbol_id = 0
+        try:
+            sym_row = self.store.query_one(
+                """
+                SELECT symbol_id
+                FROM public.symbols
+                WHERE exchange_id=%(ex)s AND upper(symbol)=%(sym)s
+                LIMIT 1;
+                """,
+                {"ex": int(self.exchange_id), "sym": str(sym).upper()},
+            )
+            symbol_id = int(sym_row[0]) if sym_row and sym_row[0] is not None else 0
+        except Exception:
+            symbol_id = 0
+
+        last_add_seen_at = None
+        trl_seen_at = None
+        if symbol_id > 0:
+            try:
+                cid_add = f"{prefix}_{tok}_ADD{int(last_n)}"
+                row = self.store.query_one(
+                    """
+                    SELECT MAX(updated_at)
+                      FROM public.orders
+                     WHERE exchange_id=%(ex)s AND account_id=%(acc)s AND symbol_id=%(symbol_id)s
+                       AND client_order_id=%(cid)s AND status IN ('FILLED','PARTIALLY_FILLED');
+                    """,
+                    {"ex": int(self.exchange_id), "acc": int(self.account_id), "symbol_id": int(symbol_id), "cid": cid_add},
+                )
+                last_add_seen_at = row[0] if row else None
+            except Exception:
+                last_add_seen_at = None
+            try:
+                row = self.store.query_one(
+                    """
+                    SELECT MAX(updated_at)
+                      FROM public.orders
+                     WHERE exchange_id=%(ex)s AND account_id=%(acc)s AND symbol_id=%(symbol_id)s
+                       AND client_order_id=%(cid)s;
+                    """,
+                    {"ex": int(self.exchange_id), "acc": int(self.account_id), "symbol_id": int(symbol_id), "cid": cid_trl},
+                )
+                trl_seen_at = row[0] if row else None
+            except Exception:
+                trl_seen_at = None
+
+        must_refresh = True
+        try:
+            if last_add_seen_at is not None and trl_seen_at is not None and trl_seen_at >= last_add_seen_at:
+                must_refresh = False
+        except Exception:
+            must_refresh = True
+
+        # Open algo orders snapshot
+        open_algos = self._rest_snapshot_get("open_algo_orders_all") or []
+        existing = None
+        for ao in open_algos if isinstance(open_algos, list) else []:
+            try:
+                if str(ao.get("symbol") or "").upper() != str(sym).upper():
+                    continue
+                if str(ao.get("clientAlgoId") or "") != cid_trl:
+                    continue
+                otype = str(ao.get("orderType") or ao.get("type") or "").upper()
+                if otype == "TRAILING_STOP_MARKET":
+                    existing = ao
+                    break
+            except Exception:
+                continue
+
+        # If TRL already exists and matches our desired params, keep it.
+        # We prefer exchange snapshot over DB timestamps to avoid "thrash" when DB sync lags.
+        if existing is not None:
+            try:
+                ex_act = float(existing.get("activatePrice") or existing.get("activationPrice") or 0.0)
+            except Exception:
+                ex_act = 0.0
+            try:
+                ex_cb = float(existing.get("callbackRate") or 0.0)
+            except Exception:
+                ex_cb = 0.0
+            eps = float(tick or 0.0) * 2.0 if tick and tick > 0 else 1e-9
+            if abs(ex_act - float(activation)) <= max(eps, 1e-9) and abs(ex_cb - float(trail_pct)) <= 1e-9:
+                return False
+
+        if (not must_refresh) and existing is not None:
+            # already fresh by DB time
+            return False
+
+        # Cancel existing TRL (best-effort)
+        try:
+            self._binance.cancel_algo_order(symbol=sym, clientAlgoId=cid_trl)
+        except Exception:
+            pass
+
+        hedge_mode = bool(getattr(self.p, "hedge_enabled", False))
+        position_side = side_u if hedge_mode else "BOTH"
+
+        # NOTE: Binance UM Futures TRAILING_STOP_MARKET in hedge mode is reliably accepted with
+        # explicit quantity. Using closePosition=true for trailing is rejected on some accounts/
+        # endpoints (HTTP 400), which caused a "place then cancel" loop with recovery.
+        qty_main = 0.0
+        try:
+            pr = self._rest_snapshot_get("position_risk") or []
+            for r in pr if isinstance(pr, list) else []:
+                if str(r.get("symbol") or "").upper() != str(sym).upper():
+                    continue
+                ps = str(r.get("positionSide") or "").upper()
+                if hedge_mode and ps in {"LONG", "SHORT"} and ps != side_u:
+                    continue
+                amt = float(r.get("positionAmt") or 0.0)
+                qty_main = abs(amt)
+                if qty_main > 0:
+                    break
+        except Exception:
+            qty_main = 0.0
+
+        if qty_main <= 0:
+            return False
+
+        # round to step
+        try:
+            step = float(self._qty_step_for_symbol(sym) or 0.0)
+        except Exception:
+            step = 0.0
+        if step and step > 0:
+            qty_main = float(_round_qty_to_step(qty_main, step, mode="down"))
+        if qty_main <= 0:
+            return False
+
+        try:
+            self._binance.new_order(
+                symbol=sym,
+                side=close_side,
+                type="TRAILING_STOP_MARKET",
+                quantity=float(qty_main),
+                callbackRate=float(trail_pct),
+                activationPrice=float(activation),
+                workingType=str(getattr(self.p, "working_type", "MARK_PRICE")),
+                newClientOrderId=cid_trl,
+                positionSide=position_side if hedge_mode else None,
+            )
+        except Exception:
+            return False
+
+        # store meta flag (best-effort)
+        try:
+            if self._pl_has_raw_meta and symbol_id > 0:
+                meta = {
+                    "after_last_add_tp_trl": {
+                        "add_n": int(last_n),
+                        "fill": float(last_fill),
+                        "entry_price": float(entry_price),
+                        "activation": float(activation),
+                        "trail_pct": float(trail_pct),
+                        "act_pct": float(act_pct),
+                        "buf_pct": float(buf_pct),
+                        "ts": _utc_now().isoformat(),
+                    }
+                }
+                self.store.execute(
+                    """
+                    UPDATE public.position_ledger
+                       SET raw_meta = COALESCE(raw_meta, '{}'::jsonb) || %(meta)s::jsonb
+                     WHERE exchange_id=%(ex)s AND account_id=%(acc)s AND strategy_id=%(st)s
+                       AND symbol_id=%(symbol_id)s AND side=%(side)s AND source='live'
+                       AND updated_at = (
+                           SELECT MAX(updated_at) FROM public.position_ledger
+                            WHERE exchange_id=%(ex)s AND account_id=%(acc)s AND strategy_id=%(st)s
+                              AND symbol_id=%(symbol_id)s AND side=%(side)s AND source='live'
+                       );
+                    """,
+                    {
+                        "meta": json.dumps(meta),
+                        "ex": int(self.exchange_id),
+                        "acc": int(self.account_id),
+                        "st": str(self.strategy_id),
+                        "symbol_id": int(symbol_id),
+                        "side": str(side_u),
+                    },
+                )
+        except Exception:
+            pass
+
+        self.log.info(
+            "[trade_liquidation][LIVE][TP_TRL] placed after-last-add TRAILING_STOP_MARKET %s %s activation=%.8f (entry=%.8f last_add=%.8f add_n=%s act_pct=%.4f trail_pct=%.4f)",
+            str(sym).upper(),
+            str(side_u),
+            float(activation),
+            float(entry_price),
+            float(last_fill),
+            str(last_n),
+            float(act_pct),
+            float(trail_pct),
+        )
+        return True
 
     def _live_ensure_next_add_order(self, *, pos: dict) -> bool:
         """Ensure the *next* averaging add order exists (LIVE).
@@ -2758,10 +3732,33 @@ class TradeLiquidation:
             return False
 
         prefix = _sanitize_coid_prefix(str(getattr(self.p, "client_order_prefix", "TL") or "TL"))
-        tok = _coid_token(pos_uid)
-
-        # Refresh adds_done from real fills (avoids over-adding after restart)
-        adds_done = self._live_refresh_scale_in_count(pos_uid=pos_uid, prefix=prefix, tok=tok)
+        # IMPORTANT: token must match the live order series token used in client ids
+        # (e.g. TL_<token>_ENTRY / TL_<token>_ADDn / TL_<token>_TRL). It is NOT
+        # derived from pos_uid in production; it is generated at signal time and
+        # stored in raw_meta / orders. If we use a pos_uid-derived token here,
+        # we will fail to find fills/orders and won't refresh protection.
+        tok = ""
+        try:
+            rm = pos.get("raw_meta")
+            if isinstance(rm, str) and rm:
+                rm = json.loads(rm)
+            if isinstance(rm, dict):
+                coid = (
+                    (((rm.get("live_entry") or {}).get("entry_order") or {}).get("clientOrderId"))
+                    or (((rm.get("live_entry") or {}).get("entry_order") or {}).get("client_order_id"))
+                    or ""
+                )
+                if isinstance(coid, str) and coid.startswith(prefix + "_"):
+                    # prefix_token_SUFFIX
+                    m = re.match(rf"^{re.escape(prefix)}_([^_]+)_", coid)
+                    if m:
+                        tok = str(m.group(1) or "")
+        except Exception:
+            tok = ""
+        if not tok:
+            tok = _coid_token(pos_uid, n=20)
+        # Refresh adds_done from DB truth (deduped by ADDn, series token & position side)
+        adds_done = self._live_refresh_scale_in_count(pos_uid=pos_uid, prefix=prefix, sym=sym, pos_side=side)
         # Ledger snapshot may already have something
         try:
             adds_done = max(adds_done, int(pos.get("scale_in_count", 0) or 0))
@@ -2770,6 +3767,34 @@ class TradeLiquidation:
 
         next_n = int(adds_done) + 1
         if next_n > max_adds:
+            # After the last allowed add is filled, place/refresh a protective hedge/SL
+            # relative to that last add price.
+            try:
+                self._live_ensure_hedge_after_last_add(
+                    pos=pos,
+                    sym=sym,
+                    pos_side=side,
+                    pos_uid=pos_uid,
+                    prefix=prefix,
+                    tok=tok,
+                    adds_done=int(adds_done),
+                    max_adds=int(max_adds),
+                )
+                self._live_ensure_tp_trailing_after_last_add(
+                    sym=sym,
+                    pos_side=side,
+                    prefix=prefix,
+                    tok=tok,
+                    adds_done=int(adds_done),
+                    max_adds=int(max_adds),
+                )
+            except Exception:
+                log.exception(
+                    "[trade_liquidation][LIVE][AFTER_LAST_ADD] failed ensure after-last-add orders for %s %s (pos_uid=%s)",
+                    sym,
+                    side,
+                    pos_uid,
+                )
             return False
 
         # Check open ADD orders (openOrders/openAlgoOrders).
@@ -2911,7 +3936,7 @@ class TradeLiquidation:
 
         # Compute next averaging level with "min distance" rule.
         # Reference: entry for 1st add, avg after that.
-        min_dist_pct = float(getattr(self.p, "averaging_min_level_distance_pct", 15.0) or 15.0)
+        min_dist_pct = float(self._cfg_averaging_min_level_distance_pct())
         ref_price = _dec(pos.get("entry_price") or 0) if int(adds_done) == 0 else avg_price
         if ref_price <= 0:
             ref_price = avg_price
@@ -4320,7 +5345,7 @@ class TradeLiquidation:
             lookback_h = int(getattr(self.p, "averaging_levels_lookback_hours", 168) or 168)
             left = int(getattr(self.p, "averaging_pivot_left", 3) or 3)
             right = int(getattr(self.p, "averaging_pivot_right", 3) or 3)
-            min_dist_pct = float(getattr(self.p, "averaging_min_level_distance_pct", 15.0) or 15.0)
+            min_dist_pct = float(self._cfg_averaging_min_level_distance_pct())
             dist_limit_pct = max(5.0, float(min_dist_pct))
 
             if entry_ref <= 0:
@@ -5786,9 +6811,33 @@ class TradeLiquidation:
             if sl_price <= 0:
                 return None
 
-            # Hedge strategy mode: do NOT place SL bracket order (we open opposite hedge on SL-hit)
+            # Hedge strategy mode (Binance Futures hedge mode):
+            # Instead of a classic stop-loss that closes the current leg, place a *conditional market*
+            # order that OPENS the opposite hedge leg when stop price is reached.
             if bool(getattr(self.p, "hedge_enabled", False)):
-                return None
+                if not hedge_mode:
+                    return None
+                try:
+                    tick_size = float(getattr(meta, "tick_size", 0) or 0)
+                    stop_px = float(_round_price_to_tick(sl_price, tick_size, mode="down" if ledger_side == "LONG" else "up"))
+                    hedge_koff = float(getattr(self.p, "hedge_koff", 1.0) or 1.0)
+                    hedge_qty = float(abs(float(qty)) * hedge_koff)
+                    if hedge_qty <= 0:
+                        return None
+                    hedge_ps = "SHORT" if ledger_side == "LONG" else "LONG"
+                    params = dict(
+                        symbol=symbol,
+                        side=close_side,
+                        type="STOP_MARKET",
+                        stopPrice=stop_px,
+                        quantity=hedge_qty,
+                        workingType=str(getattr(self.p, "working_type", "MARK_PRICE")),
+                        newClientOrderId=cid_trl,
+                        positionSide=hedge_ps,
+                    )
+                    return self._binance.new_order(**params)
+                except Exception:
+                    return None
 
             # LIVE trailing stop (Binance Futures): TRAILING_STOP_MARKET
             # Note: in Hedge Mode Binance forbids reduceOnly param, so we omit it there.
@@ -5861,20 +6910,6 @@ class TradeLiquidation:
                     raise last_err
                 return None
 
-            if sl_mode in {"stop_market", "stopmarket", "market"}:
-                params = dict(
-                    symbol=symbol,
-                    side=close_side,
-                    type="STOP_MARKET",
-                    stopPrice=float(_round_price_to_tick(sl_price, tick_size, mode="down" if ledger_side == "LONG" else "up")),
-                    closePosition=True,
-                    workingType=str(getattr(self.p, "working_type", "MARK_PRICE")),
-                    newClientOrderId=cid_trl,
-                    positionSide=position_side if hedge_mode else None,
-                )
-                if (not hedge_mode) and bool(self.p.reduce_only):
-                    params["reduceOnly"] = True
-                return self._binance.new_order(**params)
 
             # stop-limit (STOP)
             params = dict(
@@ -6036,7 +7071,7 @@ class TradeLiquidation:
                     left = int(getattr(self.p, "averaging_pivot_left", 3) or 3)
                     right = int(getattr(self.p, "averaging_pivot_right", 3) or 3)
                     tol_pct = float(getattr(self.p, "averaging_level_tolerance_pct", 0.15) or 0.15)
-                    min_dist_pct = float(getattr(self.p, "averaging_min_level_distance_pct", 15.0) or 15.0)
+                    min_dist_pct = float(self._cfg_averaging_min_level_distance_pct())
                     dist_limit_pct = max(5.0, float(min_dist_pct))
 
                     # load candles

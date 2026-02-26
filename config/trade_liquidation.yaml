@@ -38,13 +38,13 @@ traders:
 
       # Кулдаун по символу (в минутах): не открывать новую сделку по символу,
       # если недавно уже была попытка/сделка по этому же символу.
-      per_symbol_cooldown_minutes: 120
+      per_symbol_cooldown_minutes: 60
 
       # Максимум попыток открыть сделку по одному сигналу
       max_attempts_per_signal: 3
 
       # Пауза (в минутах) между повторными попытками по одному и тому же сигналу
-      retry_cooldown_minutes: 5
+      retry_cooldown_minutes: 1
 
       # Ключ в context (jsonb) для хранения/учёта попыток
       attempts_context_key: trade_liquidation
@@ -59,7 +59,7 @@ traders:
       expire_old_signals: true
 
       # Экспирировать сигналы NEW, если они старше этого возраста (в минутах)
-      expire_max_age_minutes: 240
+      expire_max_age_minutes: 60
 
       # Сколько сигналов максимум обрабатывать за один проход экспирации
       expire_batch_limit: 5000
@@ -111,7 +111,7 @@ traders:
       leverage: 10                                 # Плечо (leverage) для символа
       margin_type: CROSSED                         # Тип маржи: CROSSED или ISOLATED
       hedge_enabled: true                          # Hedge mode: true => positionSide LONG/SHORT
-      hedge_koff: 1.5                              # Hedge qty multiplier vs main position qty
+      hedge_koff: 1.1                              # Hedge qty multiplier vs main position qty
       hedge_ema_window: 20                         # EMA window
       hedge_ema_interval: "5m"                     # EMA timeframe (candles.interval)
       hedge_ema_confirm_bars: 3                    # EMA direction confirmation bars (anti-chop)
@@ -125,7 +125,7 @@ traders:
       hedge_reopen_drawdown_pct: 0.0               # Reopen threshold drawdown (%). 0 => any negative unrealized PnL
       all_P_L: 10.0                                # Close BOTH (main+hedge) if combined unrealized PnL >= this USDT
 
-      max_open_positions: 3                         # Максимум одновременно открытых позиций
+      max_open_positions: 5                        # Максимум одновременно открытых позиций
 
       # Максимальный размер позиции относительно кошелька (в % от wallet) — ограничение на notional.
       max_position_notional_pct_wallet: 10.0
@@ -189,7 +189,7 @@ traders:
       # ----------------------------
 
       averaging_enabled: true                        # Разрешить добавки к позиции
-      averaging_max_adds: 1                          # Максимум добавок (сколько раз усредняться)
+      averaging_max_adds: 2                          # Максимум добавок (сколько раз усредняться)
 
 #      averaging_add_size_mode: risk_pct             # Режим размера добавки: risk_pct / fixed / wallet_pct (зависит от реализации)
 #      averaging_add_size_value: 10                  # Значение для выбранного режима (например, %)
@@ -207,7 +207,7 @@ traders:
       averaging_level_tolerance_pct: 0.15            # Допуск (в %) при сравнении цены с уровнем
 
       # Минимальная дистанция до ближайшего уровня добора (в % от цены-референса: entry до 1-го добора, avg после)
-      averaging_min_level_distance_pct: 10.0         # Если ближайший уровень ближе этого процента — берём следующий.
+      averaging_min_level_distance_pct: 5.0          # Если ближайший уровень ближе этого процента — берём следующий.
 
       # Параметры volume profile (если используется)
       averaging_vp_bins: 48                          # Кол-во корзин VP
@@ -217,6 +217,11 @@ traders:
       averaging_pivot_left: 4                        # Pivot left bars
       averaging_pivot_right: 4                       # Pivot right bars
       averaging_cluster_tolerance_pct: 0.25          # Допуск объединения уровней в кластер (%)
+
+
+      replace_cooldown_sec: 60
+      avg_eps_pct: 0.02
+      price_eps_ticks: 2
 
       # ----------------------------
       # Debug/логирование
@@ -256,7 +261,7 @@ traders:
       # Portfolio cap (ограничение на использование маржи/кошелька)
       # ----------------------------
 
-      portfolio_cap_ratio: 0.5       # 0=OFF. Если SUM(position_ledger.position_value_usdt WHERE OPEN)/wallet >= ratio -> не открываем новые сделки.
+      portfolio_cap_ratio: 0.7       # 0=OFF. Если SUM(position_ledger.position_value_usdt WHERE OPEN)/wallet >= ratio -> не открываем новые сделки.
                                      # Пример: 0.7 = не превышать 70% от баланса; 1.0 = не превышать 1x wallet.
 
       # ----------------------------

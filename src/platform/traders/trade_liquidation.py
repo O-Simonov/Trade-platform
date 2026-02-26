@@ -1309,6 +1309,112 @@ class TradeLiquidation:
         return False
 
 
+
+    def _is_our_position_by_symbol_side(
+        self,
+        symbol: str,
+        side: str,
+        open_orders_all: Any,
+        open_algo_orders_all: Any,
+        raw_meta: Any,
+    ) -> bool:
+        """Decide if position should be treated as 'ours' for reconcile purposes.
+
+        Variant A: adjust ONLY our positions, but detect them reliably even if pos_uid is not embedded
+        into client IDs (Binance does not include pos_uid).
+
+        Heuristic (ordered):
+          1) raw_meta live_entry.entry_order.clientOrderId starts with our prefix (e.g. 'TL_')
+          2) any OPEN regular order for this symbol has clientOrderId starting with prefix
+          3) any OPEN algo order for this symbol has clientAlgoId starting with prefix
+          4) recent DB orders for this symbol have client_order_id starting with prefix (last 7 days)
+
+        If unsure -> False (treat as external).
+        """
+        sym = str(symbol or "").strip().upper()
+        sd = str(side or "").strip().upper()
+        if not sym or sd not in {"LONG", "SHORT"}:
+            return False
+
+        prefix = str(getattr(self.p, "client_order_id_prefix", "TL") or "TL").strip()
+        if prefix and not prefix.endswith("_"):
+            prefix_ = prefix + "_"
+        else:
+            prefix_ = prefix
+
+        # 1) raw_meta marker
+        try:
+            meta = raw_meta
+            if isinstance(meta, str) and meta.strip():
+                try:
+                    meta = json.loads(meta)
+                except Exception:
+                    meta = None
+            if isinstance(meta, dict):
+                le = meta.get("live_entry") if isinstance(meta.get("live_entry"), dict) else None
+                if le:
+                    eo = le.get("entry_order") if isinstance(le.get("entry_order"), dict) else None
+                    if eo:
+                        coid = str(eo.get("clientOrderId") or "")
+                        if coid.startswith(prefix_):
+                            return True
+        except Exception:
+            pass
+
+        # 2) open regular orders snapshot
+        try:
+            rows = open_orders_all if isinstance(open_orders_all, list) else []
+            for o in rows:
+                if str((o or {}).get("symbol") or "").strip().upper() != sym:
+                    continue
+                coid = str((o or {}).get("clientOrderId") or "")
+                if coid.startswith(prefix_):
+                    return True
+        except Exception:
+            pass
+
+        # 3) open algo orders snapshot
+        try:
+            rows = open_algo_orders_all if isinstance(open_algo_orders_all, list) else []
+            for o in rows:
+                if str((o or {}).get("symbol") or "").strip().upper() != sym:
+                    continue
+                coid = str((o or {}).get("clientAlgoId") or "")
+                if coid.startswith(prefix_):
+                    return True
+        except Exception:
+            pass
+
+        # 4) DB fallback (recent orders)
+        try:
+            row = self.store.query_one(
+                """
+                SELECT 1
+                FROM orders o
+                JOIN symbols s ON s.symbol_id=o.symbol_id AND s.exchange_id=o.exchange_id
+                WHERE o.exchange_id=%(ex)s
+                  AND o.account_id=%(acc)s
+                  AND o.strategy_id=%(sid)s
+                  AND s.symbol=%(sym)s
+                  AND o.client_order_id LIKE %(pfx)s
+                  AND o.updated_at >= (now() - interval '7 days')
+                LIMIT 1
+                """,
+                {
+                    "ex": int(self.p.exchange_id),
+                    "acc": int(self.account_id),
+                    "sid": str(self.STRATEGY_ID),
+                    "sym": sym,
+                    "pfx": prefix_ + "%",
+                },
+            )
+            if row:
+                return True
+        except Exception:
+            pass
+
+        return False
+
     def _maybe_refresh_rest_snapshot(self) -> None:
         """Fetch REST data in parallel (balance / positionRisk / openOrders).
 
@@ -1572,6 +1678,7 @@ class TradeLiquidation:
 
         pr = self._rest_snapshot_get("position_risk")
         oo_all = self._rest_snapshot_get("open_orders_all")
+        oo_algo_all = self._rest_snapshot_get("open_algo_orders_all")
         used = self._portfolio_used_margin_usdt(pr)
         used_over = (used / wallet_f) if wallet_f > 0 else 0.0
         blocked = bool(wallet_f > 0 and used_over >= ratio)
@@ -1601,10 +1708,17 @@ class TradeLiquidation:
         # Optional micro-step: if exchange qty differs from ledger, adjust qty_current to exchange qty.
         # Safe by default: OFF.
         auto_adjust_qty = bool(getattr(self.p, "reconcile_auto_adjust_ledger_qty_current", False))
+        # New: auto-adjust ledger position_value_usdt (mark-to-market) independently of qty.
+        auto_adjust_value = bool(getattr(self.p, "reconcile_auto_adjust_ledger_value_usdt", True))
+        # New: refresh value_usdt even when within tolerance (to keep ledger close to exchange mark).
+        auto_refresh_value = bool(getattr(self.p, "reconcile_refresh_position_value_usdt", False))
+        refresh_min_delta = float(getattr(self.p, "reconcile_value_refresh_min_delta_usdt", 0.1) or 0.1)
         adjust_only_our = bool(getattr(self.p, "reconcile_adjust_only_our_positions", True))
         ignore_external = bool(getattr(self.p, "reconcile_ignore_external_positions", True))
         ext_lvl = str(getattr(self.p, "reconcile_external_log_level", "debug") or "debug").strip().lower()
         oo_all = self._rest_snapshot_get("open_orders_all")
+        # Needed for "our position" detection (clientAlgoId TL_...)
+        oo_algo_all = self._rest_snapshot_get("open_algo_orders_all")
 
         sym_map = self._symbols_map()
 
@@ -1612,6 +1726,7 @@ class TradeLiquidation:
         pr = self._rest_snapshot_get("position_risk")
         rows = pr if isinstance(pr, list) else []
         ex_pos: Dict[Tuple[str, str], float] = {}
+        ex_usdt: Dict[Tuple[str, str], float] = {}
         for it in rows:
             sym = str(it.get("symbol") or "").strip()
             if not sym:
@@ -1626,12 +1741,21 @@ class TradeLiquidation:
             else:
                 side = "LONG" if amt > 0 else "SHORT"
             ex_pos[(sym, side)] = abs(float(amt))
+            try:
+                notional = abs(_safe_float(it.get('notional'), 0.0))
+            except Exception:
+                notional = 0.0
+            if notional <= 0:
+                mp = _safe_float(it.get('markPrice'), 0.0)
+                if mp > 0:
+                    notional = abs(float(amt)) * float(mp)
+            ex_usdt[(sym, side)] = abs(float(notional))
 
         # 2) ledger positions
         led = list(
             self.store.query_dict(
                 """
-                SELECT symbol_id, pos_uid, side, status, qty_current, entry_price, avg_price, raw_meta, opened_at
+                SELECT symbol_id, pos_uid, side, status, qty_current, position_value_usdt, entry_price, avg_price, raw_meta, opened_at
                 FROM position_ledger
                 WHERE exchange_id=%(ex)s
                   AND account_id=%(acc)s
@@ -1699,33 +1823,90 @@ class TradeLiquidation:
                         log.exception("[trade_liquidation][RECONCILE] failed to auto-close ledger pos_uid=%s", str(p.get("pos_uid") or ""))
                 continue
 
-            if abs(ex_qty - led_qty) > tol:
-                qty_mismatch += 1
-                if bool(getattr(self.p, "reconcile_log_diffs", True)):
+            # Qty/Value mismatch checks.
+            led_val = float(_safe_float(p.get("position_value_usdt"), 0.0))
+            ex_val = float(ex_usdt.get((sym, side), 0.0) or 0.0)
+            usdt_tol = float(getattr(self.p, "reconcile_value_tolerance_usdt", 0.5) or 0.5)
+
+            qty_diff = abs(ex_qty - led_qty)
+            usdt_diff = abs(ex_val - led_val) if (ex_val > 0 and led_val > 0) else 0.0
+
+            if qty_diff > tol or usdt_diff > usdt_tol:
+                if qty_diff > tol:
+                    qty_mismatch += 1
+                    if bool(getattr(self.p, "reconcile_log_diffs", True)):
+                        log.warning(
+                            "[trade_liquidation][RECONCILE] qty mismatch %s %s: ledger=%.8f exchange=%.8f (pos_uid=%s)",
+                            sym,
+                            side,
+                            float(led_qty),
+                            float(ex_qty),
+                            str(p.get("pos_uid") or ""),
+                        )
+                if usdt_diff > usdt_tol and bool(getattr(self.p, "reconcile_log_diffs", True)):
                     log.warning(
-                        "[trade_liquidation][RECONCILE] qty mismatch %s %s: ledger=%.8f exchange=%.8f (pos_uid=%s)",
+                        "[trade_liquidation][RECONCILE] value mismatch %s %s: ledger_usdt=%.8f exchange_usdt=%.8f diff=%.8f (pos_uid=%s)",
                         sym,
                         side,
-                        float(led_qty),
-                        float(ex_qty),
+                        float(led_val),
+                        float(ex_val),
+                        float(ex_val - led_val),
                         str(p.get("pos_uid") or ""),
                     )
 
-                # Micro-step: optionally auto-adjust ledger qty_current to exchange qty.
-                # This is useful if partial close happened on exchange (or reduce-only orders filled)
-                # and ledger qty_current became stale.
-                if auto_adjust_qty and ex_qty > 0:
+                
+                # Micro-step: optionally auto-adjust ledger qty_current and/or position_value_usdt to exchange values.
+                # - qty_current adjustment is OFF by default (reconcile_auto_adjust_ledger_qty_current=False)
+                # - value_usdt adjustment is ON by default (reconcile_auto_adjust_ledger_value_usdt=True) but only when diff > tolerance
+                # - value_usdt refresh is OFF by default (reconcile_refresh_position_value_usdt=False) and keeps ledger mark-to-market (writes only if delta > reconcile_value_refresh_min_delta_usdt)
+                if (auto_adjust_qty or auto_adjust_value or auto_refresh_value) and ex_qty > 0:
                     try:
                         pos_uid = str(p.get("pos_uid") or "")
-                        if adjust_only_our and not self._is_our_position_by_uid(pos_uid, oo_all, p.get("raw_meta")):
-                            log.info("[trade_liquidation][RECONCILE] skip auto-adjust qty_current for external pos_uid=%s (%s %s)", pos_uid, sym, side)
+                        if adjust_only_our and not self._is_our_position_by_symbol_side(sym, side, oo_all, oo_algo_all, p.get("raw_meta")):
+                            log.info(
+                                "[trade_liquidation][RECONCILE] skip auto-adjust qty/value for external pos_uid=%s (%s %s)",
+                                pos_uid,
+                                sym,
+                                side,
+                            )
                             continue
+
+                        do_qty = bool(auto_adjust_qty) and (qty_diff > tol)
+                        do_val = False
+                        if ex_val > 0:
+                            if bool(auto_refresh_value):
+                                # refresh even when within tolerance (but avoid excessive writes)
+                                if led_val <= 0:
+                                    do_val = True
+                                elif abs(ex_val - led_val) > float(refresh_min_delta):
+                                    do_val = True
+                            elif bool(auto_adjust_value):
+                                # adjust only when beyond tolerance
+                                if usdt_diff > usdt_tol:
+                                    do_val = True
+
+                        if not do_qty and not do_val:
+                            continue
+
+                        new_qty_f = float(ex_qty) if do_qty else float(led_qty)
+                        new_val_d = _dec(abs(ex_val)).quantize(Decimal("0.00000001")) if do_val else _dec(led_val).quantize(Decimal("0.00000001"))
+
                         if self._pl_has_raw_meta:
-                            meta = {"reconcile_adjust": {"old_qty": float(led_qty), "new_qty": float(ex_qty), "ts": _utc_now().isoformat()}}
+                            meta = {
+                                "reconcile_adjust": {
+                                    "old_qty": float(led_qty),
+                                    "new_qty": float(new_qty_f),
+                                    "old_usdt": float(led_val),
+                                    "new_usdt": float(new_val_d),
+                                    "ts": _utc_now().isoformat(),
+                                    "mode": ("qty" if do_qty else "") + ("+val" if do_val else ""),
+                                }
+                            }
                             self.store.execute(
                                 """
                                 UPDATE position_ledger
                                 SET qty_current=%(q)s,
+                                    position_value_usdt=%(v)s,
                                     updated_at=now(),
                                     raw_meta = COALESCE(raw_meta,'{}'::jsonb) || %(meta)s::jsonb
                                 WHERE exchange_id=%(ex)s
@@ -1733,31 +1914,53 @@ class TradeLiquidation:
                                   AND pos_uid=%(pos_uid)s
                                   AND status='OPEN'
                                 """,
-                                {"q": float(ex_qty), "meta": json.dumps(meta), "ex": int(self.p.exchange_id), "acc": int(self.account_id), "pos_uid": pos_uid},
+                                {
+                                    "q": float(new_qty_f),
+                                    "v": new_val_d,
+                                    "meta": json.dumps(meta),
+                                    "ex": int(self.p.exchange_id),
+                                    "acc": int(self.account_id),
+                                    "pos_uid": pos_uid,
+                                },
                             )
                         else:
                             self.store.execute(
                                 """
                                 UPDATE position_ledger
                                 SET qty_current=%(q)s,
+                                    position_value_usdt=%(v)s,
                                     updated_at=now()
                                 WHERE exchange_id=%(ex)s
                                   AND account_id=%(acc)s
                                   AND pos_uid=%(pos_uid)s
                                   AND status='OPEN'
                                 """,
-                                {"q": float(ex_qty), "ex": int(self.p.exchange_id), "acc": int(self.account_id), "pos_uid": pos_uid},
+                                {
+                                    "q": float(new_qty_f),
+                                    "v": new_val_d,
+                                    "ex": int(self.p.exchange_id),
+                                    "acc": int(self.account_id),
+                                    "pos_uid": pos_uid,
+                                },
                             )
-                        log.info(
-                            "[trade_liquidation][RECONCILE] adjusted ledger qty_current to exchange qty: %s %s old=%.8f new=%.8f (pos_uid=%s)",
-                            sym,
-                            side,
-                            float(led_qty),
-                            float(ex_qty),
-                            pos_uid,
-                        )
+
+                        if bool(getattr(self.p, "reconcile_log_diffs", True)):
+                            log.info(
+                                "[trade_liquidation][RECONCILE] adjusted ledger %s %s old_qty=%.8f new_qty=%.8f old_usdt=%.8f new_usdt=%.8f (pos_uid=%s)",
+                                sym,
+                                side,
+                                float(led_qty),
+                                float(new_qty_f),
+                                float(led_val),
+                                float(new_val_d),
+                                pos_uid,
+                            )
                     except Exception:
-                        log.exception("[trade_liquidation][RECONCILE] failed to auto-adjust ledger qty_current (pos_uid=%s)", str(p.get("pos_uid") or ""))
+                        log.exception(
+                            "[trade_liquidation][RECONCILE] failed to auto-adjust ledger qty/value (pos_uid=%s)",
+                            str(p.get("pos_uid") or ""),
+                        )
+
 
         # 3) external positions (on exchange, not in ledger)
         led_keys = set()

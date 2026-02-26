@@ -34,7 +34,7 @@ traders:
 
       # Максимальный возраст сигнала (в минутах) от signal_ts.
       # Сигналы старше этого значения игнорируются.
-      max_signal_age_minutes: 60
+      max_signal_age_minutes: 30
 
       # Кулдаун по символу (в минутах): не открывать новую сделку по символу,
       # если недавно уже была попытка/сделка по этому же символу.
@@ -125,7 +125,7 @@ traders:
       hedge_reopen_drawdown_pct: 0.0               # Reopen threshold drawdown (%). 0 => any negative unrealized PnL
       all_P_L: 10.0                                # Close BOTH (main+hedge) if combined unrealized PnL >= this USDT
 
-      max_open_positions: 5                        # Максимум одновременно открытых позиций
+      max_open_positions: 3                        # Максимум одновременно открытых позиций
 
       # Максимальный размер позиции относительно кошелька (в % от wallet) — ограничение на notional.
       max_position_notional_pct_wallet: 10.0
@@ -189,7 +189,7 @@ traders:
       # ----------------------------
 
       averaging_enabled: true                        # Разрешить добавки к позиции
-      averaging_max_adds: 2                          # Максимум добавок (сколько раз усредняться)
+      averaging_max_adds: 1                          # Максимум добавок (сколько раз усредняться)
 
 #      averaging_add_size_mode: risk_pct             # Режим размера добавки: risk_pct / fixed / wallet_pct (зависит от реализации)
 #      averaging_add_size_value: 10                  # Значение для выбранного режима (например, %)
@@ -278,6 +278,12 @@ traders:
       reconcile_log_diffs: true                       # Логировать расхождения
       reconcile_ignore_external_positions: true       # Игнорировать внешние позиции (не созданные ботом)
       reconcile_external_log_level: debug             # Уровень логирования внешних позиций (debug/info/warn)
+
+      # ✅ NEW: mark-to-market refresh position_value_usdt (чтобы ledger совпадал с биржей по notional)
+      reconcile_auto_adjust_ledger_value_usdt: true        # обновлять value при value-mismatch (в любом случае, даже когда qty совпал)
+      reconcile_refresh_position_value_usdt: true          # обновлять value "по рынку" в каждом reconcile-цикле (с ограничением по min_delta)
+      reconcile_value_refresh_min_delta_usdt: 0.10         # минимальное изменение value, чтобы писать в БД (anti-spam)
+      reconcile_value_tolerance_usdt: 0.50                 # порог, после которого считаем это DIFF (и точно обновляем при auto_adjust)
 
       # ----------------------------
       # Auto recovery (восстановление защитных ордеров/состояния)

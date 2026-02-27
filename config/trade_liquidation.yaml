@@ -34,17 +34,17 @@ traders:
 
       # Максимальный возраст сигнала (в минутах) от signal_ts.
       # Сигналы старше этого значения игнорируются.
-      max_signal_age_minutes: 30
+      max_signal_age_minutes: 120
 
       # Кулдаун по символу (в минутах): не открывать новую сделку по символу,
       # если недавно уже была попытка/сделка по этому же символу.
-      per_symbol_cooldown_minutes: 60
+      per_symbol_cooldown_minutes: 240
 
       # Максимум попыток открыть сделку по одному сигналу
       max_attempts_per_signal: 3
 
       # Пауза (в минутах) между повторными попытками по одному и тому же сигналу
-      retry_cooldown_minutes: 1
+      retry_cooldown_minutes: 2
 
       # Ключ в context (jsonb) для хранения/учёта попыток
       attempts_context_key: trade_liquidation
@@ -59,7 +59,7 @@ traders:
       expire_old_signals: true
 
       # Экспирировать сигналы NEW, если они старше этого возраста (в минутах)
-      expire_max_age_minutes: 60
+      expire_max_age_minutes: 120
 
       # Сколько сигналов максимум обрабатывать за один проход экспирации
       expire_batch_limit: 5000
@@ -111,6 +111,9 @@ traders:
       leverage: 10                                 # Плечо (leverage) для символа
       margin_type: CROSSED                         # Тип маржи: CROSSED или ISOLATED
       hedge_enabled: true                          # Hedge mode: true => positionSide LONG/SHORT
+      # funding-aware hedge sizing
+      hedge_funding_kof_limit: 1.0                 # порог в процентах (1.0 = 1% => 0.01)
+      hedge_koff_funding_boost: 2.0                # hedge_koff когда funding выгоден хеджу
       hedge_koff: 1.1                              # Hedge qty multiplier vs main position qty
       hedge_ema_window: 20                         # EMA window
       hedge_ema_interval: "5m"                     # EMA timeframe (candles.interval)
@@ -125,7 +128,29 @@ traders:
       hedge_reopen_drawdown_pct: 0.0               # Reopen threshold drawdown (%). 0 => any negative unrealized PnL
       all_P_L: 10.0                                # Close BOTH (main+hedge) if combined unrealized PnL >= this USDT
 
-      max_open_positions: 3                        # Максимум одновременно открытых позиций
+      # --- Hedge trailing (отдельно от основного trailing)
+      hedge_trailing_enabled: true
+      hedge_trailing_activation_pct: 1.5          # % от mark для activationPrice (в сторону профита хеджа)
+      hedge_trailing_trail_pct: 0.5               # callbackRate (%), Binance требует 0.1..10
+      hedge_trailing_activation_buffer_pct: 0.25  # safety буфер (анти "immediately trigger")
+      hedge_trailing_place_retries: 3
+      hedge_trailing_working_type: MARK_PRICE     # MARK_PRICE или CONTRACT_PRICE
+
+      # reissue hedge trailing when hedge_qty changed
+      hedge_trailing_reissue_on_qty_change: true
+      hedge_trailing_reissue_cooldown_sec: 30        # чтобы не дергать каждый цикл
+      hedge_trailing_qty_tolerance: 1e-8             # допуск сравнения qty
+
+      # follow/reprice for "after last add" hedge trigger order
+      hedge_after_last_add_follow_enabled: true
+      hedge_after_last_add_follow_distance_pct: 4.0   # если цена ушла от triggerPrice дальше чем на 4%
+      hedge_after_last_add_follow_pullback_pct: 2.0   # подтягиваем triggerPrice к цене на 2% (в сторону хеджа)
+
+      hedge_after_last_add_follow_cooldown_sec: 120    # минимум 45 сек между перестановками
+      hedge_after_last_add_follow_min_trigger_move_pct: 0.8  # чтобы не переставлять из-за мелочи
+      hedge_after_last_add_cancel_when_main_profit: true      # отменять pending hedge, когда uPnL main > 0
+
+      max_open_positions: 6                          # Максимум одновременно открытых позиций
 
       # Максимальный размер позиции относительно кошелька (в % от wallet) — ограничение на notional.
       max_position_notional_pct_wallet: 10.0
@@ -142,12 +167,10 @@ traders:
       # ----------------------------
       # Вход и bracket-ордера
       # ----------------------------
-
-      entry_order_type: market                       # Тип входа: market / limit (если поддерживается)
-
-      sl_order_mode: stop_market                    # Тип/режим SL ордера
+      entry_order_type: market                        # Тип входа: market / limit (если поддерживается)
+      sl_order_mode: stop_market                      # Тип/режим SL ордера
 #      sl_order_mode: trailing_stop_market            # Тип/режим SL ордера
-      tp_order_mode: take_profit_market              # Тип/режим TP ордера
+      tp_order_mode: take_profit_market               # Тип/режим TP ордера
 
       reduce_only: true                              # reduceOnly для защитных/закрывающих ордеров
       working_type: MARK_PRICE                       # MARK_PRICE или CONTRACT_PRICE для триггеров
@@ -271,19 +294,19 @@ traders:
       reconcile_enabled: true                         # Включить reconcile
       reconcile_qty_tolerance: 1e-8                   # Допуск по количеству (qty) при сравнениях
 
-      reconcile_auto_close_ledger: true               # Автоматически закрывать записи в леджере, если на бирже позиции нет
-      reconcile_auto_adjust_ledger_qty_current: true  # Автоматически корректировать qty_current в леджере по данным биржи
-      reconcile_adjust_only_our_positions: true       # Корректировать только "наши" позиции (по clientOrderId/префиксу)
-      reconcile_every_n_cycles: 1                     # Запускать reconcile каждые N циклов
-      reconcile_log_diffs: true                       # Логировать расхождения
-      reconcile_ignore_external_positions: true       # Игнорировать внешние позиции (не созданные ботом)
-      reconcile_external_log_level: debug             # Уровень логирования внешних позиций (debug/info/warn)
+      reconcile_auto_close_ledger: true                 # Автоматически закрывать записи в леджере, если на бирже позиции нет
+      reconcile_auto_adjust_ledger_qty_current: true    # Автоматически корректировать qty_current в леджере по данным биржи
+      reconcile_adjust_only_our_positions: true         # Корректировать только "наши" позиции (по clientOrderId/префиксу)
+      reconcile_ignore_external_positions: true         # Игнорировать внешние позиции (не созданные ботом)
+      reconcile_every_n_cycles: 1                       # Запускать reconcile каждые N циклов
+      reconcile_log_diffs: true                         # Логировать расхождения
+      reconcile_external_log_level: debug               # Уровень логирования внешних позиций (debug/info/warn)
 
       # ✅ NEW: mark-to-market refresh position_value_usdt (чтобы ledger совпадал с биржей по notional)
       reconcile_auto_adjust_ledger_value_usdt: true        # обновлять value при value-mismatch (в любом случае, даже когда qty совпал)
       reconcile_refresh_position_value_usdt: true          # обновлять value "по рынку" в каждом reconcile-цикле (с ограничением по min_delta)
       reconcile_value_refresh_min_delta_usdt: 0.10         # минимальное изменение value, чтобы писать в БД (anti-spam)
-      reconcile_value_tolerance_usdt: 0.50                 # порог, после которого считаем это DIFF (и точно обновляем при auto_adjust)
+      reconcile_value_tolerance_usdt: 1.0                  # порог, после которого считаем это DIFF (и точно обновляем при auto_adjust)
 
       # ----------------------------
       # Auto recovery (восстановление защитных ордеров/состояния)

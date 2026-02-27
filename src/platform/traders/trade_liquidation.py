@@ -1899,6 +1899,7 @@ class TradeLiquidation:
                                     "old_usdt": float(led_val),
                                     "new_usdt": float(new_val_d),
                                     "ts": _utc_now().isoformat(),
+                        "follow_ts": _utc_now().isoformat(),
                                     "mode": ("qty" if do_qty else "") + ("+val" if do_val else ""),
                                 }
                             }
@@ -3476,11 +3477,118 @@ class TradeLiquidation:
             try:
                 cur = found_hedge.get("triggerPrice") or found_hedge.get("stopPrice")
                 cur_f = float(cur) if cur is not None else 0.0
-                tol = max(float(tick or 0.0) * 2.0, abs(stop_price) * 0.0002, 1e-8)
-                if cur_f > 0 and abs(cur_f - float(stop_price)) <= tol:
-                    return False
             except Exception:
-                pass
+                cur_f = 0.0
+
+            # Read main uPnL from positionRisk (main side only)
+            main_upnl = 0.0
+            try:
+                pr = self._rest_snapshot_get("position_risk") or []
+                for r in pr if isinstance(pr, list) else []:
+                    if str(r.get("symbol") or "").upper() != str(sym).upper():
+                        continue
+                    if str(r.get("positionSide") or "").upper() != side_u:
+                        continue
+                    main_upnl = float(r.get("unRealizedProfit") or 0.0)
+                    break
+            except Exception:
+                main_upnl = 0.0
+
+            # If main is already in profit -> pending hedge opener is not needed (optional cancel)
+            cancel_when_profit = bool(getattr(self.p, "hedge_after_last_add_cancel_when_main_profit", True))
+            if cancel_when_profit and main_upnl > 0:
+                try:
+                    self._binance.cancel_algo_order(symbol=sym, clientAlgoId=cid_hedge)
+                    log.info(
+                        "[TL][HEDGE][FOLLOW] canceled pending after-last-add hedge for %s %s: main_upnl=%.6f > 0",
+                        sym,
+                        side_u,
+                        main_upnl,
+                    )
+                except Exception:
+                    pass
+                return True
+
+            # Follow / reprice: if price moved away from current trigger too much, pull trigger closer to mark
+            follow_enabled = bool(getattr(self.p, "hedge_after_last_add_follow_enabled", False))
+            try:
+                follow_dist = float(getattr(self.p, "hedge_after_last_add_follow_distance_pct", 0.0) or 0.0)
+            except Exception:
+                follow_dist = 0.0
+            try:
+                follow_pull = float(getattr(self.p, "hedge_after_last_add_follow_pullback_pct", 0.0) or 0.0)
+            except Exception:
+                follow_pull = 0.0
+            try:
+                follow_min_move = float(getattr(self.p, "hedge_after_last_add_follow_min_trigger_move_pct", 0.0) or 0.0)
+            except Exception:
+                follow_min_move = 0.0
+            try:
+                follow_cd_sec = float(getattr(self.p, "hedge_after_last_add_follow_cooldown_sec", 0.0) or 0.0)
+            except Exception:
+                follow_cd_sec = 0.0
+
+            if follow_enabled and follow_dist > 0 and follow_pull > 0 and mark > 0 and cur_f > 0 and main_upnl <= 0:
+                # cooldown (stored in raw_meta)
+                if follow_cd_sec and follow_cd_sec > 0 and self._pl_has_raw_meta:
+                    try:
+                        rm = pos.get("raw_meta") if isinstance(pos.get("raw_meta"), dict) else {}
+                        ts_s = ((rm.get("live_entry") or {}).get("after_last_add_hedge") or {}).get("follow_ts")
+                        if ts_s:
+                            now_ms = self._to_epoch_ms(_utc_now()) or 0
+                            ts_ms = self._to_epoch_ms(ts_s) or 0
+                            if now_ms and ts_ms and (now_ms - ts_ms) < int(follow_cd_sec * 1000):
+                                follow_enabled = False
+                    except Exception:
+                        pass
+
+                if follow_enabled:
+                    try:
+                        if close_side == "SELL":
+                            # main LONG -> hedge SHORT -> trigger below mark
+                            dist_pct_now = (mark - cur_f) / max(mark, 1e-12) * 100.0
+                            new_trigger = mark * (1.0 - follow_pull / 100.0)
+                        else:
+                            # main SHORT -> hedge LONG -> trigger above mark
+                            dist_pct_now = (cur_f - mark) / max(mark, 1e-12) * 100.0
+                            new_trigger = mark * (1.0 + follow_pull / 100.0)
+
+                        # round to tick
+                        if tick and tick > 0:
+                            new_trigger = float(
+                                _round_price_to_tick(new_trigger, tick, mode=("down" if close_side == "SELL" else "up"))
+                            )
+
+                        move_pct = abs(new_trigger - cur_f) / max(mark, 1e-12) * 100.0
+                        if dist_pct_now >= follow_dist and (follow_min_move <= 0 or move_pct >= follow_min_move):
+                            log.info(
+                                "[TL][HEDGE][FOLLOW] reprice after-last-add hedge %s %s: mark=%.8f old=%.8f dist=%.4f%% -> new=%.8f (thr=%.4f%% pull=%.4f%%)",
+                                sym,
+                                side_u,
+                                mark,
+                                cur_f,
+                                dist_pct_now,
+                                new_trigger,
+                                follow_dist,
+                                follow_pull,
+                            )
+                            stop_price = float(new_trigger)
+                            must_refresh = True
+                        else:
+                            # if trigger already close enough to desired stop_price and no refresh requested -> keep
+                            tol = max(float(tick or 0.0) * 2.0, abs(stop_price) * 0.0002, 1e-8)
+                            if cur_f > 0 and abs(cur_f - float(stop_price)) <= tol and not must_refresh:
+                                return False
+                    except Exception:
+                        pass
+            else:
+                # Default: if trigger already matches and no refresh requested -> keep
+                try:
+                    tol = max(float(tick or 0.0) * 2.0, abs(stop_price) * 0.0002, 1e-8)
+                    if cur_f > 0 and abs(cur_f - float(stop_price)) <= tol and not must_refresh:
+                        return False
+                except Exception:
+                    pass
 
         # Cancel existing hedge (best-effort) only if we really want to refresh it.
         if must_refresh or found_hedge is not None:

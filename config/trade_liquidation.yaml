@@ -4,7 +4,7 @@
 
 # Как часто перезапускать цикл трейдеров (в минутах).
 # 0.25 = 15 секунд.
-restart_interval_minutes: 0.25
+restart_interval_minutes: 0.2
 
 traders:
   - name: trade_liquidation            # Имя трейдера (используется в логах/идентификации)
@@ -34,11 +34,11 @@ traders:
 
       # Максимальный возраст сигнала (в минутах) от signal_ts.
       # Сигналы старше этого значения игнорируются.
-      max_signal_age_minutes: 120
+      max_signal_age_minutes: 60
 
       # Кулдаун по символу (в минутах): не открывать новую сделку по символу,
       # если недавно уже была попытка/сделка по этому же символу.
-      per_symbol_cooldown_minutes: 240
+      per_symbol_cooldown_minutes: 60
 
       # Максимум попыток открыть сделку по одному сигналу
       max_attempts_per_signal: 3
@@ -59,7 +59,7 @@ traders:
       expire_old_signals: true
 
       # Экспирировать сигналы NEW, если они старше этого возраста (в минутах)
-      expire_max_age_minutes: 120
+      expire_max_age_minutes: 60
 
       # Сколько сигналов максимум обрабатывать за один проход экспирации
       expire_batch_limit: 5000
@@ -108,7 +108,7 @@ traders:
       # Риск и ограничения на позиции
       # ----------------------------
 
-      leverage: 10                                 # Плечо (leverage) для символа
+      leverage: 20                                 # Плечо (leverage) для символа
       margin_type: CROSSED                         # Тип маржи: CROSSED или ISOLATED
       hedge_enabled: true                          # Hedge mode: true => positionSide LONG/SHORT
       # funding-aware hedge sizing
@@ -150,7 +150,7 @@ traders:
       hedge_after_last_add_follow_min_trigger_move_pct: 0.8  # чтобы не переставлять из-за мелочи
       hedge_after_last_add_cancel_when_main_profit: true      # отменять pending hedge, когда uPnL main > 0
 
-      max_open_positions: 6                          # Максимум одновременно открытых позиций
+      max_open_positions: 10                          # Максимум одновременно открытых позиций
 
       # Максимальный размер позиции относительно кошелька (в % от wallet) — ограничение на notional.
       max_position_notional_pct_wallet: 10.0

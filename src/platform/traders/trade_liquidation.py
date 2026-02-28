@@ -1459,10 +1459,58 @@ class TradeLiquidation:
         if not futs:
             if need_open_orders:
                 try:
+                    oo = self._binance.open_orders()
+                    ao = self._binance.open_algo_orders()
                     self._rest_snapshot_set(
-                        open_orders_all=self._binance.open_orders(),
-                        open_algo_orders_all=self._binance.open_algo_orders(),
+                        open_orders_all=oo,
+                        open_algo_orders_all=ao,
                     )
+                    # Persist open algo orders for accounting/monitoring (best-effort)
+                    try:
+                        rows = []
+                        active_cids: list[str] = []
+                        for r in ao if isinstance(ao, list) else []:
+                            cid = str(r.get("clientAlgoId") or r.get("clientOrderId") or "").strip()
+                            if not cid:
+                                continue
+                            if cid.startswith("TL_"):
+                                active_cids.append(cid)
+                            rows.append(
+                                {
+                                    "exchange_id": int(self.exchange_id),
+                                    "account_id": int(self.account_id),
+                                    "client_algo_id": cid,
+                                    "algo_id": str(r.get("algoId") or r.get("algoOrderId") or r.get("orderId") or ""),
+                                    "symbol": str(r.get("symbol") or "").upper(),
+                                    "side": str(r.get("side") or ""),
+                                    "position_side": str(r.get("positionSide") or ""),
+                                    "type": str(r.get("type") or ""),
+                                    "quantity": None if r.get("quantity") is None else float(r.get("quantity")),
+                                    "trigger_price": None if r.get("triggerPrice") is None else float(r.get("triggerPrice")),
+                                    "working_type": str(r.get("workingType") or ""),
+                                    "status": "OPEN",
+                                    "strategy_id": str(self.strategy_id),
+                                    "pos_uid": None,
+                                    "raw_json": r if isinstance(r, dict) else {"result": r},
+                                }
+                            )
+                        if rows:
+                            self.store.upsert_algo_orders(rows)
+
+                        # Mark previously OPEN algo orders as NOT_FOUND if they disappeared from exchange.
+                        try:
+                            self.store.sync_open_algo_orders_not_found(
+                                exchange_id=int(self.exchange_id),
+                                account_id=int(self.account_id),
+                                active_client_algo_ids=active_cids,
+                                prefix="TL_",
+                                not_found_status="CANCELED",
+                            )
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+
                 except Exception:
                     log.debug("[trade_liquidation] openOrders sync fetch failed", exc_info=True)
             if need_position_risk:
@@ -1486,6 +1534,49 @@ class TradeLiquidation:
                 log.debug("[trade_liquidation] async REST task failed: %s", k, exc_info=True)
 
         if out:
+            # Persist open algo orders + reconcile missing ones (best-effort)
+            try:
+                ao = out.get("open_algo_orders_all")
+                rows = []
+                active_cids: list[str] = []
+                for r in ao if isinstance(ao, list) else []:
+                    cid = str(r.get("clientAlgoId") or r.get("clientOrderId") or "").strip()
+                    if not cid:
+                        continue
+                    if cid.startswith("TL_"):
+                        active_cids.append(cid)
+                    rows.append(
+                        {
+                            "exchange_id": int(self.exchange_id),
+                            "account_id": int(self.account_id),
+                            "client_algo_id": cid,
+                            "algo_id": str(r.get("algoId") or r.get("algoOrderId") or r.get("orderId") or ""),
+                            "symbol": str(r.get("symbol") or "").upper(),
+                            "side": str(r.get("side") or ""),
+                            "position_side": str(r.get("positionSide") or ""),
+                            "type": str(r.get("type") or ""),
+                            "quantity": None if r.get("quantity") is None else float(r.get("quantity")),
+                            "trigger_price": None if r.get("triggerPrice") is None else float(r.get("triggerPrice")),
+                            "working_type": str(r.get("workingType") or ""),
+                            "status": "OPEN",
+                            "strategy_id": str(self.strategy_id),
+                            "pos_uid": None,
+                            "raw_json": r if isinstance(r, dict) else {"result": r},
+                        }
+                    )
+                if rows:
+                    self.store.upsert_algo_orders(rows)
+
+                # Mark missing
+                self.store.sync_open_algo_orders_not_found(
+                    exchange_id=int(self.exchange_id),
+                    account_id=int(self.account_id),
+                    active_client_algo_ids=active_cids,
+                    prefix="TL_",
+                    not_found_status="CANCELED",
+                )
+            except Exception:
+                pass
             self._rest_snapshot_set(**out)
 
     # ----------------------------------------------------------
@@ -3104,49 +3195,15 @@ class TradeLiquidation:
         pos_side_u = str(pos_side or "").upper()
         desired_order_side = "BUY" if pos_side_u == "LONG" else "SELL"
 
-        token: str | None = None
+        def _find_token(*, with_pos_uid: bool, statuses: tuple[str, ...]) -> str | None:
+            """Find the current TL_<token> from the orders table.
 
-        # 1) Prefer active series token (NEW/PARTIALLY_FILLED)
-        try:
-            qtok = """
-            SELECT client_order_id
-            FROM public.orders
-            WHERE exchange_id=%(ex)s
-              AND account_id=%(acc)s
-              AND strategy_id=%(sid)s
-              AND upper(symbol)=%(sym)s
-              AND upper(side)=%(oside)s
-              AND client_order_id LIKE %(like_any)s
-              AND upper(coalesce(status,'')) IN ('NEW','PARTIALLY_FILLED')
-            ORDER BY updated_at DESC
-            LIMIT 50;
+            We **prefer** filtering by pos_uid to avoid mixing series across different
+            lifecycles/restarts. If older DB rows don't have pos_uid filled, we fallback
+            to the legacy non-pos_uid query.
             """
-            rows = list(
-                self.store.query_dict(
-                    qtok,
-                    {
-                        "ex": int(self.exchange_id),
-                        "acc": int(self.account_id),
-                        "sid": self.STRATEGY_ID,
-                        "sym": sym_u,
-                        "oside": desired_order_side,
-                        "like_any": f"{prefix}_%_ADD%",
-                    },
-                )
-            )
-            for r in rows:
-                cid = str(r.get("client_order_id") or "")
-                m = re.match(rf"^{re.escape(prefix)}_([^_]+)_ADD\d+$", cid)
-                if m:
-                    token = m.group(1)
-                    break
-        except Exception:
-            token = None
-
-        # 2) Fallback to the most recent completed series token
-        if token is None:
             try:
-                qtok2 = """
+                qtok = """
                 SELECT client_order_id
                 FROM public.orders
                 WHERE exchange_id=%(ex)s
@@ -3155,70 +3212,89 @@ class TradeLiquidation:
                   AND upper(symbol)=%(sym)s
                   AND upper(side)=%(oside)s
                   AND client_order_id LIKE %(like_any)s
-                  AND upper(coalesce(status,'')) IN ('FILLED','PARTIALLY_FILLED')
-                ORDER BY updated_at DESC
-                LIMIT 50;
+                  AND upper(coalesce(status,'')) = ANY(%(sts)s)
                 """
-                rows = list(
-                    self.store.query_dict(
-                        qtok2,
-                        {
-                            "ex": int(self.exchange_id),
-                            "acc": int(self.account_id),
-                            "sid": self.STRATEGY_ID,
-                            "sym": sym_u,
-                            "oside": desired_order_side,
-                            "like_any": f"{prefix}_%_ADD%",
-                        },
-                    )
-                )
+                if with_pos_uid:
+                    qtok += " AND pos_uid=%(pos_uid)s\n"
+                qtok += "ORDER BY updated_at DESC\nLIMIT 50;"
+                params = {
+                    "ex": int(self.exchange_id),
+                    "acc": int(self.account_id),
+                    "sid": self.STRATEGY_ID,
+                    "sym": sym_u,
+                    "oside": desired_order_side,
+                    "like_any": f"{prefix}_%_ADD%",
+                    "sts": list(statuses),
+                }
+                if with_pos_uid:
+                    params["pos_uid"] = str(pos_uid)
+                rows = list(self.store.query_dict(qtok, params))
                 for r in rows:
                     cid = str(r.get("client_order_id") or "")
                     m = re.match(rf"^{re.escape(prefix)}_([^_]+)_ADD\d+$", cid)
                     if m:
-                        token = m.group(1)
-                        break
+                        return str(m.group(1) or "")
             except Exception:
-                token = None
+                return None
+            return None
+
+        token: str | None = None
+
+        # 1) Prefer active series token (NEW/PARTIALLY_FILLED) for this pos_uid
+        token = _find_token(with_pos_uid=True, statuses=("NEW", "PARTIALLY_FILLED"))
+
+        # 1b) Fallback: active series without pos_uid (legacy rows)
+        if token is None:
+            token = _find_token(with_pos_uid=False, statuses=("NEW", "PARTIALLY_FILLED"))
+
+        # 2) Fallback to the most recent completed series token
+        if token is None:
+            token = _find_token(with_pos_uid=True, statuses=("FILLED", "PARTIALLY_FILLED"))
+        if token is None:
+            token = _find_token(with_pos_uid=False, statuses=("FILLED", "PARTIALLY_FILLED"))
 
         # 3) Compute adds_done as MAX(ADDn) among FILLED/PARTIALLY_FILLED for that token
         adds_done = 0
         if token:
-            try:
-                qmax = """
-                SELECT client_order_id
-                FROM public.orders
-                WHERE exchange_id=%(ex)s
-                  AND account_id=%(acc)s
-                  AND strategy_id=%(sid)s
-                  AND upper(symbol)=%(sym)s
-                  AND upper(side)=%(oside)s
-                  AND client_order_id LIKE %(like_tok)s
-                  AND upper(coalesce(status,'')) IN ('FILLED','PARTIALLY_FILLED')
-                ORDER BY updated_at DESC
-                LIMIT 1000;
-                """
-                rows = list(
-                    self.store.query_dict(
-                        qmax,
-                        {
-                            "ex": int(self.exchange_id),
-                            "acc": int(self.account_id),
-                            "sid": self.STRATEGY_ID,
-                            "sym": sym_u,
-                            "oside": desired_order_side,
-                            "like_tok": f"{prefix}_{token}_ADD%",
-                        },
-                    )
-                )
-                done: set[int] = set()
-                for r in rows:
-                    n = self._parse_add_n(str(r.get("client_order_id") or ""))
-                    if n > 0:
-                        done.add(n)
-                adds_done = max(done) if done else 0
-            except Exception:
-                adds_done = 0
+            def _max_add_n(*, with_pos_uid: bool) -> int:
+                try:
+                    qmax = """
+                    SELECT client_order_id
+                    FROM public.orders
+                    WHERE exchange_id=%(ex)s
+                      AND account_id=%(acc)s
+                      AND strategy_id=%(sid)s
+                      AND upper(symbol)=%(sym)s
+                      AND upper(side)=%(oside)s
+                      AND client_order_id LIKE %(like_tok)s
+                      AND upper(coalesce(status,'')) IN ('FILLED','PARTIALLY_FILLED')
+                    """
+                    if with_pos_uid:
+                        qmax += " AND pos_uid=%(pos_uid)s\n"
+                    qmax += "ORDER BY updated_at DESC\nLIMIT 1000;"
+                    params = {
+                        "ex": int(self.exchange_id),
+                        "acc": int(self.account_id),
+                        "sid": self.STRATEGY_ID,
+                        "sym": sym_u,
+                        "oside": desired_order_side,
+                        "like_tok": f"{prefix}_{token}_ADD%",
+                    }
+                    if with_pos_uid:
+                        params["pos_uid"] = str(pos_uid)
+                    rows = list(self.store.query_dict(qmax, params))
+                    done: set[int] = set()
+                    for r in rows:
+                        n = self._parse_add_n(str(r.get("client_order_id") or ""))
+                        if n > 0:
+                            done.add(n)
+                    return int(max(done) if done else 0)
+                except Exception:
+                    return 0
+
+            adds_done = _max_add_n(with_pos_uid=True)
+            if adds_done <= 0:
+                adds_done = _max_add_n(with_pos_uid=False)
         try:
             self.store.execute(
                 """
@@ -3238,6 +3314,25 @@ class TradeLiquidation:
             )
         except Exception:
             # non-fatal
+            pass
+
+        # Keep positions.scale_in_count in sync (used by dashboards/risk logic).
+        try:
+            self.store.execute(
+                """
+                UPDATE public.positions
+                   SET scale_in_count = GREATEST(COALESCE(scale_in_count,0), %(n)s),
+                       updated_at = now()
+                 WHERE exchange_id=%(ex)s AND account_id=%(acc)s AND pos_uid=%(pos_uid)s;
+                """,
+                {
+                    "ex": int(self.exchange_id),
+                    "acc": int(self.account_id),
+                    "pos_uid": str(pos_uid),
+                    "n": int(adds_done),
+                },
+            )
+        except Exception:
             pass
 
         return int(adds_done)
@@ -3376,22 +3471,24 @@ class TradeLiquidation:
             row = self.store.query_one(
                 """
                 SELECT MAX(updated_at)
-                  FROM public.orders
+                  FROM public.algo_orders
                  WHERE exchange_id=%(ex)s
                    AND account_id=%(acc)s
-                   AND symbol_id=%(symbol_id)s
-                   AND client_order_id=%(cid)s;
+                   AND symbol=%(symbol)s
+                   AND client_algo_id=%(cid)s;
                 """,
-                {"ex": int(self.exchange_id), "acc": int(self.account_id), "symbol_id": int(symbol_id), "cid": cid_hedge},
+                {"ex": int(self.exchange_id), "acc": int(self.account_id), "symbol": str(sym).upper(), "cid": cid_hedge},
             )
             hedge_seen_at = row[0] if row else None
         except Exception:
             hedge_seen_at = None
 
         must_refresh = False
+        refresh_reason = None
         try:
             if last_add_seen_at is not None and (hedge_seen_at is None or hedge_seen_at < last_add_seen_at):
                 must_refresh = True
+                refresh_reason = "after_add"
         except Exception:
             must_refresh = False
 
@@ -3498,7 +3595,21 @@ class TradeLiquidation:
             cancel_when_profit = bool(getattr(self.p, "hedge_after_last_add_cancel_when_main_profit", True))
             if cancel_when_profit and main_upnl > 0:
                 try:
-                    self._binance.cancel_algo_order(symbol=sym, clientAlgoId=cid_hedge)
+                    resp_cancel = self._binance.cancel_algo_order(symbol=sym, clientAlgoId=cid_hedge)
+                    try:
+                        rawj = resp_cancel if isinstance(resp_cancel, dict) else {"result": resp_cancel}
+                        if isinstance(rawj, dict):
+                            rawj.setdefault("cancel_reason", "main_profit")
+                            rawj.setdefault("cancel_source", "bot_rule")
+                        self.store.set_algo_order_status(
+                            exchange_id=int(self.exchange_id),
+                            account_id=int(self.account_id),
+                            client_algo_id=str(cid_hedge),
+                            status="CANCELED",
+                            raw_json=rawj,
+                        )
+                    except Exception:
+                        pass
                     log.info(
                         "[TL][HEDGE][FOLLOW] canceled pending after-last-add hedge for %s %s: main_upnl=%.6f > 0",
                         sym,
@@ -3574,6 +3685,7 @@ class TradeLiquidation:
                             )
                             stop_price = float(new_trigger)
                             must_refresh = True
+                            refresh_reason = "reprice"
                         else:
                             # if trigger already close enough to desired stop_price and no refresh requested -> keep
                             tol = max(float(tick or 0.0) * 2.0, abs(stop_price) * 0.0002, 1e-8)
@@ -3594,7 +3706,21 @@ class TradeLiquidation:
         if must_refresh or found_hedge is not None:
             for cid in (cid_hedge,):
                 try:
-                    self._binance.cancel_algo_order(symbol=sym, clientAlgoId=cid)
+                    resp_cancel = self._binance.cancel_algo_order(symbol=sym, clientAlgoId=cid)
+                    try:
+                        rawj = resp_cancel if isinstance(resp_cancel, dict) else {"result": resp_cancel}
+                        if isinstance(rawj, dict):
+                            rawj.setdefault("cancel_reason", refresh_reason or "refresh")
+                            rawj.setdefault("cancel_source", "bot_refresh")
+                        self.store.set_algo_order_status(
+                            exchange_id=int(self.exchange_id),
+                            account_id=int(self.account_id),
+                            client_algo_id=str(cid),
+                            status="CANCELED",
+                            raw_json=rawj,
+                        )
+                    except Exception:
+                        pass
                 except Exception:
                     try:
                         self._binance.cancel_order(symbol=sym, origClientOrderId=cid)
@@ -3604,7 +3730,21 @@ class TradeLiquidation:
         # Cancel legacy hedge stored under _TRL if it's STOP_MARKET
         if found_legacy is not None:
             try:
-                self._binance.cancel_algo_order(symbol=sym, clientAlgoId=legacy_cid)
+                resp_cancel = self._binance.cancel_algo_order(symbol=sym, clientAlgoId=legacy_cid)
+                try:
+                    rawj = resp_cancel if isinstance(resp_cancel, dict) else {"result": resp_cancel}
+                    if isinstance(rawj, dict):
+                        rawj.setdefault("cancel_reason", "legacy_cleanup")
+                        rawj.setdefault("cancel_source", "bot_refresh")
+                    self.store.set_algo_order_status(
+                        exchange_id=int(self.exchange_id),
+                        account_id=int(self.account_id),
+                        client_algo_id=str(legacy_cid),
+                        status="CANCELED",
+                        raw_json=rawj,
+                    )
+                except Exception:
+                    pass
             except Exception:
                 pass
 
@@ -3646,7 +3786,7 @@ class TradeLiquidation:
         hedge_ps = "SHORT" if side_u == "LONG" else "LONG"
 
         try:
-            self._binance.new_order(
+            resp = self._binance.new_order(
                 symbol=sym,
                 side=close_side,
                 type="STOP_MARKET",
@@ -3656,6 +3796,31 @@ class TradeLiquidation:
                 newClientOrderId=cid_hedge,
                 positionSide=hedge_ps,
             )
+            # persist algo hedge order (best-effort)
+            try:
+                self.store.upsert_algo_orders(
+                    [
+                        {
+                            "exchange_id": int(self.exchange_id),
+                            "account_id": int(self.account_id),
+                            "client_algo_id": str(cid_hedge),
+                            "algo_id": None if resp is None else str(resp.get("algoId") or resp.get("algoOrderId") or resp.get("orderId") or ""),
+                            "symbol": str(sym).upper(),
+                            "side": str(close_side),
+                            "position_side": str(hedge_ps),
+                            "type": "STOP_MARKET",
+                            "quantity": float(hedge_qty),
+                            "trigger_price": float(stop_price),
+                            "working_type": str(getattr(self.p, "working_type", "MARK_PRICE")),
+                            "status": "OPEN",
+                            "strategy_id": str(self.strategy_id),
+                            "pos_uid": str(pos_uid),
+                            "raw_json": (resp if isinstance(resp, dict) else {"result": resp}),
+                        }
+                    ]
+                )
+            except Exception:
+                pass
         except Exception:
             return False
 
@@ -4049,6 +4214,39 @@ class TradeLiquidation:
         # stored in raw_meta / orders. If we use a pos_uid-derived token here,
         # we will fail to find fills/orders and won't refresh protection.
         tok = ""
+
+        # 0) Prefer DB truth: read ENTRY client_order_id for this pos_uid.
+        # This is the most reliable across restarts and does not depend on raw_meta.
+        try:
+            row = self.store.query_one(
+                """
+                SELECT client_order_id
+                FROM public.orders
+                WHERE exchange_id=%(ex)s AND account_id=%(acc)s
+                  AND strategy_id=%(sid)s
+                  AND pos_uid=%(u)s
+                  AND client_order_id LIKE %(like_entry)s
+                ORDER BY updated_at DESC
+                LIMIT 1;
+                """,
+                {
+                    "ex": int(self.exchange_id),
+                    "acc": int(self.account_id),
+                    "sid": self.STRATEGY_ID,
+                    "u": str(pos_uid),
+                    "like_entry": f"{prefix}_%_ENTRY",
+                },
+            )
+            if row and row[0]:
+                coid = str(row[0])
+                if coid.startswith(prefix + "_"):
+                    m = re.match(rf"^{re.escape(prefix)}_([^_]+)_", coid)
+                    if m:
+                        tok = str(m.group(1) or "")
+        except Exception:
+            tok = ""
+
+        # 1) raw_meta fallback
         try:
             rm = pos.get("raw_meta")
             if isinstance(rm, str) and rm:
@@ -4157,7 +4355,17 @@ class TradeLiquidation:
                 return False
             try:
                 if str(a.get("kind")) == "algo":
-                    self._binance.cancel_algo_order(symbol=sym, clientAlgoId=cid)
+                    resp_cancel = self._binance.cancel_algo_order(symbol=sym, clientAlgoId=cid)
+                    try:
+                        self.store.set_algo_order_status(
+                            exchange_id=int(self.exchange_id),
+                            account_id=int(self.account_id),
+                            client_algo_id=str(cid),
+                            status="CANCELED",
+                            raw_json=resp_cancel if isinstance(resp_cancel, dict) else {"result": resp_cancel},
+                        )
+                    except Exception:
+                        pass
                 else:
                     self._binance.cancel_order(symbol=sym, origClientOrderId=cid)
                 return True
@@ -6952,7 +7160,8 @@ class TradeLiquidation:
                 WHERE exchange_id = %(ex)s
                   AND account_id = %(acc)s
                   AND client_order_id = %(coid)s
-                  AND status = 'NEW'
+                  AND client_order_id IS NOT NULL
+                  AND client_order_id <> ''
                 RETURNING 1
             )
             INSERT INTO orders (
@@ -6970,11 +7179,14 @@ class TradeLiquidation:
                 %(side)s, %(type)s, %(status)s,
                 %(qty)s, %(price)s,
                 %(reduce_only)s,
-                %(strategy_id)s, %(pos_uid)s,
+                %(strategy_id)s, %(pos_uid)s, 
                 now(), now()
             WHERE NOT EXISTS (SELECT 1 FROM upd)
-            ON CONFLICT (exchange_id, account_id, order_id) DO UPDATE
+            ON CONFLICT (exchange_id, account_id, client_order_id)
+            WHERE client_order_id IS NOT NULL AND client_order_id <> ''
+            DO UPDATE
             SET
+                order_id = EXCLUDED.order_id,
                 client_order_id = EXCLUDED.client_order_id,
                 symbol_id = EXCLUDED.symbol_id,
                 side = EXCLUDED.side,
@@ -7042,6 +7254,8 @@ class TradeLiquidation:
         tok = _coid_token(pos_uid, n=20)
         cid_entry = f"{prefix}_{tok}_ENTRY"
         cid_sl = f"{prefix}_{tok}_SL"
+        cid_trl = f"{prefix}_{tok}_TRL"
+        cid_hedge = f"{prefix}_{tok}_HEDGE"
         cid_tp = f"{prefix}_{tok}_TP"
 
         hedge_mode = bool(getattr(self.p, "hedge_enabled", False))
@@ -7122,10 +7336,11 @@ class TradeLiquidation:
             if sl_price <= 0:
                 return None
 
-            # Hedge strategy mode (Binance Futures hedge mode):
-            # Instead of a classic stop-loss that closes the current leg, place a *conditional market*
-            # order that OPENS the opposite hedge leg when stop price is reached.
-            if bool(getattr(self.p, "hedge_enabled", False)):
+            # Averaging/scale-in mode: вместо классического стоп-лосса ставим
+            # условный маркет-ордер, который **открывает** противоположную сторону (hedge),
+            # чтобы зафиксировать риск, не закрывая основную позицию.
+            avg_enabled = bool(getattr(self.p, "averaging_enabled", False)) and int(self._cfg_max_adds() or 0) > 0
+            if avg_enabled and bool(getattr(self.p, "hedge_enabled", False)):
                 if not hedge_mode:
                     return None
                 try:
@@ -7143,7 +7358,7 @@ class TradeLiquidation:
                         stopPrice=stop_px,
                         quantity=hedge_qty,
                         workingType=str(getattr(self.p, "working_type", "MARK_PRICE")),
-                        newClientOrderId=cid_trl,
+                        newClientOrderId=cid_hedge,
                         positionSide=hedge_ps,
                     )
                     return self._binance.new_order(**params)
@@ -7231,7 +7446,7 @@ class TradeLiquidation:
                 quantity=float(qty),
                 price=float(sl_price),
                 stopPrice=float(sl_price),
-                newClientOrderId=cid_trl,
+                newClientOrderId=cid_sl,
                 positionSide=position_side if hedge_mode else None,
             )
             if (not hedge_mode) and bool(self.p.reduce_only):
@@ -7328,16 +7543,21 @@ class TradeLiquidation:
         # shadow order rows (SL/TP)
         try:
             if isinstance(sl_resp, dict):
+                # If we placed a hedge-opener instead of a classic SL (averaging mode),
+                # it is NOT reduce-only and uses a dedicated client id.
+                avg_enabled_shadow = bool(getattr(self.p, "averaging_enabled", False)) and int(self._cfg_max_adds() or 0) > 0
+                sl_is_hedge = bool(getattr(self.p, "hedge_enabled", False)) and hedge_mode and avg_enabled_shadow
+
                 self._upsert_order_shadow(
                     pos_uid=pos_uid,
                     order_id=sl_resp.get("orderId") or sl_resp.get("order_id") or sl_resp.get("algoId") or "",
-                    client_order_id=cid_sl,
+                    client_order_id=cid_hedge if sl_is_hedge else cid_sl,
                     symbol_id=symbol_id,
                     side=close_side,
                     order_type=str(sl_resp.get("type") or "STOP_MARKET"),
                     qty=float(qty),
                     price=None,
-                    reduce_only=True,
+                    reduce_only=(False if sl_is_hedge else True),
                     status=str(sl_resp.get("status") or "NEW"),
                 )
             if isinstance(tp_resp, dict):
@@ -7367,6 +7587,11 @@ class TradeLiquidation:
                     mult = 1.0  # disable add placement
                 else:
                     try:
+                        # Refresh from DB truth (deduped by ADDn/pos_uid) to avoid duplicate ADD1 after restarts.
+                        try:
+                            _ = self._live_refresh_scale_in_count(pos_uid=pos_uid, prefix=prefix, sym=symbol, pos_side=ledger_side)
+                        except Exception:
+                            pass
                         rows_sc = list(self.store.query_dict(
                             "SELECT COALESCE(scale_in_count, 0) AS scale_in_count FROM position_ledger WHERE pos_uid=%(u)s LIMIT 1;",
                             {"u": str(pos_uid)},

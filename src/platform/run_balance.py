@@ -8,6 +8,7 @@ import hmac
 import hashlib
 import logging
 import threading
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,6 +25,15 @@ from src.platform.data.storage.postgres.pool import create_pool
 
 
 log = logging.getLogger("platform.run_balance")
+
+
+class RateLimitError(RuntimeError):
+    """Raised when Binance responds with rate limit / ban (HTTP 429/418, code -1003)."""
+
+    def __init__(self, message: str, retry_after_sec: float):
+        super().__init__(message)
+        self.retry_after_sec = float(max(retry_after_sec, 0.0))
+
 
 
 # =============================================================================
@@ -290,6 +300,9 @@ class BinanceFuturesRest:
         # time sync
         self._time_offset_ms = 0
 
+        # rate-limit / ban cooldown handling
+        self._cooldown_until_ts = 0.0  # epoch seconds
+
     def sync_time(self) -> None:
         # /fapi/v1/time => {"serverTime":...}
         try:
@@ -307,6 +320,17 @@ class BinanceFuturesRest:
     def _ts_ms(self) -> int:
         return int(time.time() * 1000) + int(self._time_offset_ms)
 
+    def get_cooldown_seconds(self) -> float:
+        now = time.time()
+        return max(0.0, float(self._cooldown_until_ts) - now)
+
+    def _set_cooldown(self, retry_after_sec: float, *, reason: str) -> None:
+        retry_after_sec = float(max(retry_after_sec, 0.0))
+        until = time.time() + retry_after_sec
+        if until > self._cooldown_until_ts:
+            self._cooldown_until_ts = until
+        log.warning("[BINANCE REST] cooldown %.1fs (reason=%s)", retry_after_sec, reason)
+
     def _sign(self, params: Dict[str, Any]) -> Dict[str, Any]:
         # Binance expects query string to be HMAC SHA256 over the exact query string.
         q = urlencode(params, doseq=True)
@@ -321,6 +345,10 @@ class BinanceFuturesRest:
 
         for attempt in range(self._retry_max + 1):
             try:
+                cd = self.get_cooldown_seconds()
+                if cd > 0:
+                    raise RateLimitError(f"binance cooldown active for {cd:.1f}s", cd)
+
                 q = dict(params)
                 if signed:
                     q.setdefault("recvWindow", 5000)
@@ -334,9 +362,51 @@ class BinanceFuturesRest:
                 r = self._sess.request(method, url, params=q, timeout=self._timeout)
                 if self._debug:
                     log.info("[BINANCE REST] HTTP %s for %s", r.status_code, path)
+
+                if r.status_code in (418, 429):
+                    # 429: rate limit; 418: banned.
+                    retry_after = 60.0
+                    try:
+                        # Some responses include: banned until <epoch_ms>
+                        m = re.search(r"banned until\s+(\d+)", r.text)
+                        if m:
+                            banned_until_ms = int(m.group(1))
+                            retry_after = max((banned_until_ms / 1000.0) - time.time(), 5.0)
+                    except Exception:
+                        pass
+                    self._set_cooldown(retry_after, reason=f"http_{r.status_code}:{path}")
+                    raise RateLimitError(f"binance http {r.status_code} {method} {path}: {r.text}", retry_after)
+
                 if r.status_code >= 400:
+                    # Sometimes Binance returns JSON with code=-1003 without 418/429.
+                    try:
+                        j = r.json()
+                        if isinstance(j, dict) and str(j.get("code")) == "-1003":
+                            retry_after = 60.0
+                            msg = str(j.get("msg") or "")
+                            m = re.search(r"banned until\s+(\d+)", msg)
+                            if m:
+                                banned_until_ms = int(m.group(1))
+                                retry_after = max((banned_until_ms / 1000.0) - time.time(), 5.0)
+                            self._set_cooldown(retry_after, reason=f"code_-1003:{path}")
+                            raise RateLimitError(f"binance rate limit {method} {path}: {msg}", retry_after)
+                    except Exception:
+                        pass
                     raise RuntimeError(f"binance http {r.status_code} {method} {path}: {r.text}")
-                return r.json()
+
+                data = r.json()
+                # Even with HTTP 200, Binance can respond with code=-1003 in some edge cases.
+                if isinstance(data, dict) and str(data.get("code")) == "-1003":
+                    retry_after = 60.0
+                    msg = str(data.get("msg") or "")
+                    m = re.search(r"banned until\s+(\d+)", msg)
+                    if m:
+                        banned_until_ms = int(m.group(1))
+                        retry_after = max((banned_until_ms / 1000.0) - time.time(), 5.0)
+                    self._set_cooldown(retry_after, reason=f"code_-1003_200:{path}")
+                    raise RateLimitError(f"binance rate limit {method} {path}: {msg}", retry_after)
+
+                return data
             except Exception as e:
                 last_exc = e
                 if attempt < self._retry_max:
@@ -537,7 +607,11 @@ class BinanceFuturesUserStream:
         """Rotate listenKey and force WS reconnect."""
         try:
             old = self._listen_key
-            new_key = self._rest.create_listen_key()
+            try:
+                new_key = self._rest.create_listen_key()
+            except RateLimitError as e:
+                log.warning("[BINANCE WS] rotate skipped due to rate limit: %s", e)
+                return
             new_url = f"wss://fstream.binance.com/ws/{new_key}"
             with self._lock:
                 self._listen_key = new_key
@@ -603,7 +677,13 @@ class BinanceFuturesUserStream:
                     log.info("[BINANCE WS] listenKey keepalive OK")
             except Exception as e:
                 log.warning("[BINANCE WS] listenKey keepalive failed: %s", e)
-                # If keepalive fails, rotate listenKey and reconnect.
+                # If we are rate-limited/banned, wait out the cooldown instead of hammering
+                # listenKey endpoints (which can extend the ban).
+                if isinstance(e, RateLimitError):
+                    cd = float(getattr(e, "retry_after_sec", 60.0) or 60.0)
+                    time.sleep(min(max(cd, 5.0), 60.0))
+                    continue
+                # If keepalive fails for other reasons, rotate listenKey and reconnect.
                 self._rotate_listen_key()
 
 
@@ -676,6 +756,16 @@ class AccountBalanceWriter:
         upnl: Optional[float],
         source: str,
     ) -> None:
+        # Derive margin_used if writer didn't provide it.
+        # For Binance USDT-M cross margin, a practical approximation is:
+        #   margin_used ~= wallet_balance - available_balance
+        # (clamped to 0). This keeps portfolio_cap_ratio-by-margin usable even
+        # when the exchange endpoint doesn't provide marginUsed directly.
+        if margin_used is None and wallet is not None and avail is not None:
+            try:
+                margin_used = max(float(wallet) - float(avail), 0.0)
+            except Exception:
+                margin_used = None
         _db_exec(
             self._pool,
             """
@@ -1452,7 +1542,13 @@ class AccountBalanceWriter:
             "avg_price": avg_price,
         }
 
-        if client_order_id and is_new:
+        # IMPORTANT:
+        # In this project we enforce a UNIQUE index on (exchange_id, account_id, client_order_id)
+        # for non-empty client_order_id values. That means inserting/upserting only by (order_id)
+        # can fail with UniqueViolation when the same client_order_id arrives with a different order_id.
+        # Therefore: when client_order_id is present, upsert by (exchange_id, account_id, client_order_id)
+        # for ALL statuses (NEW/FILLED/etc.).
+        if client_order_id:
             _db_exec(
                 self._pool,
                 '''
@@ -1469,7 +1565,7 @@ class AccountBalanceWriter:
                   %(st)s, now(), now(), %(src)s, %(ts_ms)s, %(raw)s::jsonb, %(avg_price)s
                 )
                 ON CONFLICT (exchange_id, account_id, client_order_id)
-                WHERE (client_order_id IS NOT NULL AND client_order_id <> '' AND status = 'NEW')
+                WHERE (client_order_id IS NOT NULL AND client_order_id <> '')
                 DO UPDATE SET
                   -- We may receive a NEW update for the same client_order_id with a different order_id.
                   -- The NEW-placeholder unique constraint is on (exchange_id, account_id, client_order_id) WHERE status='NEW'.
@@ -1652,7 +1748,8 @@ class AccountBalanceWriter:
             '''
             UPDATE public.orders o
             SET
-              strategy_id = COALESCE(NULLIF(o.strategy_id,'unknown'), src.strategy_id),
+              -- never write NULL into strategy_id (NOT NULL constraint)
+              strategy_id = COALESCE(NULLIF(o.strategy_id,'unknown'), src.strategy_id, 'unknown'),
               pos_uid     = COALESCE(NULLIF(o.pos_uid,''), src.pos_uid),
               updated_at  = now()
             FROM (
@@ -1976,9 +2073,27 @@ class AccountBalanceWriter:
                     next_rest = time.time() + poll_sec
 
             except Exception as e:
-                log.error("poll error: %s", e, exc_info=True)
-                # don't spin
-                time.sleep(2.0)
+                # Rate limit / ban protection: avoid tight loops that spam REST endpoints.
+                if isinstance(e, RateLimitError):
+                    cd = float(getattr(e, "retry_after_sec", 60.0) or 60.0)
+                    # Push the next REST attempt beyond cooldown.
+                    next_rest = max(next_rest, time.time() + cd)
+                    log.error("poll error (rate limited): %s | cooldown=%.1fs", e, cd, exc_info=True)
+                    time.sleep(min(max(cd, 2.0), 10.0))
+                else:
+                    # For generic errors, still back off a bit and also move next_rest forward
+                    # so we don't retry immediately with the same failing call.
+                    backoff = 10.0
+                    try:
+                        # If REST layer has a cooldown, respect it.
+                        cd2 = float(self._rest.get_cooldown_seconds())
+                        if cd2 > 0:
+                            backoff = max(backoff, cd2)
+                    except Exception:
+                        pass
+                    next_rest = max(next_rest, time.time() + backoff)
+                    log.error("poll error: %s | backoff=%.1fs", e, backoff, exc_info=True)
+                    time.sleep(2.0)
 
             # write-heartbeat: persist last known state even if no REST heartbeat
             if (self.cfg.write_heartbeat_sec and self.cfg.write_heartbeat_sec > 0) and time.time() >= next_write:

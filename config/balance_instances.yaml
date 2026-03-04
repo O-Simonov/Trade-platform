@@ -21,7 +21,7 @@ instances:
 
     # Базовый tick цикла (сек). В WS режиме — это “частота обслуживания” (keepalive/таймеры),
     # а не частота записи в БД.
-    poll_sec: 10
+    poll_sec: 15
 
     # REST таймаут и ретраи (на случай heartbeat/seed запросов)
     timeout_sec: 20

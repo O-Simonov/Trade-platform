@@ -1,3 +1,5 @@
+
+
 # FAST PROCESS: minimal REST load, WS candles (1m/5m) + liquidations (optional)
 exchange: binance
 exchange_id: 1

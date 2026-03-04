@@ -1756,6 +1756,28 @@ class PostgreSQLStorage:
                 updated_at     = NOW()
         """
         self._exec_many(query, prepared)
+
+    def get_algo_order(self, *, exchange_id: int, account_id: int, client_algo_id: str) -> dict | None:
+        """Fetch algo order row by PK."""
+        sql = """
+            SELECT
+              exchange_id, account_id, client_algo_id,
+              algo_id, symbol, side, position_side, type,
+              quantity, trigger_price, working_type,
+              status, strategy_id, pos_uid,
+              created_at, updated_at, raw_json
+            FROM algo_orders
+            WHERE exchange_id=%(exchange_id)s
+              AND account_id=%(account_id)s
+              AND client_algo_id=%(client_algo_id)s
+            LIMIT 1
+        """
+        return self.fetch_one(sql, {
+            'exchange_id': int(exchange_id),
+            'account_id': int(account_id),
+            'client_algo_id': str(client_algo_id),
+        })
+
     def set_algo_order_status(
         self,
         *,
@@ -1826,6 +1848,10 @@ class PostgreSQLStorage:
                   AND account_id = %s
                   AND status = 'OPEN'
                   AND client_algo_id LIKE %s
+              AND client_algo_id NOT LIKE '%_HEDGE_TRL'
+              AND client_algo_id NOT LIKE '%_HEDGE_SL'
+                  AND client_algo_id NOT LIKE '%_HEDGE_TRL'
+                  AND client_algo_id NOT LIKE '%_HEDGE_SL'
             """
             return int(
                 self.execute(

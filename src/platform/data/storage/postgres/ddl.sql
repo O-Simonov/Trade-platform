@@ -61,7 +61,7 @@ CREATE TABLE IF NOT EXISTS positions (
   unrealized_pnl NUMERIC(18,8),
   updated_at TIMESTAMPTZ NOT NULL,
   source TEXT DEFAULT 'rest',
-  PRIMARY KEY(exchange_id, account_id, symbol_id)
+  PRIMARY KEY(exchange_id, account_id, symbol_id, side)
 );
 
 CREATE TABLE IF NOT EXISTS hedge_links (
@@ -309,12 +309,14 @@ CREATE TABLE IF NOT EXISTS position_snapshots (
   exchange_id SMALLINT NOT NULL,
   account_id SMALLINT NOT NULL,
   symbol_id BIGINT NOT NULL,
+  side TEXT NOT NULL DEFAULT 'FLAT',
   mark_price NUMERIC(18,8),
   unrealized_pnl NUMERIC(18,8),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  PRIMARY KEY(exchange_id, account_id, symbol_id)
+  PRIMARY KEY(exchange_id, account_id, symbol_id, side)
 );
 
+ALTER TABLE position_snapshots ADD COLUMN IF NOT EXISTS side TEXT DEFAULT 'FLAT';
 ALTER TABLE position_snapshots ADD COLUMN IF NOT EXISTS qty NUMERIC(18,8);
 ALTER TABLE position_snapshots ADD COLUMN IF NOT EXISTS avg_price NUMERIC(18,8);
 ALTER TABLE position_snapshots ADD COLUMN IF NOT EXISTS realized_pnl NUMERIC(18,8);
@@ -338,6 +340,34 @@ FROM position_snapshots;
 
 CREATE INDEX IF NOT EXISTS idx_position_snapshots_acc
   ON position_snapshots(exchange_id, account_id);
+
+CREATE INDEX IF NOT EXISTS idx_positions_open_symbol_side
+  ON positions(exchange_id, symbol_id, side)
+  WHERE status = 'OPEN' AND closed_at IS NULL AND abs(qty) > 0;
+
+CREATE INDEX IF NOT EXISTS idx_positions_status_side
+  ON positions(exchange_id, account_id, status, side);
+
+ALTER TABLE positions DROP CONSTRAINT IF EXISTS chk_flat_consistency;
+ALTER TABLE positions DROP CONSTRAINT IF EXISTS chk_qty_non_negative;
+ALTER TABLE positions DROP CONSTRAINT IF EXISTS chk_status_valid;
+ALTER TABLE positions DROP CONSTRAINT IF EXISTS chk_symbol_positive;
+
+ALTER TABLE positions
+  ADD CONSTRAINT chk_qty_non_negative CHECK (qty >= 0);
+
+ALTER TABLE positions
+  ADD CONSTRAINT chk_status_valid CHECK (status IN ('OPEN','CLOSED'));
+
+ALTER TABLE positions
+  ADD CONSTRAINT chk_symbol_positive CHECK (symbol_id > 0);
+
+ALTER TABLE positions
+  ADD CONSTRAINT chk_flat_consistency CHECK (
+    (side = 'FLAT' AND qty = 0 AND status = 'CLOSED')
+    OR (side IN ('LONG','SHORT') AND qty > 0 AND status = 'OPEN')
+    OR (side IN ('LONG','SHORT') AND qty = 0 AND status = 'CLOSED')
+  );
 
 CREATE INDEX IF NOT EXISTS idx_position_snapshots_sym
   ON position_snapshots(exchange_id, symbol_id);

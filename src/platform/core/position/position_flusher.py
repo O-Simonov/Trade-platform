@@ -134,7 +134,13 @@ class PositionFlusher:
 
         # ---- CLOSED / FLAT ----
         else:
-            row["side"] = "FLAT"
+            close_side = side
+            if close_side not in ("LONG", "SHORT"):
+                close_side = self._norm_side(getattr(life, "last_side", "FLAT") if life is not None else "FLAT")
+            if close_side not in ("LONG", "SHORT"):
+                close_side = "FLAT"
+
+            row["side"] = close_side
             row["qty"] = 0.0
             row["status"] = "CLOSED"
 

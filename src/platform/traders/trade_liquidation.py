@@ -191,6 +191,22 @@ def _coid_token(pos_uid: str, n: int = 20) -> str:
     return hashlib.sha1(b).hexdigest()[: max(8, int(n))]
 
 
+def _stable_live_signal_pos_uid(*, exchange_id: Any, account_id: Any, strategy_id: Any, signal_id: Any, symbol_id: Any, side: Any) -> str:
+    """Deterministic pos_uid for live entries opened from a signal.
+
+    This makes entry/SL/TP/TRAIL client ids idempotent across retries/restarts so the
+    same signal cannot create a second independent position with a new uuid4().
+    """
+    seed = "|".join([
+        str(exchange_id),
+        str(account_id),
+        str(strategy_id),
+        str(signal_id),
+        str(symbol_id),
+        str(side or "").upper(),
+    ])
+    return f"SIG-{hashlib.sha1(seed.encode('utf-8', errors='ignore')).hexdigest()[:24]}"
+
 
 def _as_bool(v: Any, default: bool = False) -> bool:
     """Best-effort convert config values to bool.
@@ -406,8 +422,9 @@ class TradeLiquidationParams:
 
     # --- debug
     paper_mode: bool = True  # compatibility
-    debug: bool = True
+    debug: bool = False
     debug_top: int = 10
+    ema_log_enabled: bool = False
 
     # --- backfill (CLOSED rows enrichment from exchange trades)
     backfill_run_on_startup: bool = True
@@ -554,6 +571,7 @@ class TradeLiquidationParams:
 
         params["debug"] = _as_bool(params.get("debug", cls().debug), cls().debug)
         params["debug_top"] = int(_as_int(params.get("debug_top"), cls().debug_top) or cls().debug_top)
+        params["ema_log_enabled"] = _as_bool(params.get("ema_log_enabled", cls().ema_log_enabled), cls().ema_log_enabled)
         # 3) store unknown keys so strategy can read them via getattr
         known = set(cls.__dataclass_fields__.keys())
         extras = {k: v for k, v in (d or {}).items() if k not in known}
@@ -1485,6 +1503,12 @@ class TradeLiquidation:
         if not sym or not cid:
             return
 
+        # Clear local marker immediately so the next cycle can re-create safely if needed.
+        try:
+            self._clear_local_algo_open(cid)
+        except Exception:
+            pass
+
         # IMPORTANT: Avoid spamming cancel requests that will 400 if the order is already gone.
         # We have an openAlgoOrders snapshot each cycle; if the clientAlgoId is not present there,
         # skip the REST cancel call altogether.
@@ -1513,6 +1537,147 @@ class TradeLiquidation:
                 self._binance.cancel_algo_order(symbol=sym, origClientOrderId=cid)  # type: ignore
             except Exception:
                 pass
+
+    def _get_local_algo_open_cache(self) -> Dict[str, Dict[str, Any]]:
+        cache = getattr(self, "_algo_local_open", None)
+        if not isinstance(cache, dict):
+            self._algo_local_open = {}
+            cache = self._algo_local_open
+        return cache
+
+    def _mark_local_algo_open(
+        self,
+        client_algo_id: str,
+        *,
+        symbol: str,
+        position_side: Optional[str] = None,
+        order_type: Optional[str] = None,
+        side: Optional[str] = None,
+        quantity: Optional[float] = None,
+        trigger_price: Optional[float] = None,
+        close_position: Optional[bool] = None,
+        pos_uid: Optional[str] = None,
+    ) -> None:
+        cid = str(client_algo_id or "").strip()
+        if not cid:
+            return
+        cache = self._get_local_algo_open_cache()
+        cache[cid] = {
+            "clientAlgoId": cid,
+            "symbol": str(symbol or "").upper(),
+            "positionSide": str(position_side or "").upper(),
+            "orderType": str(order_type or "").upper(),
+            "type": str(order_type or "").upper(),
+            "side": str(side or "").upper(),
+            "quantity": None if quantity is None else float(quantity),
+            "origQty": None if quantity is None else float(quantity),
+            "triggerPrice": None if trigger_price is None else float(trigger_price),
+            "activatePrice": None if trigger_price is None else float(trigger_price),
+            "closePosition": None if close_position is None else bool(close_position),
+            "pos_uid": str(pos_uid or ""),
+            "placed_at": float(time.time()),
+        }
+
+    def _clear_local_algo_open(self, client_algo_id: str) -> None:
+        cid = str(client_algo_id or "").strip()
+        if not cid:
+            return
+        cache = getattr(self, "_algo_local_open", None)
+        if isinstance(cache, dict):
+            cache.pop(cid, None)
+
+    def _find_known_algo_order_by_client_id(self, symbol: str, client_algo_id: str) -> Optional[Dict[str, Any]]:
+        sym = (symbol or "").upper().strip()
+        cid = (client_algo_id or "").strip()
+        if not sym or not cid:
+            return None
+
+        try:
+            cache = self._get_local_algo_open_cache()
+            row = cache.get(cid)
+            if isinstance(row, dict) and str(row.get("symbol") or "").upper().strip() == sym:
+                return dict(row)
+        except Exception:
+            pass
+
+        row = self._find_open_algo_order_by_client_id(sym, cid)
+        if isinstance(row, dict):
+            return row
+
+        try:
+            db_row = self.store.get_algo_order(exchange_id=self.exchange_id, account_id=self.account_id, client_algo_id=cid)
+        except Exception:
+            db_row = None
+        if db_row and str(db_row.get("status") or "").upper() == "OPEN":
+            return {
+                "symbol": sym,
+                "clientAlgoId": cid,
+                "positionSide": str(db_row.get("position_side") or "").upper(),
+                "orderType": str(db_row.get("type") or "").upper(),
+                "type": str(db_row.get("type") or "").upper(),
+                "side": str(db_row.get("side") or "").upper(),
+                "quantity": db_row.get("quantity"),
+                "origQty": db_row.get("quantity"),
+                "triggerPrice": db_row.get("trigger_price"),
+            }
+        return None
+
+    def _find_semantic_open_algo(
+        self,
+        symbol: str,
+        *,
+        client_suffix: Optional[str] = None,
+        position_side: Optional[str] = None,
+        order_type: Optional[str] = None,
+        side: Optional[str] = None,
+        close_position: Optional[bool] = None,
+    ) -> Optional[Dict[str, Any]]:
+        sym = str(symbol or "").upper().strip()
+        if not sym:
+            return None
+        want_ps = str(position_side or "").upper().strip()
+        want_type = str(order_type or "").upper().strip()
+        want_side = str(side or "").upper().strip()
+        suffix = str(client_suffix or "").strip().upper()
+
+        rows: List[Dict[str, Any]] = []
+        try:
+            rows.extend(list(self._get_local_algo_open_cache().values()))
+        except Exception:
+            pass
+        try:
+            snap = self._rest_snapshot_get("open_algo_orders_all")
+            if isinstance(snap, list):
+                rows.extend([r for r in snap if isinstance(r, dict)])
+        except Exception:
+            pass
+
+        def _to_bool_local(x: Any) -> bool:
+            if isinstance(x, bool):
+                return bool(x)
+            if x is None:
+                return False
+            return str(x).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+        for row in rows:
+            if str(row.get("symbol") or "").upper().strip() != sym:
+                continue
+            cid = str(row.get("clientAlgoId") or row.get("clientOrderId") or "").strip().upper()
+            if suffix and not cid.endswith(suffix):
+                continue
+            row_ps = str(row.get("positionSide") or row.get("position_side") or "").upper().strip()
+            if want_ps and row_ps not in {want_ps, "BOTH", ""}:
+                continue
+            row_type = str(row.get("orderType") or row.get("type") or "").upper().strip()
+            if want_type and row_type and row_type != want_type:
+                continue
+            row_side = str(row.get("side") or "").upper().strip()
+            if want_side and row_side and row_side != want_side:
+                continue
+            if close_position is not None and _to_bool_local(row.get("closePosition")) != bool(close_position):
+                continue
+            return row
+        return None
 
     def _find_open_algo_order_by_client_id(self, symbol: str, client_algo_id: str) -> Optional[Dict[str, Any]]:
         """Return an open algo order dict from the current openAlgoOrders snapshot by (symbol, clientAlgoId).
@@ -1871,6 +2036,7 @@ class TradeLiquidation:
 
                 except Exception:
                     log.debug("[trade_liquidation] openOrders sync fetch failed", exc_info=True)
+
             if need_position_risk:
                 try:
                     self._rest_snapshot_set(position_risk=self._binance.position_risk())
@@ -2741,11 +2907,11 @@ class TradeLiquidation:
             except Exception:
                 pass
 
-        # Ledger OPEN positions
+        # Ledger OPEN positions (main recovery loop works on OPEN rows only)
         led = list(
             self.store.query_dict(
                 """
-            SELECT symbol_id, pos_uid, side, status, qty_current, entry_price, avg_price, raw_meta, opened_at
+            SELECT symbol_id, pos_uid, side, status, qty_current, entry_price, avg_price, raw_meta, opened_at, source
                 FROM position_ledger
                 WHERE exchange_id=%(ex)s
                   AND account_id=%(acc)s
@@ -2756,6 +2922,63 @@ class TradeLiquidation:
                 {"ex": int(self.exchange_id), "acc": int(self.account_id), "sid": str(self.STRATEGY_ID)},
             )
         )
+
+        # Separate snapshot for hedge ownership discovery.
+        # HEDGE_TRL can be managed from a CLOSED live main row while the hedge leg is still open
+        # on exchange, so building hedge_managed_sides only from OPEN rows is insufficient.
+        led_live_for_hedge = list(
+            self.store.query_dict(
+                """
+            SELECT symbol_id, pos_uid, side, status, qty_current, entry_price, avg_price, raw_meta, opened_at, source
+                FROM position_ledger
+                WHERE exchange_id=%(ex)s
+                  AND account_id=%(acc)s
+                  AND strategy_id=%(sid)s
+                  AND source='live'
+                  AND status IN ('OPEN','CLOSED')
+                ORDER BY opened_at DESC
+                """,
+                {"ex": int(self.exchange_id), "acc": int(self.account_id), "sid": str(self.STRATEGY_ID)},
+            )
+        )
+
+        # Precompute symbol/side pairs that are hedge-managed by another OPEN live position.
+        # For any OPEN live ledger row with raw_meta.hedge.base_qty > 0, the opposite side is
+        # controlled by _live_hedge_manage() and must NOT receive generic RECOVERY TRAILING/ADD.
+        hedge_managed_sides: set[tuple[str, str]] = set()
+        try:
+            for _lp in led_live_for_hedge:
+                try:
+                    if str(_lp.get("status") or "").upper().strip() != "OPEN":
+                        continue
+                    _sid = int(_lp.get("symbol_id") or 0)
+                    _sym = sym_map.get(_sid)
+                    if not _sym:
+                        continue
+                    _side = str(_lp.get("side") or "").upper().strip()
+                    if _side not in {"LONG", "SHORT"}:
+                        continue
+                    _rm = _lp.get("raw_meta") or {}
+                    if isinstance(_rm, str):
+                        try:
+                            import json as _json
+                            _rm = _json.loads(_rm) if _rm.strip() else {}
+                        except Exception:
+                            _rm = {}
+                    _h = (_rm.get("hedge") or {}) if isinstance(_rm, dict) else {}
+                    _bq = float(_h.get("base_qty") or 0.0) if isinstance(_h, dict) else 0.0
+                    if _bq > 0.0:
+                        # raw_meta.hedge may be attached either to the hedge-managed leg itself
+                        # or to the main leg that owns the hedge state. To be robust across both
+                        # layouts, exclude both the current side and its opposite side from
+                        # generic RECOVERY TRAILING/ADD recovery.
+                        hedge_managed_sides.add((_sym, _side))
+                        _opp = "SHORT" if _side == "LONG" else "LONG"
+                        hedge_managed_sides.add((_sym, _opp))
+                except Exception:
+                    continue
+        except Exception:
+            hedge_managed_sides = set()
 
         # --- Reconcile DB: if TP/TRL/SL were manually canceled on the exchange,
         # the DB may still show them as NEW and the trader will think protection exists.
@@ -2833,6 +3056,56 @@ class TradeLiquidation:
         now = _utc_now()
         recovered = 0
 
+        # In hedge mode, a symbol side can be managed as a dedicated hedge leg of the
+        # opposite main position. In that case generic main TRAILING recovery must not
+        # place a second _TRL on the same (symbol, positionSide), otherwise recovery and
+        # hedge manager will duplicate trailing activation orders.
+        hedge_managed_sides: set[tuple[str, str]] = set()
+        two_sided_symbols: set[str] = set()
+        if hedge_mode:
+            try:
+                sides_by_symbol: Dict[str, set[str]] = {}
+                for sym_i, side_i in ex_has_pos:
+                    sides_by_symbol.setdefault(str(sym_i).upper(), set()).add(str(side_i).upper())
+                two_sided_symbols = {sym_i for sym_i, sides_i in sides_by_symbol.items() if {"LONG", "SHORT"}.issubset(sides_i)}
+            except Exception:
+                two_sided_symbols = set()
+            try:
+                for lp in led_live_for_hedge:
+                    try:
+                        sym_i = sym_map.get(int(lp.get("symbol_id") or 0))
+                        side_i = str(lp.get("side") or "").upper().strip()
+                        if (not sym_i) or side_i not in {"LONG", "SHORT"}:
+                            continue
+                        sym_u_i = str(sym_i).upper()
+                        if sym_u_i in two_sided_symbols:
+                            hedge_managed_sides.add((sym_u_i, side_i))
+                        rm_i = lp.get("raw_meta") or {}
+                        if isinstance(rm_i, str):
+                            try:
+                                import json as _json
+                                rm_i = _json.loads(rm_i) if rm_i.strip() else {}
+                            except Exception:
+                                rm_i = {}
+                        if not isinstance(rm_i, dict):
+                            continue
+                        hedge_meta = rm_i.get("hedge") or {}
+                        if not isinstance(hedge_meta, dict):
+                            continue
+                        base_qty = float(hedge_meta.get("base_qty") or 0.0)
+                        if base_qty <= 0.0:
+                            continue
+                        # raw_meta.hedge can live either on the hedge leg itself or on the main
+                        # leg that controls hedge lifecycle. Exclude both sides here to avoid
+                        # generic RECOVERY TRAILING/ADD1 racing with dedicated HEDGE_TRL logic.
+                        hedge_managed_sides.add((sym_u_i, side_i))
+                        opp_i = "SHORT" if side_i == "LONG" else "LONG"
+                        hedge_managed_sides.add((sym_u_i, opp_i))
+                    except Exception:
+                        continue
+            except Exception:
+                hedge_managed_sides = set()
+
         def _tl_safe_trigger_price(*, symbol: str, close_side: str, desired: float, mark: float, tick: float, buffer_pct: float) -> float:
             """Ensure conditional trigger price won't immediately trigger.
 
@@ -2898,6 +3171,8 @@ class TradeLiquidation:
             if side not in {"LONG", "SHORT"}:
                 continue
 
+            is_hedge_managed_side = (sym, side) in hedge_managed_sides
+
             # If exchange says no position - skip recovery (reconcile will handle ledger close)
             if (sym, side) not in ex_has_pos:
                 continue
@@ -2907,6 +3182,12 @@ class TradeLiquidation:
             qty_ex = abs(_safe_float(ex_qty_map.get((sym, side)), 0.0))
             avg_price = _safe_float(p.get("avg_price"), 0.0)
             raw_meta = p.get("raw_meta") or {}
+            if isinstance(raw_meta, str):
+                try:
+                    import json as _json
+                    raw_meta = _json.loads(raw_meta) if raw_meta.strip() else {}
+                except Exception:
+                    raw_meta = {}
             qty_led = abs(_safe_float(p.get("qty_current"), 0.0))
             qty_use = float(qty_ex if qty_ex > 0 else qty_led)
             if qty_use <= 0:
@@ -2978,6 +3259,30 @@ class TradeLiquidation:
             has_tp = (cid_tp in existing) or bool(any_tp)
             has_trl = (cid_trl in existing) or bool(any_trl)
 
+            # Strong dedupe for our own protective algo orders. Exchange snapshots can lag,
+            # and without DB/local markers the next cycle may re-place the same TP/TRL.
+            if not has_tp:
+                tp_known = self._find_known_algo_order_by_client_id(sym, cid_tp)
+                if tp_known is None:
+                    tp_known = self._find_semantic_open_algo(
+                        sym,
+                        client_suffix="_TP",
+                        position_side=position_side if hedge_mode else None,
+                        order_type="TAKE_PROFIT_MARKET",
+                        side=close_side,
+                    )
+                has_tp = tp_known is not None
+            if not has_trl:
+                trl_known = self._find_known_algo_order_by_client_id(sym, cid_trl)
+                if trl_known is None:
+                    trl_known = self._find_semantic_open_algo(
+                        sym,
+                        client_suffix="_TRL",
+                        position_side=position_side if hedge_mode else None,
+                        order_type="TRAILING_STOP_MARKET",
+                        side=close_side,
+                    )
+                has_trl = trl_known is not None
 
             # Compute protective prices from the *actual* average entry.
             # Prefer exchange-reported entryPrice (positionRisk) when available.
@@ -3027,7 +3332,7 @@ class TradeLiquidation:
                         _last = float(self._bracket_replace_last_ts.get((pos_uid, "tp"), 0.0) or 0.0)
                         if (now_ts - _last) >= float(REPLACE_COOLDOWN_SEC):
                             try:
-                                self._binance.cancel_algo_order(symbol=sym, clientAlgoId=cid_tp)
+                                self._cancel_algo_by_client_id_safe(sym, cid_tp)
                             except Exception:
                                 pass
                             has_tp = False
@@ -3039,7 +3344,7 @@ class TradeLiquidation:
             if not has_tp:
                 try:
                     tp_side = "SELL" if side == "LONG" else "BUY"
-                    self._binance.new_algo_order(
+                    resp_tp = self._binance.new_algo_order(
                         symbol=sym,
                         side=tp_side,
                         type="TAKE_PROFIT_MARKET",
@@ -3050,6 +3355,24 @@ class TradeLiquidation:
                         clientAlgoId=cid_tp,
                         triggerPrice=str(tp_price),
                     )
+                    try:
+                        self._upsert_algo_order_shadow(resp_tp, pos_uid=pos_uid, strategy_id=self.STRATEGY_ID)
+                    except Exception:
+                        pass
+                    try:
+                        self._mark_local_algo_open(
+                            cid_tp,
+                            symbol=sym,
+                            position_side=position_side,
+                            order_type="TAKE_PROFIT_MARKET",
+                            side=tp_side,
+                            quantity=float(qty_use),
+                            trigger_price=float(tp_price),
+                            close_position=True,
+                            pos_uid=pos_uid,
+                        )
+                    except Exception:
+                        pass
                     has_tp = True
                 except Exception as _e:
                     log.warning("[trade_liquidation][RECOVER] failed to place TP %s %s: %s", sym, side, _e)
@@ -3342,6 +3665,24 @@ class TradeLiquidation:
                             reduce_only=True,
                             status=str(resp.get("status") or "NEW"),
                         )
+                        try:
+                            self._upsert_algo_order_shadow(resp, pos_uid=pos_uid, strategy_id=self.STRATEGY_ID)
+                        except Exception:
+                            pass
+                        try:
+                            self._mark_local_algo_open(
+                                cid_tp,
+                                symbol=sym,
+                                position_side=position_side,
+                                order_type=str(resp.get("type") or "TAKE_PROFIT_MARKET"),
+                                side=close_side,
+                                quantity=float(qty_use),
+                                trigger_price=float(tp_price),
+                                close_position=True,
+                                pos_uid=pos_uid,
+                            )
+                        except Exception:
+                            pass
                         recovered += 1
                     log.info("[trade_liquidation][RECOVERY] placed missing TP %s %s pos_uid=%s", sym, side, pos_uid)
                 except Exception:
@@ -3396,7 +3737,7 @@ class TradeLiquidation:
                                 continue
                             self._bracket_replace_last_ts[(pos_uid, "trl")] = now_ts
                             try:
-                                self._binance.cancel_algo_order(symbol=sym, clientAlgoId=cid_trl)
+                                self._cancel_algo_by_client_id_safe(sym, cid_trl)
                             except Exception:
                                 # fallback - might be a regular order
                                 try:
@@ -3410,7 +3751,46 @@ class TradeLiquidation:
             # Trailing stop recovery (independent from SL deferral): ensure TRAILING is present if enabled
             try:
                 trailing_enabled = bool(getattr(self.p, "trailing_enabled", False))
-                if trailing_enabled and (not has_trl):
+                # Important hedge-mode guard: if this symbol side is currently managed as a
+                # hedge leg of the opposite main position, generic _TRL recovery must stay
+                # silent here. The dedicated HEDGE_TRL manager owns that side.
+                if trailing_enabled and hedge_mode and ((str(sym).upper(), str(side).upper()) in hedge_managed_sides):
+                    self._dlog(
+                        "skip generic TRL recovery for hedge-managed side sym=%s side=%s pos_uid=%s",
+                        sym, side, pos_uid,
+                    )
+                    continue
+                opp_side = "SHORT" if str(side).upper() == "LONG" else "LONG"
+                # Strong last-line guard: when both hedge-mode sides are currently open on exchange,
+                # generic recovery must not place a normal _TRL for either side. Those symbols are
+                # managed by live TP/TRL + HEDGE_TRL flows, and recovery here creates duplicate
+                # trailing activation orders after restart.
+                if trailing_enabled and hedge_mode and ((str(sym).upper(), opp_side) in ex_has_pos):
+                    self._dlog(
+                        "skip generic TRL recovery because opposite side is open sym=%s side=%s opp=%s pos_uid=%s",
+                        sym, side, opp_side, pos_uid,
+                    )
+                    continue
+                if trailing_enabled and hedge_mode and (str(sym).upper() in two_sided_symbols):
+                    self._dlog(
+                        "skip generic TRL recovery for two-sided hedge symbol sym=%s side=%s pos_uid=%s",
+                        sym, side, pos_uid,
+                    )
+                    continue
+                if trailing_enabled and (not has_trl) and (not is_hedge_managed_side):
+                    try:
+                        if not hasattr(self, "_recent_main_trl_place_ts"):
+                            self._recent_main_trl_place_ts = {}
+                    except Exception:
+                        pass
+                    recent_trl_ts = 0.0
+                    trl_guard_sec = float(getattr(self.p, "trailing_place_guard_sec", 20) or 20)
+                    try:
+                        recent_trl_ts = float(getattr(self, "_recent_main_trl_place_ts", {}).get(cid_trl, 0.0) or 0.0)
+                    except Exception:
+                        recent_trl_ts = 0.0
+                    if recent_trl_ts and (time.time() - recent_trl_ts) < trl_guard_sec:
+                        continue
                     # reference price: before any averaging adds -> entry_price, after adds -> avg_price
                     try:
                         avg_state = (raw_meta or {}).get("avg_state") or {}
@@ -3432,7 +3812,11 @@ class TradeLiquidation:
                             act = self._safe_price_above_mark(act, mark, tick, buf)
                         else:
                             act = self._safe_price_below_mark(act, mark, tick, buf)
-                        cb = float(getattr(self.p, "trailing_callback_rate", 0.5) or 0.5)
+                        cb = float(
+                            getattr(self.p, "trailing_callback_rate", None)
+                            or getattr(self.p, "trailing_trail_pct", None)
+                            or 0.5
+                        )
                         def _place_trl(i_try: int):
                             p_trl = dict(
                                 symbol=sym,
@@ -3460,7 +3844,29 @@ class TradeLiquidation:
                             reduce_only=True,
                             pos_uid=pos_uid,
                         )
+                        try:
+                            self._upsert_algo_order_shadow(resp_trl, pos_uid=pos_uid, strategy_id=self.STRATEGY_ID)
+                        except Exception:
+                            pass
+                        try:
+                            self._mark_local_algo_open(
+                                cid_trl,
+                                symbol=sym,
+                                position_side=position_side,
+                                order_type="TRAILING_STOP_MARKET",
+                                side=close_side,
+                                quantity=float(qty_use),
+                                trigger_price=float(act) if act is not None else None,
+                                close_position=None,
+                                pos_uid=pos_uid,
+                            )
+                        except Exception:
+                            pass
                         recovered += 1
+                        try:
+                            self._recent_main_trl_place_ts[cid_trl] = time.time()
+                        except Exception:
+                            pass
                         log.info("[trade_liquidation][RECOVERY] placed missing TRAILING %s %s pos_uid=%s", sym, side, pos_uid)
             except Exception:
                 log.exception("[trade_liquidation][RECOVERY] failed trailing recovery for %s %s pos_uid=%s", sym, side, pos_uid)
@@ -3470,17 +3876,28 @@ class TradeLiquidation:
             try:
                 averaging_enabled = bool(getattr(self.p, "averaging_enabled", False) or getattr(self.p, "avg_enabled", False))
                 if averaging_enabled:
-                    self._recovery_ensure_add1(
-                        sym=sym,
-                        side=side,
-                        position_side=position_side,
-                        pos_uid=pos_uid,
-                        symbol_id=int(symbol_id),
-                        entry_price=Decimal(str(avg_price or entry or 0)),
-        mark_price=_dec(ex_mark_map.get((sym, side)) or "0"),
-                        pos_qty=Decimal(str(qty_use or 0)),
-                        existing_client_ids=existing,
-                    )
+                    if hedge_mode and ((str(sym).upper(), str(side).upper()) in hedge_managed_sides):
+                        self._dlog(
+                            "skip generic ADD1 recovery for hedge-managed side sym=%s side=%s pos_uid=%s",
+                            sym, side, pos_uid,
+                        )
+                    elif hedge_mode and (str(sym).upper() in two_sided_symbols):
+                        self._dlog(
+                            "skip generic ADD1 recovery for two-sided hedge symbol sym=%s side=%s pos_uid=%s",
+                            sym, side, pos_uid,
+                        )
+                    else:
+                        self._recovery_ensure_add1(
+                            sym=sym,
+                            side=side,
+                            position_side=position_side,
+                            pos_uid=pos_uid,
+                            symbol_id=int(symbol_id),
+                            entry_price=Decimal(str(avg_price or entry or 0)),
+            mark_price=_dec(ex_mark_map.get((sym, side)) or "0"),
+                            pos_qty=Decimal(str(qty_use or 0)),
+                            existing_client_ids=existing,
+                        )
             except Exception:
                 log.exception("[trade_liquidation][RECOVERY] failed ADD recovery for %s %s pos_uid=%s", sym, side, pos_uid)
 
@@ -3524,7 +3941,7 @@ class TradeLiquidation:
                     SELECT COALESCE(scale_in_count, 0) AS scale_in_count
                     FROM position_ledger
                     WHERE exchange_id=%(ex)s AND account_id=%(acc)s AND pos_uid=%(pos_uid)s
-                      AND status='OPEN' AND source='live' AND strategy_id=%(sid)s
+                      AND status IN ('OPEN','CLOSED') AND source='live' AND strategy_id=%(sid)s
                     LIMIT 1;
                     """,
                     {
@@ -3646,6 +4063,13 @@ class TradeLiquidation:
                     reduce_only=False,
                     status=str(resp.get("status") or "NEW"),
                 )
+        except Exception:
+            pass
+
+        try:
+            if not hasattr(self, "_recent_recovery_add_place_ts"):
+                self._recent_recovery_add_place_ts = {}
+            self._recent_recovery_add_place_ts[str(cid_add)] = time.time()
         except Exception:
             pass
 
@@ -3892,7 +4316,7 @@ class TradeLiquidation:
                 SET scale_in_count = GREATEST(COALESCE(scale_in_count,0), %(n)s),
                     updated_at = now()
                 WHERE exchange_id=%(ex)s AND account_id=%(acc)s AND pos_uid=%(pos_uid)s
-                  AND status='OPEN' AND source='live' AND strategy_id=%(sid)s;
+                  AND status IN ('OPEN','CLOSED') AND source='live' AND strategy_id=%(sid)s;
                 """,
                 {
                     "ex": int(self.exchange_id),
@@ -4091,7 +4515,7 @@ class TradeLiquidation:
         if cd_sec and cd_sec > 0 and self._pl_has_raw_meta:
             try:
                 rm = pos.get("raw_meta") if isinstance(pos.get("raw_meta"), dict) else {}
-                ts_s = ((rm.get("live_entry") or {}).get("after_last_add_hedge") or {}).get("ts")
+                ts_s = ((rm.get("after_last_add_hedge") or {}).get("ts") or ((rm.get("live_entry") or {}).get("after_last_add_hedge") or {}).get("ts"))
                 if ts_s:
                     now_ms = self._to_epoch_ms(_utc_now()) or 0
                     ts_ms = self._to_epoch_ms(ts_s) or 0
@@ -4103,6 +4527,7 @@ class TradeLiquidation:
 
         side_u = str(pos_side or "").upper()
         close_side = "SELL" if side_u == "LONG" else "BUY"
+        hedge_ps = "SHORT" if side_u == "LONG" else "LONG"
 
         # Trigger price from last add fill
         if side_u == "LONG":
@@ -4140,6 +4565,40 @@ class TradeLiquidation:
             if close_side == "SELL" and stop_price >= mark:
                 stop_price = float(_round_price_to_tick(mark - tick, tick, mode="down"))
 
+        # Quantity: must be based on exchange position size
+        qty_main = 0.0
+        try:
+            pr = self._rest_snapshot_get("position_risk") or []
+            for r in pr if isinstance(pr, list) else []:
+                if str(r.get("symbol") or "").upper() != str(sym).upper():
+                    continue
+                ps = str(r.get("positionSide") or "").upper()
+                if ps in {"LONG", "SHORT"} and ps != side_u:
+                    continue
+                amt = float(r.get("positionAmt") or 0.0)
+                if abs(amt) > 0:
+                    qty_main = abs(float(amt))
+                    break
+        except Exception:
+            qty_main = 0.0
+        if qty_main <= 0:
+            qty_main = _safe_float(pos.get("qty_current") or 0.0, 0.0)
+        if qty_main <= 0:
+            return False
+
+        hedge_koff = float(getattr(self.p, "hedge_koff", 1.0) or 1.0)
+        hedge_qty = float(abs(float(qty_main)) * hedge_koff)
+
+        # qty step rounding
+        try:
+            qty_step = float(self._qty_step_for_symbol(sym) or 0.0)
+        except Exception:
+            qty_step = 0.0
+        if qty_step and qty_step > 0:
+            hedge_qty = float(_round_qty_to_step(hedge_qty, qty_step, mode="down"))
+        if hedge_qty <= 0:
+            return False
+
         # Find open algos by clientAlgoId
         open_algos = self._rest_snapshot_get("open_algo_orders_all") or []
         found_hedge = None
@@ -4151,12 +4610,67 @@ class TradeLiquidation:
                     continue
                 cid = str(ao.get("clientAlgoId") or "")
                 otype = str(ao.get("orderType") or ao.get("type") or "").upper()
+                ps = str(ao.get("positionSide") or "").upper()
+                side_ao = str(ao.get("side") or "").upper()
+                reduce_only_ao = bool(ao.get("reduceOnly"))
+                close_pos_ao = bool(ao.get("closePosition"))
+                qty_ao = float(ao.get("quantity") or ao.get("origQty") or 0.0)
+                trig_ao = float(ao.get("triggerPrice") or ao.get("stopPrice") or 0.0)
                 if cid == cid_hedge:
                     found_hedge = ao
                 if cid == legacy_cid and otype in {"STOP_MARKET", "STOP"}:
                     found_legacy = ao
+                # Semantic match for the pending hedge opener.
+                # It must belong to the hedge side, use the same opening side, and MUST NOT
+                # be a reduce-only / close-position main protective order.
+                if found_hedge is None and otype in {"STOP_MARKET", "STOP"}:
+                    if ps != str(hedge_ps).upper():
+                        continue
+                    if side_ao != str(close_side).upper():
+                        continue
+                    if reduce_only_ao or close_pos_ao:
+                        continue
+                    qty_tol = max(float(qty_step or 0.0) * 2.0, abs(float(hedge_qty or 0.0)) * 0.001, 1e-8)
+                    trig_tol = max(float(tick or 0.0) * 2.0, abs(float(stop_price or 0.0)) * 0.0002, 1e-8)
+                    if hedge_qty > 0 and qty_ao > 0 and abs(qty_ao - float(hedge_qty)) > qty_tol:
+                        continue
+                    if stop_price > 0 and trig_ao > 0 and abs(trig_ao - float(stop_price)) > trig_tol:
+                        continue
+                    found_hedge = ao
             except Exception:
                 continue
+        if found_hedge is None:
+            try:
+                row = self.store.query_one(
+                    """
+                    SELECT client_algo_id, trigger_price, quantity, updated_at
+                      FROM public.algo_orders
+                     WHERE exchange_id=%(ex)s AND account_id=%(acc)s
+                       AND upper(symbol)=%(sym)s
+                       AND upper(COALESCE(position_side,'')) = %(ps)s
+                       AND upper(COALESCE(side,'')) = %(side)s
+                       AND upper(type) IN ('STOP_MARKET','STOP')
+                       AND COALESCE(reduce_only, FALSE) = FALSE
+                       AND status='OPEN'
+                     ORDER BY updated_at DESC
+                     LIMIT 1;
+                    """,
+                    {
+                        "ex": int(self.exchange_id),
+                        "acc": int(self.account_id),
+                        "sym": str(sym).upper(),
+                        "ps": str(hedge_ps).upper(),
+                        "side": str(close_side).upper(),
+                    },
+                )
+                if row and row[0]:
+                    found_hedge = {
+                        "clientAlgoId": str(row[0] or ""),
+                        "triggerPrice": float(row[1] or 0.0),
+                        "quantity": float(row[2] or 0.0),
+                    }
+            except Exception:
+                pass
 
         # If hedge POSITION is already open on the exchange (opposite positionSide has non-zero amt),
         # we must NOT place a pending hedge opener again.
@@ -4275,7 +4789,7 @@ class TradeLiquidation:
                 if follow_cd_sec and follow_cd_sec > 0 and self._pl_has_raw_meta:
                     try:
                         rm = pos.get("raw_meta") if isinstance(pos.get("raw_meta"), dict) else {}
-                        ts_s = ((rm.get("live_entry") or {}).get("after_last_add_hedge") or {}).get("follow_ts")
+                        ts_s = ((rm.get("after_last_add_hedge") or {}).get("follow_ts") or ((rm.get("live_entry") or {}).get("after_last_add_hedge") or {}).get("follow_ts"))
                         if ts_s:
                             now_ms = self._to_epoch_ms(_utc_now()) or 0
                             ts_ms = self._to_epoch_ms(ts_s) or 0
@@ -4325,16 +4839,18 @@ class TradeLiquidation:
                     except Exception:
                         pass
             else:
-                # Default: if trigger already matches and no refresh requested -> keep
+                # Default: if trigger already matches, or DB/exchange already reports an open hedge stopper, keep it.
                 try:
                     tol = max(float(tick or 0.0) * 2.0, abs(stop_price) * 0.0002, 1e-8)
-                    if cur_f > 0 and abs(cur_f - float(stop_price)) <= tol and not must_refresh:
+                    if cur_f > 0 and abs(cur_f - float(stop_price)) <= tol:
+                        return False
+                    if cur_f > 0 and not must_refresh:
                         return False
                 except Exception:
                     pass
 
         # Cancel existing hedge (best-effort) only if we really want to refresh it.
-        if must_refresh or found_hedge is not None:
+        if must_refresh and found_hedge is not None:
             for cid in (cid_hedge,):
                 try:
                     resp_cancel = self._binance.cancel_algo_order(symbol=sym, clientAlgoId=cid)
@@ -4379,42 +4895,8 @@ class TradeLiquidation:
             except Exception:
                 pass
 
-        # Quantity: must be based on exchange position size
-        qty_main = 0.0
-        try:
-            pr = self._rest_snapshot_get("position_risk") or []
-            for r in pr if isinstance(pr, list) else []:
-                if str(r.get("symbol") or "").upper() != str(sym).upper():
-                    continue
-                ps = str(r.get("positionSide") or "").upper()
-                if ps in {"LONG", "SHORT"} and ps != side_u:
-                    continue
-                amt = float(r.get("positionAmt") or 0.0)
-                if abs(amt) > 0:
-                    qty_main = abs(float(amt))
-                    break
-        except Exception:
-            qty_main = 0.0
-        if qty_main <= 0:
-            qty_main = _safe_float(pos.get("qty_current") or 0.0, 0.0)
-        if qty_main <= 0:
-            return False
-
-        hedge_koff = float(getattr(self.p, "hedge_koff", 1.0) or 1.0)
-        hedge_qty = float(abs(float(qty_main)) * hedge_koff)
-
-        # qty step rounding
-        try:
-            qty_step = float(self._qty_step_for_symbol(sym) or 0.0)
-        except Exception:
-            qty_step = 0.0
-        if qty_step and qty_step > 0:
-            hedge_qty = float(_round_qty_to_step(hedge_qty, qty_step, mode="down"))
-        if hedge_qty <= 0:
-            return False
-
         # Hedge position side is opposite
-        # (already computed above for hedge-position-open check)
+        # (already computed above and reused for semantic exchange/DB matching)
 
         try:
             resp = self._binance.new_order(
@@ -4684,6 +5166,79 @@ class TradeLiquidation:
             except Exception:
                 continue
 
+        # Cooldown/semantic dedupe: recovery/openAlgo snapshots can lag. Treat any OPEN trailing
+        # for the same symbol+position side(+pos_uid when available) as authoritative.
+        pos_uid = None
+        semantic_db_row = None
+        try:
+            semantic_db_row = self.store.query_one(
+                """
+                SELECT client_algo_id, trigger_price, quantity, updated_at, pos_uid
+                  FROM public.algo_orders
+                 WHERE exchange_id=%(ex)s AND account_id=%(acc)s
+                   AND upper(symbol)=%(sym)s
+                   AND upper(COALESCE(position_side,'')) IN (%(side)s, 'BOTH', '')
+                   AND upper(type)='TRAILING_STOP_MARKET'
+                   AND status='OPEN'
+                 ORDER BY updated_at DESC
+                 LIMIT 1;
+                """,
+                {
+                    "ex": int(self.exchange_id),
+                    "acc": int(self.account_id),
+                    "sym": str(sym).upper(),
+                    "side": str(side_u).upper(),
+                },
+            )
+        except Exception:
+            semantic_db_row = None
+        if existing is None and semantic_db_row and semantic_db_row[0]:
+            existing = {
+                "clientAlgoId": str(semantic_db_row[0] or ""),
+                "activatePrice": float(semantic_db_row[1] or 0.0),
+            }
+            try:
+                pos_uid = str(semantic_db_row[4] or "")
+            except Exception:
+                pos_uid = None
+
+        # raw_meta cooldown for after-last-add trailing placement
+        try:
+            cd_sec = float(getattr(self.p, "trailing_reissue_cooldown_sec", 90) or 90)
+        except Exception:
+            cd_sec = 90.0
+        if cd_sec and cd_sec > 0 and symbol_id > 0 and self._pl_has_raw_meta:
+            try:
+                row = self.store.query_one(
+                    """
+                    SELECT raw_meta
+                      FROM public.position_ledger
+                     WHERE exchange_id=%(ex)s AND account_id=%(acc)s AND strategy_id=%(st)s
+                       AND symbol_id=%(symbol_id)s AND side=%(side)s AND source='live'
+                     ORDER BY updated_at DESC
+                     LIMIT 1;
+                    """,
+                    {
+                        "ex": int(self.exchange_id),
+                        "acc": int(self.account_id),
+                        "st": str(self.strategy_id),
+                        "symbol_id": int(symbol_id),
+                        "side": str(side_u),
+                    },
+                )
+                rm = row[0] if row else None
+                if isinstance(rm, str) and rm:
+                    rm = json.loads(rm)
+                if isinstance(rm, dict):
+                    ts_s = ((rm.get("after_last_add_tp_trl") or {}).get("ts") or ((rm.get("live_entry") or {}).get("after_last_add_tp_trl") or {}).get("ts"))
+                    if ts_s:
+                        now_ms = self._to_epoch_ms(_utc_now()) or 0
+                        ts_ms = self._to_epoch_ms(ts_s) or 0
+                        if now_ms and ts_ms and (now_ms - ts_ms) < int(cd_sec * 1000) and existing is not None:
+                            return False
+            except Exception:
+                pass
+
         # If TRL already exists and matches our desired params, keep it.
         # We prefer exchange snapshot over DB timestamps to avoid "thrash" when DB sync lags.
         if existing is not None:
@@ -4699,8 +5254,8 @@ class TradeLiquidation:
             if abs(ex_act - float(activation)) <= max(eps, 1e-9) and abs(ex_cb - float(trail_pct)) <= 1e-9:
                 return False
 
-        if (not must_refresh) and existing is not None:
-            # already fresh by DB time
+        if existing is not None and not must_refresh:
+            # already fresh by DB/open order semantics
             return False
 
         # Cancel existing TRL (best-effort)
@@ -4828,6 +5383,180 @@ class TradeLiquidation:
         )
         return True
 
+    def _tl_safe_trigger_price(self, *, symbol: str, close_side: str, desired: float, mark: float, tick: float, buffer_pct: float) -> float:
+        """Ensure conditional trigger price won't immediately trigger.
+
+        For close_side=SELL (closing LONG): trigger/activation must be ABOVE current mark.
+        For close_side=BUY  (closing SHORT): trigger/activation must be BELOW current mark.
+        """
+        p = float(desired or 0.0)
+        m = float(mark or 0.0)
+        buf = float(buffer_pct or 0.0) / 100.0
+        if m > 0:
+            if str(close_side).upper() == "SELL":
+                floor = m * (1.0 + max(buf, 0.0005))
+                p = max(p, floor)
+                if tick and tick > 0:
+                    p = _round_price_to_tick(p, tick, mode="up")
+            else:
+                ceil = m * (1.0 - max(buf, 0.0005))
+                p = min(p if p > 0 else ceil, ceil)
+                if tick and tick > 0:
+                    p = _round_price_to_tick(p, tick, mode="down")
+        else:
+            if tick and tick > 0:
+                p = _round_price_to_tick(p, tick, mode="up" if str(close_side).upper() == "SELL" else "down")
+        return float(p)
+
+    def _live_ensure_tp_trailing_pre_last_add(
+        self,
+        pos: dict,
+        sym: str,
+        pos_side: str,
+        pos_uid: str,
+        prefix: str,
+        tok: str,
+        adds_done: int,
+        max_adds: int,
+    ) -> bool:
+        """Ensure main TRAILING_STOP_MARKET exists before the last averaging add is filled.
+
+        This path is active only when averaging is enabled and
+        defer_stop_loss_until_last_add == False.
+        """
+        try:
+            if not bool(getattr(self.p, "trailing_enabled", False)):
+                return False
+            if bool(getattr(self.p, "defer_stop_loss_until_last_add", False)):
+                return False
+            if int(max_adds or 0) <= 0 or int(adds_done or 0) >= int(max_adds or 0):
+                return False
+
+            side_u = str(pos_side or "").upper()
+            if side_u not in {"LONG", "SHORT"}:
+                return False
+
+            qty = _safe_float(pos.get("qty_current") or pos.get("qty_opened") or 0.0, 0.0)
+            if qty <= 0.0:
+                return False
+            if not self._has_open_position_live(str(sym).upper(), side_u):
+                return False
+
+            entry_price = _safe_float(pos.get("avg_price") or pos.get("entry_price") or 0.0, 0.0)
+            if entry_price <= 0.0:
+                return False
+
+            sym_u = str(sym).upper()
+            close_side = "SELL" if side_u == "LONG" else "BUY"
+            hedge_mode = bool(getattr(self.p, "hedge_enabled", False))
+            position_side = side_u if hedge_mode else None
+            act_pct = float(getattr(self.p, "trailing_activation_pct", 0.0) or 0.0)
+            trail_pct = float(getattr(self.p, "trailing_trail_pct", 0.0) or 0.0)
+            buf_pct = float(getattr(self.p, "trailing_activation_buffer_pct", 0.20) or 0.20)
+            tick_dec = self._price_tick_for_symbol(sym_u)
+            tick = float(tick_dec) if tick_dec is not None else 0.0
+            cid_trl = f"{prefix}_{tok}_TRL"
+
+            try:
+                known = self._find_open_algo_order_by_client_id(sym_u, cid_trl) or self._find_semantic_open_algo(
+                    sym_u,
+                    client_suffix="_TRL",
+                    position_side=position_side,
+                    order_type="TRAILING_STOP_MARKET",
+                    side=close_side,
+                )
+                if known:
+                    return False
+            except Exception:
+                pass
+
+            try:
+                guard_sec = float(getattr(self.p, "trailing_place_guard_sec", 20) or 20)
+            except Exception:
+                guard_sec = 20.0
+            try:
+                recent_ts = float(getattr(self, "_recent_main_trl_place_ts", {}).get(cid_trl, 0.0) or 0.0)
+            except Exception:
+                recent_ts = 0.0
+            if recent_ts and (time.time() - recent_ts) < guard_sec:
+                return False
+
+            mark = self._get_mark_price_live(sym_u, position_side)
+            if mark <= 0.0:
+                mark = entry_price
+
+            if close_side == "SELL":
+                desired = entry_price * (1.0 + act_pct / 100.0)
+            else:
+                desired = entry_price * (1.0 - act_pct / 100.0)
+            desired = _ensure_tp_trail_side(desired, entry_price, tick, side_u, kind="trail_activate")
+            activation = self._tl_safe_trigger_price(
+                symbol=sym_u,
+                close_side=close_side,
+                desired=desired,
+                mark=mark,
+                tick=tick,
+                buffer_pct=buf_pct,
+            )
+            activation = _round_price_to_tick(
+                activation,
+                tick,
+                mode="up" if close_side == "SELL" else "down",
+            )
+            activation = _ensure_tp_trail_side(activation, entry_price, tick, side_u, kind="trail_activate")
+
+            resp = self._binance.new_order(
+                symbol=sym_u,
+                side=close_side,
+                type="TRAILING_STOP_MARKET",
+                quantity=float(qty),
+                activationPrice=float(activation),
+                callbackRate=float(trail_pct),
+                workingType=str(getattr(self.p, "working_type", "MARK_PRICE")),
+                newClientOrderId=cid_trl,
+                positionSide=position_side,
+            )
+            try:
+                self._upsert_order_shadow(
+                    pos_uid=pos_uid,
+                    order_id=resp.get("orderId") or resp.get("order_id") or resp.get("algoId") or "",
+                    client_order_id=cid_trl,
+                    symbol_id=int(pos.get("symbol_id") or 0),
+                    side=close_side,
+                    order_type="TRAILING_STOP_MARKET",
+                    qty=float(qty),
+                    price=None,
+                    reduce_only=True,
+                    status=str(resp.get("status") or "NEW"),
+                )
+            except Exception:
+                pass
+            try:
+                if not hasattr(self, "_recent_main_trl_place_ts") or not isinstance(self._recent_main_trl_place_ts, dict):
+                    self._recent_main_trl_place_ts = {}
+                self._recent_main_trl_place_ts[cid_trl] = time.time()
+            except Exception:
+                pass
+            self.log.info(
+                "[trade_liquidation][LIVE][TP_TRL] placed pre-last-add TRAILING_STOP_MARKET %s %s activation=%.8f (entry=%.8f adds_done=%s/%s trail_pct=%.4f)",
+                sym_u,
+                side_u,
+                float(activation),
+                float(entry_price),
+                int(adds_done),
+                int(max_adds),
+                float(trail_pct),
+            )
+            return True
+        except Exception:
+            self.log.exception(
+                "[trade_liquidation][LIVE][TP_TRL] failed pre-last-add ensure for %s %s (pos_uid=%s)",
+                str(sym).upper(),
+                str(pos_side).upper(),
+                str(pos_uid),
+            )
+            return False
+
     def _live_ensure_next_add_order(self, *, pos: dict) -> bool:
         """Ensure the *next* averaging add order exists (LIVE).
 
@@ -4922,6 +5651,26 @@ class TradeLiquidation:
         except Exception:
             pass
 
+        try:
+            if int(max_adds or 0) > 0 and int(adds_done or 0) < int(max_adds or 0):
+                self._live_ensure_tp_trailing_pre_last_add(
+                    pos=pos,
+                    sym=sym,
+                    pos_side=side,
+                    pos_uid=pos_uid,
+                    prefix=prefix,
+                    tok=tok,
+                    adds_done=int(adds_done),
+                    max_adds=int(max_adds),
+                )
+        except Exception:
+            self.log.exception(
+                "[trade_liquidation][LIVE][TP_TRL] failed pre-last-add call for %s %s (pos_uid=%s)",
+                str(sym).upper(),
+                str(side).upper(),
+                str(pos_uid),
+            )
+
         next_n = int(adds_done) + 1
         if next_n > max_adds:
             # Max additions cap reached -> do NOT place any new ADD orders.
@@ -4993,6 +5742,93 @@ class TradeLiquidation:
         open_all = self._rest_snapshot_get("open_orders_all") or []
         open_algos = self._rest_snapshot_get("open_algo_orders_all") or []
 
+        # Recovery can place ADD1 just before LIVE AVG runs, while Binance/openAlgo snapshots still lag.
+        # Use both a short in-process guard and DB shadow check to avoid re-sending the same clientOrderId.
+        try:
+            recent_add_guard = float(getattr(self.p, "averaging_recovery_place_guard_sec", 30) or 30)
+        except Exception:
+            recent_add_guard = 30.0
+        try:
+            recent_map = getattr(self, "_recent_recovery_add_place_ts", {})
+            recent_ts = float(recent_map.get(want_cid, 0.0) or 0.0) if isinstance(recent_map, dict) else 0.0
+        except Exception:
+            recent_ts = 0.0
+        if recent_ts and (time.time() - recent_ts) < recent_add_guard:
+            return False
+        try:
+            row = self.store.query_one(
+                """
+                SELECT status, COALESCE(source, '')
+                FROM public.orders
+                WHERE exchange_id=%(ex)s AND account_id=%(acc)s
+                  AND strategy_id=%(sid)s
+                  AND client_order_id=%(cid)s
+                ORDER BY updated_at DESC
+                LIMIT 1;
+                """,
+                {
+                    "ex": int(self.exchange_id),
+                    "acc": int(self.account_id),
+                    "sid": self.STRATEGY_ID,
+                    "cid": str(want_cid),
+                },
+            )
+            if row:
+                db_status = str(row[0] or "").upper()
+                db_source = str(row[1] or "")
+                if db_status in ("NEW", "OPEN", "PARTIALLY_FILLED"):
+                    # Shadow order can lag after manual cancel / recovery cleanup.
+                    # Let DB block placement only if the same ADD is still present in current exchange snapshots.
+                    add_is_live_on_exchange = any(str(a.get("cid") or "") == want_cid for a in (
+                        ([
+                            {
+                                "cid": str(oo.get("clientOrderId") or "")
+                            }
+                            for oo in (open_all if isinstance(open_all, list) else [])
+                            if str(oo.get("symbol") or "").upper() == sym
+                        ]) + ([
+                            {
+                                "cid": str(ao.get("clientAlgoId") or "")
+                            }
+                            for ao in (open_algos if isinstance(open_algos, list) else [])
+                            if str(ao.get("symbol") or "").upper() == sym
+                        ])
+                    ))
+                    if add_is_live_on_exchange:
+                        return False
+                    # Poisoned recovery ids must not block new averaging orders.
+                    if "#BADTP#" not in str(want_cid).upper():
+                        try:
+                            self.store.execute(
+                                """
+                                UPDATE public.orders
+                                   SET status='CANCELED', updated_at=NOW()
+                                 WHERE exchange_id=%(ex)s AND account_id=%(acc)s
+                                   AND strategy_id=%(sid)s AND client_order_id=%(cid)s
+                                   AND status IN ('NEW','OPEN','PARTIALLY_FILLED');
+                                """,
+                                {
+                                    "ex": int(self.exchange_id),
+                                    "acc": int(self.account_id),
+                                    "sid": self.STRATEGY_ID,
+                                    "cid": str(want_cid),
+                                },
+                            )
+                            log.info("[trade_liquidation][LIVE][AVG] shadow ADD marked CANCELED as stale %s %s cid=%s source=%s", sym, side, want_cid, db_source)
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
+        def _is_valid_add_cid(cid: str) -> bool:
+            cid = str(cid or "")
+            if not cid.startswith(f"{prefix}_{tok}_ADD"):
+                return False
+            # Historical poisoned ids created during bad TP/add recovery must never block new adds.
+            if "#BADTP#" in cid.upper():
+                return False
+            return int(self._parse_add_n(cid) or 0) > 0
+
         def _iter_open_adds() -> list[dict[str, Any]]:
             out: list[dict[str, Any]] = []
             # Regular openOrders
@@ -5001,7 +5837,7 @@ class TradeLiquidation:
                     if str(oo.get("symbol") or "").upper() != sym:
                         continue
                     cid = str(oo.get("clientOrderId") or "")
-                    if not cid.startswith(f"{prefix}_{tok}_ADD"):
+                    if not _is_valid_add_cid(cid):
                         continue
                     out.append({
                         "kind": "order",
@@ -5017,7 +5853,7 @@ class TradeLiquidation:
                     if str(ao.get("symbol") or "").upper() != sym:
                         continue
                     cid = str(ao.get("clientAlgoId") or "")
-                    if not cid.startswith(f"{prefix}_{tok}_ADD"):
+                    if not _is_valid_add_cid(cid):
                         continue
                     out.append({
                         "kind": "algo",
@@ -5057,8 +5893,8 @@ class TradeLiquidation:
         # should be canceled (stale orders after restart / duplicated placement).
         open_adds = _iter_open_adds()
 
-        # Drop obviously invalid numbers
-        open_adds = [a for a in open_adds if int(a.get("add_n") or 0) > 0]
+        # Drop obviously invalid numbers / poisoned ids
+        open_adds = [a for a in open_adds if _is_valid_add_cid(str(a.get("cid") or ""))]
 
         # Cancel obsolete (<= adds_done) and out-of-range (> max_adds) orders.
         canceled_any = False
@@ -5096,7 +5932,7 @@ class TradeLiquidation:
 
         # Re-check open adds after cleanup.
         open_adds = _iter_open_adds()
-        open_adds = [a for a in open_adds if int(a.get("add_n") or 0) > 0]
+        open_adds = [a for a in open_adds if _is_valid_add_cid(str(a.get("cid") or ""))]
 
         # If any ADD is still open that is NOT the desired next one, do not place a new one.
         # This enforces: at most one active ADD per position.
@@ -5956,12 +6792,17 @@ class TradeLiquidation:
           AND pl.account_id  = %(account_id)s
           AND pl.strategy_id = %(strategy_id)s
           AND pl.status      = 'OPEN'
+          AND (
+                COALESCE(pl.source, CASE WHEN %(mode)s = 'live' THEN 'live' ELSE 'paper' END)
+                = CASE WHEN %(mode)s = 'live' THEN 'live' ELSE 'paper' END
+              )
         ORDER BY pl.opened_at ASC
         """
         pos = self.store.query_dict(sql, dict(
             exchange_id=int(self.exchange_id),
             account_id=int(self.account_id),
             strategy_id=str(self.strategy_id),
+            mode=str(self.mode).lower(),
         ))
 
         # PAPER: просто считаем по ledger
@@ -6496,13 +7337,19 @@ class TradeLiquidation:
         Uses candles table (close) for given interval.
         """
         ctx = f"[{log_ctx}] " if log_ctx else ""
+        ema_log_enabled = bool(getattr(self.p, "ema_log_enabled", False) or getattr(self.p, "debug", False))
+
+        def _ema_log(msg: str, *args: Any) -> None:
+            if ema_log_enabled:
+                log.info(msg, *args)
+
         try:
             window = int(window)
             if window < 2:
-                log.info("%s[EMA] skip: window<2 (window=%s)", ctx, window)
+                _ema_log("%s[EMA] skip: window<2 (window=%s)", ctx, window)
                 return None
         except Exception:
-            log.info("%s[EMA] skip: bad window=%r", ctx, window)
+            _ema_log("%s[EMA] skip: bad window=%r", ctx, window)
             return None
 
         try:
@@ -6528,7 +7375,7 @@ class TradeLiquidation:
         rows = list(self.store.query_dict(q, {"ex": int(self.exchange_id), "sym": int(symbol_id), "tf": str(interval), "n": int(n)}))
         closes = [float(r.get("close") or 0.0) for r in rows if float(r.get("close") or 0.0) > 0]
         if len(closes) < window + 2:
-            log.info(
+            _ema_log(
                 "%s[EMA] insufficient candles: got=%s need>=%s interval=%s symbol_id=%s",
                 ctx,
                 len(closes),
@@ -6569,8 +7416,8 @@ class TradeLiquidation:
         all_up = all(d > 0 for d in last_diffs)
         all_down = all(d < 0 for d in last_diffs)
 
-        if log_ctx:
-            log.info(
+        if log_ctx and ema_log_enabled:
+            _ema_log(
                 "%s[EMA] computed: interval=%s window=%s confirm_bars=%s min_slope_pct=%.6f ema_prev=%.8f ema_last=%.8f slope_pct=%.6f last_diffs=%s",
                 ctx,
                 interval,
@@ -6584,15 +7431,15 @@ class TradeLiquidation:
             )
 
         if all_up and slope_pct >= float(min_slope_pct):
-            if log_ctx:
-                log.info("%s[EMA] direction=UP", ctx)
+            if log_ctx and ema_log_enabled:
+                _ema_log("%s[EMA] direction=UP", ctx)
             return "UP"
         if all_down and slope_pct <= -float(min_slope_pct):
-            if log_ctx:
-                log.info("%s[EMA] direction=DOWN", ctx)
+            if log_ctx and ema_log_enabled:
+                _ema_log("%s[EMA] direction=DOWN", ctx)
             return "DOWN"
-        if log_ctx:
-            log.info("%s[EMA] direction=FLAT", ctx)
+        if log_ctx and ema_log_enabled:
+            _ema_log("%s[EMA] direction=FLAT", ctx)
         return "FLAT"
 
     def _compute_significant_level(self, symbol_id: int, *, side: str, entry_ref: float, timeframe: str) -> float:
@@ -6697,7 +7544,7 @@ class TradeLiquidation:
         # NOTE: position_ledger schema can differ between deployments.
         # We only need basic fields + optional raw_meta (for hedge state).
         try:
-            sel = "symbol_id, pos_uid, side, qty_current, avg_price, entry_price"
+            sel = "symbol_id, pos_uid, side, status, qty_current, avg_price, entry_price"
             if getattr(self, "_pl_has_raw_meta", False):
                 sel += ", raw_meta"
             led = list(
@@ -6705,7 +7552,7 @@ class TradeLiquidation:
                     f"""
                     SELECT {sel}
                     FROM position_ledger
-                    WHERE exchange_id=%(ex)s AND account_id=%(acc)s AND strategy_id=%(sid)s AND status='OPEN' AND source='live'
+                    WHERE exchange_id=%(ex)s AND account_id=%(acc)s AND strategy_id=%(sid)s AND status IN ('OPEN','CLOSED') AND source='live'
                     ORDER BY opened_at DESC;
                     """,
                     {"ex": int(self.exchange_id), "acc": int(self.account_id), "sid": str(self.STRATEGY_ID)},
@@ -6716,9 +7563,9 @@ class TradeLiquidation:
             led = list(
                 self.store.query_dict(
                     """
-                    SELECT symbol_id, pos_uid, side, qty_current, avg_price, entry_price
+                    SELECT symbol_id, pos_uid, side, status, qty_current, avg_price, entry_price
                     FROM position_ledger
-                    WHERE exchange_id=%(ex)s AND account_id=%(acc)s AND strategy_id=%(sid)s AND status='OPEN' AND source='live'
+                    WHERE exchange_id=%(ex)s AND account_id=%(acc)s AND strategy_id=%(sid)s AND status IN ('OPEN','CLOSED') AND source='live'
                     ORDER BY opened_at DESC;
                     """,
                     {"ex": int(self.exchange_id), "acc": int(self.account_id), "sid": str(self.STRATEGY_ID)},
@@ -6741,13 +7588,17 @@ class TradeLiquidation:
                 skipped += 1
                 continue
 
+            pl_status = str(p.get("status") or "OPEN").upper().strip()
+            if pl_status not in {"OPEN", "CLOSED"}:
+                pl_status = "OPEN"
+
             qty = abs(float(p.get("qty_current") or 0.0))
-            if qty <= 0:
+            if pl_status == "OPEN" and qty <= 0:
                 skipped += 1
                 continue
 
             entry = _safe_float(p.get("avg_price"), default=_safe_float(p.get("entry_price"), default=0.0))
-            if entry <= 0:
+            if pl_status == "OPEN" and entry <= 0:
                 skipped += 1
                 continue
 
@@ -6799,6 +7650,11 @@ class TradeLiquidation:
                     hedge_entry = abs(float(hedge_pos.get("entryPrice") or hedge_pos.get("avgEntryPrice") or 0.0))
                 except Exception:
                     hedge_entry = 0.0
+
+            # If main is already closed in ledger, still manage hedge only if it exists on exchange
+            if pl_status != "OPEN" and float(hedge_amt or 0.0) <= 0.0:
+                skipped += 1
+                continue
 
             # Main position info (for PnL controls) + hedge base qty from ledger raw_meta
             main_amt = 0.0
@@ -6936,11 +7792,55 @@ class TradeLiquidation:
             # ------------------------------------------------------------------
             if hedge_amt > 0 and bool(getattr(self.p, "hedge_trailing_enabled", False)):
                 try:
+                    # Strict ownership guard:
+                    # HEDGE_TRL must belong to a real OPEN hedge leg that is linked to the current
+                    # base position. Without this, historical CLOSED base rows can recreate
+                    # HEDGE_TRL on the main positionSide and duplicate the normal main TRL.
+                    hedge_leg_owned = False
+                    try:
+                        row = self.store.fetch_one(
+                            """
+                            SELECT 1 AS ok
+                            FROM position_ledger pl
+                            JOIN hedge_links hl
+                              ON hl.exchange_id = pl.exchange_id
+                             AND hl.symbol_id = pl.symbol_id
+                             AND hl.base_account_id = pl.account_id
+                             AND hl.hedge_account_id = pl.account_id
+                             AND hl.hedge_pos_uid = pl.pos_uid
+                            WHERE pl.exchange_id = %s
+                              AND pl.account_id = %s
+                              AND pl.symbol_id = %s
+                              AND pl.side = %s
+                              AND pl.status = 'OPEN'
+                              AND COALESCE(pl.source, 'live') = 'live_hedge'
+                              AND hl.base_pos_uid = %s
+                            LIMIT 1
+                            """,
+                            (
+                                int(self.exchange_id),
+                                int(self.account_id),
+                                int(symbol_id),
+                                str(hedge_ps),
+                                str(p.get('pos_uid') or ''),
+                            ),
+                        )
+                        hedge_leg_owned = bool(row)
+                    except Exception:
+                        hedge_leg_owned = False
+
                     # Guard: only manage HEDGE_TRL when hedge position is really open on exchange
-                    if not self._has_open_position_live(symbol, str(hedge_ps)):
+                    # and we have a live_hedge row linked to this exact base position.
+                    if (not hedge_leg_owned) or (not self._has_open_position_live(symbol, str(hedge_ps))):
                         tok = _coid_token(str(p.get('pos_uid') or ''), n=20)
                         cid_htrl = f"TL_{tok}_HEDGE_TRL"
                         self._dlog("skip HEDGE_TRL: no open hedge position sym=%s side=%s", symbol, hedge_ps)
+                        try:
+                            cache = getattr(self, "_hedge_trl_local_open", None)
+                            if isinstance(cache, dict):
+                                cache.pop(str(cid_htrl), None)
+                        except Exception:
+                            pass
                         self._cancel_algo_by_client_id_safe(symbol, cid_htrl)
                         raise StopIteration()
 
@@ -6993,29 +7893,63 @@ class TradeLiquidation:
 
                     if q > 0:
 
-                        # Find existing trailing order in openAlgoOrders (Binance FUTURES algo endpoint)
-                        # We key by clientAlgoId == cid_htrl (some responses may also include clientOrderId).
+                        # Strong dedupe for hedge trailing. Binance openAlgoOrders can lag, and on some
+                        # accounts the same clientAlgoId may still be accepted again. So we combine:
+                        #   1) in-process recent-place guard
+                        #   2) exact clientAlgoId match in all available algo snapshots
+                        #   3) semantic match: symbol + positionSide + TRAILING_STOP_MARKET + *_HEDGE_TRL
                         existing = None
                         try:
-                            oo = self._rest_snapshot_get("open_algo_orders")
-                            oo_rows = oo if isinstance(oo, list) else []
+                            if not hasattr(self, "_hedge_trl_place_guard_ts"):
+                                self._hedge_trl_place_guard_ts = {}
+                        except Exception:
+                            pass
+
+                        place_guard_sec = float(getattr(self.p, "hedge_trailing_place_guard_sec", 20) or 20)
+                        recent_place_ts = 0.0
+                        try:
+                            recent_place_ts = float(getattr(self, "_hedge_trl_place_guard_ts", {}).get(cid_htrl, 0.0) or 0.0)
+                        except Exception:
+                            recent_place_ts = 0.0
+
+                        oo_rows = []
+                        try:
+                            for snap_name in ("open_algo_orders_all", "open_algo_orders"):
+                                snap = self._rest_snapshot_get(snap_name)
+                                if isinstance(snap, list):
+                                    oo_rows.extend(snap)
+                        except Exception:
+                            oo_rows = []
+
+                        try:
+                            want_sym = str(symbol).upper()
+                            want_ps = str(hedge_ps).upper()
+                            # 1) exact client id match
                             for r in oo_rows:
-                                if str(r.get("symbol") or "").upper() != str(symbol).upper():
+                                if str(r.get("symbol") or "").upper() != want_sym:
                                     continue
-                                cid = str(r.get("clientAlgoId") or r.get("clientOrderId") or "")
+                                cid = str(r.get("clientAlgoId") or r.get("clientOrderId") or "").strip()
                                 if cid != cid_htrl:
                                     continue
-                                # orderType (Binance) is the algo's order type; sometimes "type" may exist
-                                otype = str(r.get("orderType") or r.get("type") or "").upper()
-                                if otype and otype != "TRAILING_STOP_MARKET":
-                                    # still treat it as existing to avoid duplicates
-                                    existing = r
-                                    break
                                 existing = r
                                 break
+                            # 2) semantic match for same live hedge leg
+                            if existing is None:
+                                for r in oo_rows:
+                                    if str(r.get("symbol") or "").upper() != want_sym:
+                                        continue
+                                    cid = str(r.get("clientAlgoId") or r.get("clientOrderId") or "").strip()
+                                    if not cid.endswith("_HEDGE_TRL"):
+                                        continue
+                                    if want_ps and str(r.get("positionSide") or "").upper() not in {want_ps, "BOTH", ""}:
+                                        continue
+                                    otype = str(r.get("orderType") or r.get("type") or "").upper()
+                                    if otype and otype != "TRAILING_STOP_MARKET":
+                                        continue
+                                    existing = r
+                                    break
                         except Exception:
                             existing = None
-
 
                         # Fallback dedupe: Binance may not return some algo types in openAlgoOrders.
                         db_htrl = None
@@ -7032,8 +7966,33 @@ class TradeLiquidation:
                             db_htrl = None
                         have_db_open = bool(db_htrl and str(db_htrl.get("status") or "").upper() == "OPEN")
 
+                        # In-memory dedupe for exchanges/accounts where openAlgoOrders does not
+                        # reliably return TRAILING_STOP_MARKET hedge orders. Once we successfully
+                        # place HEDGE_TRL, keep a local "open" marker until hedge leg disappears
+                        # or we explicitly reissue/cancel it.
+                        local_htrl = None
+                        try:
+                            cache = getattr(self, "_hedge_trl_local_open", None)
+                            if not isinstance(cache, dict):
+                                self._hedge_trl_local_open = {}
+                                cache = self._hedge_trl_local_open
+                            local_htrl = cache.get(str(cid_htrl))
+                        except Exception:
+                            local_htrl = None
+
+                        local_open_same = False
+                        if isinstance(local_htrl, dict):
+                            try:
+                                local_open_same = (
+                                    str(local_htrl.get("symbol") or "").upper() == str(symbol).upper()
+                                    and str(local_htrl.get("position_side") or "").upper() == str(hedge_ps).upper()
+                                    and abs(float(local_htrl.get("quantity") or 0.0) - float(q)) <= max(qty_tol, 0.0)
+                                )
+                            except Exception:
+                                local_open_same = False
+
                         # Determine if we need to (re)issue
-                        need_place = (existing is None) and (not have_db_open)
+                        need_place = (existing is None) and (not have_db_open) and (not local_open_same)
                         need_reissue = False
                         if (not need_place) and reissue_on_qty:
                             try:
@@ -7059,6 +8018,12 @@ class TradeLiquidation:
                             # cancel existing before reissue
                             try:
                                 self._binance.cancel_algo_order(symbol=symbol, clientAlgoId=cid_htrl)
+                                try:
+                                    cache = getattr(self, "_hedge_trl_local_open", None)
+                                    if isinstance(cache, dict):
+                                        cache.pop(str(cid_htrl), None)
+                                except Exception:
+                                    pass
                                 self._hedge_trl_last_reissue_ts[cid_htrl] = now_ts
                                 log.info("[TL][HEDGE_TRL] canceled for reissue %s %s cid=%s", symbol, hedge_ps, cid_htrl)
 
@@ -7091,13 +8056,59 @@ class TradeLiquidation:
                             need_place = True
 
                         if need_place:
-                            # Activation in profit direction for hedge
+                            # Last local guard before sending REST request. Prevent duplicates inside the same
+                            # cycle / shortly after a successful placement when exchange snapshots lag behind.
+                            if recent_place_ts and (now_ts - recent_place_ts) < place_guard_sec:
+                                need_place = False
+
+                        if need_place:
+                            # Activation must be computed from the hedge average entry price:
+                            #   LONG  -> above entry by configured pct
+                            #   SHORT -> below entry by configured pct
+                            # Then we apply a mark-price safety buffer to avoid immediate trigger rejection,
+                            # but keep activation on the correct side of the entry.
+                            hedge_entry_ref = float(hedge_entry or 0.0)
+                            if hedge_entry_ref <= 0.0 and hedge_pos:
+                                try:
+                                    hedge_entry_ref = abs(float(hedge_pos.get("entryPrice") or hedge_pos.get("avgEntryPrice") or 0.0))
+                                except Exception:
+                                    hedge_entry_ref = 0.0
+                            if hedge_entry_ref <= 0.0:
+                                raise RuntimeError(f"HEDGE_TRL: no valid hedge entry for {symbol} {hedge_ps}")
+
+                            try:
+                                tick_h = float(self._price_tick_for_symbol(symbol) or 0.0)
+                            except Exception:
+                                tick_h = 0.0
+
                             if str(hedge_ps).upper() == "SHORT":
-                                activation = float(mark) * (1.0 - (act_pct + buf_pct) / 100.0)
+                                activation = float(hedge_entry_ref) * (1.0 - act_pct / 100.0)
                                 close_side = "BUY"
+                                if float(mark or 0.0) > 0.0 and tick_h > 0.0:
+                                    max_act = float(mark) * (1.0 - buf_pct / 100.0)
+                                    if activation >= max_act:
+                                        activation = float(_round_price_to_tick(max_act - tick_h, tick_h, mode="down"))
                             else:
-                                activation = float(mark) * (1.0 + (act_pct + buf_pct) / 100.0)
+                                activation = float(hedge_entry_ref) * (1.0 + act_pct / 100.0)
                                 close_side = "SELL"
+                                if float(mark or 0.0) > 0.0 and tick_h > 0.0:
+                                    min_act = float(mark) * (1.0 + buf_pct / 100.0)
+                                    if activation <= min_act:
+                                        activation = float(_round_price_to_tick(min_act + tick_h, tick_h, mode="up"))
+
+                            if tick_h > 0.0:
+                                activation = float(_round_price_to_tick(
+                                    activation,
+                                    tick_h,
+                                    mode=("down" if str(hedge_ps).upper() == "SHORT" else "up"),
+                                ))
+                                activation = float(_ensure_tp_trail_side(
+                                    activation,
+                                    hedge_entry_ref,
+                                    tick_h,
+                                    str(hedge_ps).upper(),
+                                    kind="hedge_trail_activate",
+                                ))
 
                             placed = False
                             last_err = None
@@ -7156,6 +8167,43 @@ class TradeLiquidation:
                                         pass
 
                                     self._hedge_trl_last_reissue_ts[cid_htrl] = now_ts
+                                    try:
+                                        self._hedge_trl_place_guard_ts[cid_htrl] = now_ts
+                                    except Exception:
+                                        pass
+                                    try:
+                                        cache = getattr(self, "_hedge_trl_local_open", None)
+                                        if not isinstance(cache, dict):
+                                            self._hedge_trl_local_open = {}
+                                            cache = self._hedge_trl_local_open
+                                        cache[str(cid_htrl)] = {
+                                            "symbol": str(symbol).upper(),
+                                            "position_side": str(hedge_ps).upper(),
+                                            "side": str(close_side).upper(),
+                                            "quantity": float(q),
+                                            "activation_price": float(activation),
+                                            "callback_rate": float(trail_pct),
+                                            "placed_at": float(now_ts),
+                                            "pos_uid": str(p.get("pos_uid") or ""),
+                                        }
+                                    except Exception:
+                                        pass
+                                    try:
+                                        snap = self._rest_snapshot_get("open_algo_orders_all")
+                                        if isinstance(snap, list):
+                                            snap.append({
+                                                "symbol": str(symbol).upper(),
+                                                "clientAlgoId": str(cid_htrl),
+                                                "positionSide": str(hedge_ps).upper(),
+                                                "orderType": "TRAILING_STOP_MARKET",
+                                                "type": "TRAILING_STOP_MARKET",
+                                                "side": str(close_side).upper(),
+                                                "quantity": float(q),
+                                                "callbackRate": float(trail_pct),
+                                                "activatePrice": float(activation),
+                                            })
+                                    except Exception:
+                                        pass
                                     log.info(
                                         "[TL][HEDGE_TRL] placed %s %s qty=%.8f activation=%.8f cb=%.4f cid=%s",
                                         symbol, str(hedge_ps).upper(), float(q), float(activation), float(trail_pct), cid_htrl
@@ -7262,8 +8310,16 @@ class TradeLiquidation:
                         qty_tol = max(cfg_tol, step * 0.5 if step > 0 else cfg_tol)
                         reissue_on_qty = bool(getattr(self.p, 'hedge_trailing_reissue_on_qty_change', True))
                         reissue_cd = float(getattr(self.p, 'hedge_trailing_reissue_cooldown_sec', 30) or 30)
-                        # Prefer exchange snapshot state for recovery after restart.
-                        ex_hsl = self._find_open_algo_order_by_client_id(symbol, cid_hsl)
+                        # Prefer exchange/local snapshot state for recovery after restart.
+                        ex_hsl = self._find_known_algo_order_by_client_id(symbol, cid_hsl)
+                        if ex_hsl is None:
+                            ex_hsl = self._find_semantic_open_algo(
+                                symbol,
+                                client_suffix="_HEDGE_SL",
+                                position_side=str(hedge_ps).upper(),
+                                order_type="STOP_MARKET",
+                                side=sl_side,
+                            )
                         ex_open = bool(ex_hsl is not None)
                         try:
                             ex_qty = float((ex_hsl or {}).get("quantity") or (ex_hsl or {}).get("origQty") or 0.0)
@@ -7388,6 +8444,20 @@ class TradeLiquidation:
                                     triggerPrice=self._fmt_price(symbol, desired_trig),
                                 )
                                 self._upsert_algo_order_shadow(resp_sl, pos_uid=str(p.get('pos_uid') or ''), strategy_id='trade_liquidation')
+                                try:
+                                    self._mark_local_algo_open(
+                                        cid_hsl,
+                                        symbol=symbol,
+                                        position_side=str(hedge_ps).upper(),
+                                        order_type='STOP_MARKET',
+                                        side=sl_side,
+                                        quantity=float(hedge_amt),
+                                        trigger_price=float(desired_trig),
+                                        close_position=False,
+                                        pos_uid=str(p.get('pos_uid') or ''),
+                                    )
+                                except Exception:
+                                    pass
                                 self._hsl_last_ts[cid_hsl] = now_ts
                                 log.info('[TL][HEDGE_SL] placed %s %s qty=%.8f stop=%.8f entry=%.8f pct=%.4f be=%s be_pct=%.4f act_pct=%.4f cid=%s', symbol, str(hedge_ps).upper(), float(hedge_amt), float(stop_px), float(hedge_entry_use), float(hedge_sl_pct), bool(be_applied), float(be_pct or 0.0), float(be_act_pct or 0.0), cid_hsl)
                     except Exception:
@@ -7444,8 +8514,8 @@ class TradeLiquidation:
 
             # 1) Open hedge instead of SL
             # Open hedge instead of SL (or reopen after prior close) when conditions met
-            open_trigger = bool(sl_hit)
-            if (not open_trigger) and bool(getattr(self.p, "hedge_reopen_enabled", True)):
+            open_trigger = bool(sl_hit) if pl_status == "OPEN" else False
+            if pl_status == "OPEN" and (not open_trigger) and bool(getattr(self.p, "hedge_reopen_enabled", True)):
                 # reopen hedge if main is in loss and drawdown beyond configured threshold
                 try:
                     dd_thr = float(getattr(self.p, "hedge_reopen_drawdown_pct", 0.0) or 0.0)
@@ -7598,26 +8668,28 @@ class TradeLiquidation:
                     if close_qty <= 0 or (qty_step and close_qty < qty_step):
                         skipped += 1
                         continue
-                    try:
-                        resp = self._binance.new_order(
-                            symbol=symbol,
-                            side=close_side,
-                            type="MARKET",
-                            quantity=float(close_qty),
-                            positionSide=hedge_ps,
-                        )
-                        closed += 1
-                        # persist last hedge close reason into raw_meta if available
+
+                    def _stamp_hedge_close_attempt(reason: str, close_px: float, synthetic_closed: bool = False) -> None:
                         try:
                             if getattr(self, "_pl_has_raw_meta", False):
                                 import json as _json
-                                meta = {"hedge": {"base_qty": float(hedge_base_qty) if (hedge_base_qty is not None and float(hedge_base_qty) > 0) else float(hedge_amt), "last_close_reason": str(close_reason), "last_close_ts": float(time.time()), "last_close_px": float(mark), "last_action_ts": float(time.time())}}
-                                uqm = '''
+                                meta = {
+                                    "hedge": {
+                                        "base_qty": float(hedge_base_qty) if (hedge_base_qty is not None and float(hedge_base_qty) > 0) else float(hedge_amt),
+                                        "last_close_reason": str(reason),
+                                        "last_close_ts": float(time.time()),
+                                        "last_close_px": float(close_px),
+                                        "last_action_ts": float(time.time()),
+                                        "close_inflight": False if synthetic_closed else True,
+                                        "close_inflight_ts": float(time.time()),
+                                    }
+                                }
+                                uqm = """
                                 UPDATE position_ledger
                                 SET raw_meta = COALESCE(raw_meta,'{}'::jsonb) || %(meta)s::jsonb,
                                     updated_at = now()
                                 WHERE exchange_id=%(ex)s AND account_id=%(acc)s AND pos_uid=%(pos_uid)s AND status='OPEN';
-                                '''
+                                """
                                 self.store.execute(
                                     uqm,
                                     {
@@ -7629,11 +8701,50 @@ class TradeLiquidation:
                                 )
                         except Exception:
                             pass
+
+                    try:
+                        # Stamp the close attempt before the exchange request so we do not spam duplicate
+                        # close orders while the ledger is waiting for reconciliation.
+                        _stamp_hedge_close_attempt(str(close_reason), float(mark), synthetic_closed=False)
+                        close_params = dict(
+                            symbol=symbol,
+                            side=close_side,
+                            type="MARKET",
+                            quantity=float(close_qty),
+                            positionSide=hedge_ps,
+                        )
+                        try:
+                            # In Hedge Mode Binance typically forbids reduceOnly together with positionSide.
+                            # We therefore close hedge legs without reduceOnly by default.
+                            resp = self._binance.new_order(**close_params)
+                        except Exception as e1:
+                            msg1 = str(e1)
+                            if '"code":-1106' in msg1 and 'reduceonly' in msg1.lower():
+                                retry_params = dict(close_params)
+                                retry_params.pop("reduceOnly", None)
+                                resp = self._binance.new_order(**retry_params)
+                            else:
+                                raise
+                        closed += 1
+                        _stamp_hedge_close_attempt(str(close_reason), float(mark), synthetic_closed=False)
                         log.info("[TL][HEDGE] closed %s %s qty=%.8f reason=%s mark=%.6f ema_close=%s ema_open=%s",
                                  symbol, hedge_ps, float(close_qty), str(close_reason), float(mark), str(ema_dir_close), str(ema_dir_open))
                     except Exception as e:
-                        log.exception("[TL][HEDGE] failed to close hedge for %s: %s", symbol, e)
-                        skipped += 1
+                        msg = str(e)
+                        if 'ReduceOnly Order is rejected' in msg or '"code":-2022' in msg:
+                            # The hedge is already closed (or a close is already fully matched) on the exchange.
+                            # Treat it as an idempotent close and let the normal ledger reconciliation mark qty=0.
+                            _stamp_hedge_close_attempt(f"{close_reason}_ALREADY_CLOSED", float(mark), synthetic_closed=True)
+                            closed += 1
+                            log.info("[TL][HEDGE] close already satisfied for %s %s qty=%.8f reason=%s mark=%.6f",
+                                     symbol, hedge_ps, float(close_qty), str(close_reason), float(mark))
+                        elif '"code":-1106' in msg and 'reduceonly' in msg.lower():
+                            # Binance rejected an unnecessary reduceOnly flag; treat as config/API-shape issue for this request.
+                            log.info("[TL][HEDGE] close retried without reduceOnly for %s %s qty=%.8f reason=%s",
+                                     symbol, hedge_ps, float(close_qty), str(close_reason))
+                        else:
+                            log.exception("[TL][HEDGE] failed to close hedge for %s: %s", symbol, e)
+                            skipped += 1
 
         return {"checked": checked, "opened": opened, "closed": closed, "skipped": skipped}
     # ----------------------------------------------------------
@@ -8086,6 +9197,48 @@ class TradeLiquidation:
             )
         return n
 
+    def _try_claim_signal(self, signal_id: int) -> bool:
+        """Atomically reserve a NEW signal for processing.
+
+        This protects against duplicate entries when multiple trader loops/processes
+        read the same NEW signal concurrently, or when a fast next cycle starts
+        before the previous one has fully persisted its state.
+
+        We use the existing DB enum value LOCKED as the temporary in-flight status.
+        After a successful open the signal is moved to TAKEN; on failure it is
+        returned back to NEW so it can be retried.
+        """
+        try:
+            rows = list(
+                self.store.query_dict(
+                    """
+                    UPDATE signals
+                       SET status='LOCKED', updated_at=now()
+                     WHERE id=%(id)s
+                       AND status=%(st)s
+                    RETURNING id
+                    """,
+                    {
+                        "id": int(signal_id),
+                        "st": str(self.p.signal_status_new),
+                    },
+                )
+            )
+            return bool(rows)
+        except Exception:
+            log.exception("[trade_liquidation] failed to claim signal_id=%s", int(signal_id))
+            return False
+
+    def _release_signal_claim(self, signal_id: int) -> None:
+        """Release LOCKED claim so the signal can be retried later."""
+        try:
+            self.store.execute(
+                "UPDATE signals SET status=%s, updated_at=now() WHERE id=%s AND status='LOCKED'",
+                (str(self.p.signal_status_new), int(signal_id)),
+            )
+        except Exception:
+            log.exception("[trade_liquidation] failed to release signal claim signal_id=%s", int(signal_id))
+
     def _mark_signal_taken(self, signal_id: int) -> None:
         self.store.execute("UPDATE signals SET status='TAKEN', updated_at=now() WHERE id=%s", (int(signal_id),))
 
@@ -8116,6 +9269,87 @@ class TradeLiquidation:
             return False
         mins = (_utc_now() - last.astimezone(timezone.utc)).total_seconds() / 60.0
         return mins < float(self.p.per_symbol_cooldown_minutes)
+
+    def _find_open_main_position_for_signal(self, signal_id: int, symbol_id: int, ledger_side: str) -> Optional[Dict[str, Any]]:
+        """Find existing OPEN main live position for the same signal.
+
+        Prefer deterministic pos_uid; also fall back to raw_meta.live_entry.signal_id when
+        the DB row was already created by an older build. Hedge rows are excluded.
+        """
+        params = {
+            "ex": int(self.exchange_id),
+            "acc": int(self.account_id),
+            "sid": str(self.STRATEGY_ID),
+            "sym": int(symbol_id),
+            "side": str(ledger_side),
+            "signal_id": int(signal_id),
+            "pos_uid": _stable_live_signal_pos_uid(
+                exchange_id=self.exchange_id,
+                account_id=self.account_id,
+                strategy_id=self.STRATEGY_ID,
+                signal_id=signal_id,
+                symbol_id=symbol_id,
+                side=ledger_side,
+            ),
+        }
+        try:
+            if self._pl_has_raw_meta:
+                sql = """
+                SELECT pos_uid, symbol_id, side, status, qty_current, entry_price, avg_price, raw_meta, opened_at, source
+                FROM public.position_ledger
+                WHERE exchange_id=%(ex)s
+                  AND account_id=%(acc)s
+                  AND strategy_id=%(sid)s
+                  AND symbol_id=%(sym)s
+                  AND side=%(side)s
+                  AND status='OPEN'
+                  AND COALESCE(source, 'live')='live'
+                  AND (
+                        pos_uid=%(pos_uid)s
+                        OR COALESCE(raw_meta->'live_entry'->>'signal_id','')=%(signal_id)s::text
+                      )
+                ORDER BY opened_at DESC
+                LIMIT 1;
+                """
+            else:
+                sql = """
+                SELECT pos_uid, symbol_id, side, status, qty_current, entry_price, avg_price, opened_at, source
+                FROM public.position_ledger
+                WHERE exchange_id=%(ex)s
+                  AND account_id=%(acc)s
+                  AND strategy_id=%(sid)s
+                  AND symbol_id=%(sym)s
+                  AND side=%(side)s
+                  AND status='OPEN'
+                  AND COALESCE(source, 'live')='live'
+                  AND pos_uid=%(pos_uid)s
+                ORDER BY opened_at DESC
+                LIMIT 1;
+                """
+            rows = list(self.store.query_dict(sql, params))
+            return rows[0] if rows else None
+        except Exception:
+            log.exception("[trade_liquidation] failed to lookup existing signal position signal_id=%s symbol_id=%s side=%s", int(signal_id), int(symbol_id), str(ledger_side))
+            return None
+
+    def _get_order_shadow_by_client_id(self, client_order_id: str) -> Optional[Dict[str, Any]]:
+        try:
+            rows = list(self.store.query_dict(
+                """
+                SELECT order_id, client_order_id, pos_uid, symbol_id, side, type, status, qty, price, updated_at
+                FROM public.orders
+                WHERE exchange_id=%(ex)s
+                  AND account_id=%(acc)s
+                  AND client_order_id=%(coid)s
+                ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST
+                LIMIT 1;
+                """,
+                {"ex": int(self.exchange_id), "acc": int(self.account_id), "coid": str(client_order_id)},
+            ))
+            return rows[0] if rows else None
+        except Exception:
+            log.exception("[trade_liquidation] failed to lookup orders shadow client_order_id=%s", str(client_order_id))
+            return None
 
     def _process_new_signals(self) -> Dict[str, int]:
         open_positions = self._get_open_positions()
@@ -8188,7 +9422,18 @@ class TradeLiquidation:
                 skipped += 1
                 continue
 
-            ok = self._open_from_signal(sig, wallet_balance_usdt=wallet)
+            signal_id = int(sig["signal_id"])
+            if not self._try_claim_signal(signal_id):
+                skipped += 1
+                continue
+
+            ok = False
+            try:
+                ok = self._open_from_signal(sig, wallet_balance_usdt=wallet)
+            finally:
+                if not ok:
+                    self._release_signal_claim(signal_id)
+
             if ok:
                 opened += 1
             else:
@@ -8628,8 +9873,16 @@ class TradeLiquidation:
         entry_side = "BUY" if ledger_side == "LONG" else "SELL"
         close_side = "SELL" if entry_side == "BUY" else "BUY"
 
-        # pos_uid is the join-key for all 3 orders + ledger
-        pos_uid = str(uuid.uuid4())
+        # pos_uid is the join-key for all orders + ledger.
+        # For LIVE openings from signals it must be deterministic to survive retries/restarts.
+        pos_uid = _stable_live_signal_pos_uid(
+            exchange_id=self.exchange_id,
+            account_id=self.account_id,
+            strategy_id=self.STRATEGY_ID,
+            signal_id=signal_id,
+            symbol_id=symbol_id,
+            side=ledger_side,
+        )
         prefix = _sanitize_coid_prefix(str(getattr(self.p, "client_order_id_prefix", "TL") or "TL"))
         tok = _coid_token(pos_uid, n=20)
         cid_entry = f"{prefix}_{tok}_ENTRY"
@@ -8656,24 +9909,54 @@ class TradeLiquidation:
         except Exception:
             pass
 
-        # 2) MARKET entry
-        try:
-            resp = self._binance.new_order(
-                symbol=symbol,
-                side=entry_side,
-                type="MARKET",
-                quantity=float(qty),
-                newClientOrderId=cid_entry,
-                positionSide=position_side if hedge_mode else None,
-            )
-        except Exception as e:
-            log.exception("[trade_liquidation][LIVE] MARKET entry failed for %s: %s", symbol, e)
-            return False
+        # 2) MARKET entry (idempotent by deterministic pos_uid/client ids)
+        existing_pos = self._find_open_main_position_for_signal(signal_id=signal_id, symbol_id=symbol_id, ledger_side=ledger_side)
+        shadow_entry = self._get_order_shadow_by_client_id(cid_entry)
+        entry_preexisting = False
 
-        # Binance response may include avgPrice or fills; if missing, fallback
-        avg_price = _safe_float(resp.get("avgPrice"), default=0.0)
-        if avg_price <= 0:
-            avg_price = entry_estimate
+        if existing_pos:
+            entry_preexisting = True
+            pos_uid = str(existing_pos.get("pos_uid") or pos_uid)
+            avg_price = _safe_float(existing_pos.get("avg_price") or existing_pos.get("entry_price"), default=0.0) or float(entry_estimate)
+            resp = {"orderId": None, "status": "FILLED", "avgPrice": avg_price, "clientOrderId": cid_entry}
+            log.info("[trade_liquidation][LIVE] reuse existing OPEN position for signal_id=%s symbol=%s pos_uid=%s", int(signal_id), symbol, pos_uid)
+        elif shadow_entry and str(shadow_entry.get("status") or "").upper() in {"NEW", "PARTIALLY_FILLED", "FILLED"}:
+            entry_preexisting = True
+            pos_uid = str(shadow_entry.get("pos_uid") or pos_uid)
+            avg_price = _safe_float(shadow_entry.get("price"), default=0.0) or float(entry_estimate)
+            resp = {"orderId": shadow_entry.get("order_id"), "status": shadow_entry.get("status") or "FILLED", "avgPrice": avg_price, "clientOrderId": cid_entry}
+            log.warning("[trade_liquidation][LIVE] found existing entry shadow for signal_id=%s symbol=%s pos_uid=%s; skip duplicate MARKET", int(signal_id), symbol, pos_uid)
+        else:
+            try:
+                resp = self._binance.new_order(
+                    symbol=symbol,
+                    side=entry_side,
+                    type="MARKET",
+                    quantity=float(qty),
+                    newClientOrderId=cid_entry,
+                    positionSide=position_side if hedge_mode else None,
+                )
+            except Exception as e:
+                msg = str(e)
+                # If the first attempt already reached the exchange, Binance may reject the same client id.
+                if "client" in msg.lower() and "id" in msg.lower() and "duplicate" in msg.lower():
+                    shadow_entry = self._get_order_shadow_by_client_id(cid_entry)
+                    if shadow_entry and str(shadow_entry.get("status") or "").upper() in {"NEW", "PARTIALLY_FILLED", "FILLED"}:
+                        entry_preexisting = True
+                        pos_uid = str(shadow_entry.get("pos_uid") or pos_uid)
+                        avg_price = _safe_float(shadow_entry.get("price"), default=0.0) or float(entry_estimate)
+                        resp = {"orderId": shadow_entry.get("order_id"), "status": shadow_entry.get("status") or "FILLED", "avgPrice": avg_price, "clientOrderId": cid_entry}
+                    else:
+                        log.exception("[trade_liquidation][LIVE] duplicate MARKET client id for %s but no shadow row found", symbol)
+                        return False
+                else:
+                    log.exception("[trade_liquidation][LIVE] MARKET entry failed for %s: %s", symbol, e)
+                    return False
+
+            # Binance response may include avgPrice or fills; if missing, fallback
+            avg_price = _safe_float(resp.get("avgPrice"), default=0.0)
+            if avg_price <= 0:
+                avg_price = entry_estimate
 
         # Re-anchor precomputed bracket prices to the *actual* average entry.
         # This keeps the same distance (delta) that was computed from the estimated entry.
@@ -8724,7 +10007,7 @@ class TradeLiquidation:
                 if not hedge_mode:
                     return None
                 try:
-                    tick_size = float(getattr(meta, "tick_size", 0) or 0)
+                    tick_size = float(tick_size or 0)
                     stop_px = float(_round_price_to_tick(sl_price, tick_size, mode="down" if ledger_side == "LONG" else "up"))
                     hedge_koff = float(getattr(self.p, "hedge_koff", 1.0) or 1.0)
                     hedge_qty = float(abs(float(qty)) * hedge_koff)
@@ -8786,7 +10069,7 @@ class TradeLiquidation:
                         activation_price,
                         avg_price,
                         tick_size,
-                        side,
+                        ledger_side,
                         kind="trail_activate",
                     )
 
@@ -8803,6 +10086,16 @@ class TradeLiquidation:
                     )
                     if (not hedge_mode) and bool(self.p.reduce_only):
                         params["reduceOnly"] = True
+
+                    known_trl = self._find_open_algo_order_by_client_id(symbol, cid_trl) or self._find_semantic_open_algo(
+                        symbol,
+                        client_suffix="_TRL",
+                        position_side=position_side if hedge_mode else None,
+                        order_type="TRAILING_STOP_MARKET",
+                        side=close_side,
+                    )
+                    if known_trl:
+                        return known_trl
 
                     try:
                         return self._binance.new_order(**params)
@@ -8831,6 +10124,15 @@ class TradeLiquidation:
             )
             if (not hedge_mode) and bool(self.p.reduce_only):
                 params["reduceOnly"] = True
+            known_sl = self._find_open_algo_order_by_client_id(symbol, cid_sl) or self._find_semantic_open_algo(
+                symbol,
+                client_suffix="_SL",
+                position_side=position_side if hedge_mode else None,
+                order_type="STOP",
+                side=close_side,
+            )
+            if known_sl:
+                return known_sl
             return self._binance.new_order(**params)
 
         def _place_tp() -> Optional[dict]:
@@ -8876,6 +10178,17 @@ class TradeLiquidation:
                     if (not hedge_mode) and bool(self.p.reduce_only):
                         params["reduceOnly"] = True
 
+                    known_tp = self._find_open_algo_order_by_client_id(symbol, cid_tp) or self._find_semantic_open_algo(
+                        symbol,
+                        client_suffix="_TP",
+                        position_side=position_side if hedge_mode else None,
+                        order_type="TAKE_PROFIT_MARKET",
+                        side=close_side,
+                        close_position=True,
+                    )
+                    if known_tp:
+                        return known_tp
+
                     try:
                         return self._binance.new_order(**params)
                     except Exception as e:
@@ -8902,6 +10215,15 @@ class TradeLiquidation:
             )
             if (not hedge_mode) and bool(self.p.reduce_only):
                 params["reduceOnly"] = True
+            known_tp = self._find_open_algo_order_by_client_id(symbol, cid_tp) or self._find_semantic_open_algo(
+                symbol,
+                client_suffix="_TP",
+                position_side=position_side if hedge_mode else None,
+                order_type="TAKE_PROFIT",
+                side=close_side,
+            )
+            if known_tp:
+                return known_tp
             return self._binance.new_order(**params)
 
         try:
@@ -9153,23 +10475,25 @@ class TradeLiquidation:
 
         ins = f"INSERT INTO position_ledger ({', '.join(cols)}) VALUES ({', '.join(vals)});"
         try:
-            self.store.execute(
-                ins,
-                {
-                    "ex": int(self.exchange_id),
-                    "acc": int(self.account_id),
-                    "sym": int(symbol_id),
-                    "pos_uid": str(pos_uid),
-                    "sid": self.STRATEGY_ID,
-                    "sname": self.STRATEGY_ID,
-                    "side": str(ledger_side),
-                    "qty": float(qty),
-                    "entry": float(avg_price),
-                    "avg": float(avg_price),
-                    "val": float(avg_price * qty),
-                    "meta": json.dumps(meta),
-                },
-            )
+            already_open = self._find_open_main_position_for_signal(signal_id=signal_id, symbol_id=symbol_id, ledger_side=ledger_side)
+            if not already_open:
+                self.store.execute(
+                    ins,
+                    {
+                        "ex": int(self.exchange_id),
+                        "acc": int(self.account_id),
+                        "sym": int(symbol_id),
+                        "pos_uid": str(pos_uid),
+                        "sid": self.STRATEGY_ID,
+                        "sname": self.STRATEGY_ID,
+                        "side": str(ledger_side),
+                        "qty": float(qty),
+                        "entry": float(avg_price),
+                        "avg": float(avg_price),
+                        "val": float(avg_price * qty),
+                        "meta": json.dumps(meta),
+                    },
+                )
         except Exception:
             log.exception("[trade_liquidation][LIVE] failed to INSERT position_ledger for %s", symbol)
 

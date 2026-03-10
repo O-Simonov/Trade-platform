@@ -951,9 +951,10 @@ class PostgreSQLStorage:
 
         side = self._norm_side(row.get("side"))
         qty = abs(self._f(row.get("qty"), 0.0))
+        close_side = side if side in ("LONG", "SHORT") else "FLAT"
 
         if qty <= 0.0:
-            row["side"] = "FLAT"
+            row["side"] = close_side
             row["qty"] = 0.0
             row["status"] = "CLOSED"
 
@@ -1031,7 +1032,7 @@ class PostgreSQLStorage:
                 %(opened_at)s, %(closed_at)s,
                 %(updated_at)s, %(source)s
             )
-            ON CONFLICT (exchange_id, account_id, symbol_id)
+            ON CONFLICT (exchange_id, account_id, symbol_id, side)
             DO UPDATE SET
                 strategy_id = CASE
                     WHEN positions.strategy_id = 'unknown'
@@ -1040,20 +1041,16 @@ class PostgreSQLStorage:
                     THEN EXCLUDED.strategy_id
                     ELSE positions.strategy_id
                 END,
-                strategy_name = COALESCE(positions.strategy_name, EXCLUDED.strategy_name),
+                strategy_name = COALESCE(EXCLUDED.strategy_name, positions.strategy_name),
 
-                pos_uid = CASE
-                    WHEN COALESCE(positions.pos_uid, '') <> '' THEN positions.pos_uid
-                    WHEN COALESCE(EXCLUDED.pos_uid, '') <> '' THEN EXCLUDED.pos_uid
-                    ELSE positions.pos_uid
-                END,
+                -- positions = current state table, so active pos_uid/opened_at must follow latest row
+                pos_uid = COALESCE(NULLIF(EXCLUDED.pos_uid, ''), positions.pos_uid),
 
-                opened_at = COALESCE(positions.opened_at, EXCLUDED.opened_at),
+                opened_at = COALESCE(EXCLUDED.opened_at, positions.opened_at),
 
                 closed_at = CASE
-                    WHEN positions.closed_at IS NOT NULL THEN positions.closed_at
-                    WHEN EXCLUDED.closed_at IS NOT NULL THEN EXCLUDED.closed_at
-                    ELSE positions.closed_at
+                    WHEN EXCLUDED.status = 'OPEN' THEN NULL
+                    ELSE COALESCE(EXCLUDED.closed_at, positions.closed_at)
                 END,
 
                 side = EXCLUDED.side,
@@ -1103,9 +1100,10 @@ class PostgreSQLStorage:
             qty = abs(self._f(d.get("qty"), 0.0))
             side = self._norm_side(d.get("side"))
 
+            close_side = side if side in ("LONG", "SHORT") else "FLAT"
             if qty <= 0:
                 d["qty"] = 0.0
-                d["side"] = "FLAT"
+                d["side"] = close_side
             else:
                 d["qty"] = float(qty)
                 if side not in ("LONG", "SHORT"):
@@ -1146,7 +1144,7 @@ class PostgreSQLStorage:
                 %(position_value)s, %(unrealized_pnl)s, %(realized_pnl)s, %(fees)s,
                 %(last_ts)s, %(updated_at)s, %(source)s
             )
-            ON CONFLICT (exchange_id, account_id, symbol_id)
+            ON CONFLICT (exchange_id, account_id, symbol_id, side)
             DO UPDATE SET
                 side = EXCLUDED.side,
                 qty = EXCLUDED.qty,
@@ -1289,6 +1287,8 @@ class PostgreSQLStorage:
         query = """
             SELECT s.symbol,
                    p.symbol_id,
+                   p.side,
+                   p.pos_uid,
                    p.qty,
                    p.entry_price,
                    p.unrealized_pnl,
@@ -1299,6 +1299,7 @@ class PostgreSQLStorage:
                 JOIN symbols s ON s.symbol_id = p.symbol_id
             WHERE p.exchange_id = %s
               AND p.account_id = %s
+            ORDER BY s.symbol, p.side
         """
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
@@ -1310,7 +1311,18 @@ class PostgreSQLStorage:
         for row in rows:
             r = dict(zip(cols, row))
             sym = r.pop("symbol")
-            out[sym] = r
+            side = str(r.get("side") or "").upper()
+            prev = out.get(sym)
+            if prev is None:
+                out[sym] = r
+            else:
+                if isinstance(prev, dict) and "side" in prev:
+                    out[sym] = {str(prev.get("side") or "UNKNOWN").upper(): prev, side or "UNKNOWN": r}
+                elif isinstance(prev, dict):
+                    prev[side or "UNKNOWN"] = r
+                    out[sym] = prev
+                else:
+                    out[sym] = {side or "UNKNOWN": r}
         return out
 
     def get_latest_balances(self, *, exchange=None, account=None, exchange_id=None, account_id=None) -> dict:

@@ -126,6 +126,10 @@ traders:
       hedge_level_tolerance_pct: 0.10              # Tolerance (%) around level for hedge close
       hedge_reopen_enabled: true                   # Reopen hedge after it was closed if main still in loss
       hedge_reopen_drawdown_pct: 0.0               # Reopen threshold drawdown (%). 0 => any negative unrealized PnL
+
+      hedge_add_on_main_close_enabled: true        # Добор в hedge, когда main-позиция закрылась, а hedge ещё открыт
+      hedge_add_on_main_close_max_adds: 1          # Лимит таких доборов на одну позицию
+
       all_P_L: 5.0                                 # Close BOTH (main+hedge) if combined unrealized PnL >= this USDT
 
       # --- Hedge trailing (отдельно от основного trailing)
@@ -198,7 +202,7 @@ traders:
       max_open_positions: 10                          # Максимум одновременно открытых позиций
 
       # Максимальный размер позиции относительно кошелька (в % от wallet) — ограничение на notional.
-      max_position_notional_pct_wallet: 10.0
+      max_position_notional_pct_wallet: 20.0
 
       # Риск на сделку (в % от wallet). Используется для расчёта размера позиции/добавок.
       risk_wallet_pct: 2.0
@@ -310,8 +314,8 @@ traders:
       # ----------------------------
       # Portfolio cap (ограничение на использование маржи/кошелька)
       # ----------------------------
-      portfolio_cap_ratio: 0.0       # 0=OFF. Если SUM(position_ledger.position_value_usdt WHERE OPEN)/wallet >= ratio -> не открываем новые сделки.
-                                     # Пример: 0.9 = не превышать 90% от баланса; 1.0 = не превышать 1x wallet.
+      portfolio_cap_ratio: 0.7       # 0=OFF. Если SUM(position_ledger.position_value_usdt WHERE OPEN)/wallet >= ratio -> не открываем новые сделки.
+                                     # Пример: 0.7 = не превышать 70% от баланса; 1.0 = не превышать 1x wallet.
       # ----------------------------
       # Reconcile (сверка позиций биржа vs леджер/БД)
       # ----------------------------

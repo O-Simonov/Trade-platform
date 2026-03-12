@@ -743,14 +743,13 @@ class PostgreSQLStorage:
         self.exec_ddl(ddl)
         self._screeners_schema_ready = True
 
-
     def ensure_screener(self, *, name: str, version: str, description: str | None = None) -> int:
         """
         Ensure screener exists and return screener_id.
 
-        ВАЖНО:
-        В БД сейчас UNIQUE только на (name), поэтому ON CONFLICT тоже должен быть по (name).
-        Версию просто обновляем.
+        Почему не INSERT ... ON CONFLICT:
+        even on conflict Postgres may advance the sequence before checking uniqueness,
+        so frequent calls can exhaust a SMALLINT/old sequence.
         """
         self._ensure_screeners_schema()
 
@@ -760,21 +759,53 @@ class PostgreSQLStorage:
         if not name:
             raise ValueError("ensure_screener(): name is empty")
 
-        sql = """
-            INSERT INTO public.screeners (name, version, description, is_enabled, created_at, updated_at)
-            VALUES (%s, %s, %s, TRUE, NOW(), NOW())
-            ON CONFLICT (name)
-            DO UPDATE SET
-                version = EXCLUDED.version,
-                description = COALESCE(screeners.description, EXCLUDED.description),
-                is_enabled = TRUE,
-                updated_at = NOW()
-            RETURNING screener_id
-        """
-
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
-                cur.execute(sql, (name, version, description))
+                # 1) сначала пытаемся найти существующий screener
+                cur.execute(
+                    """
+                    SELECT screener_id, version, description, is_enabled
+                    FROM public.screeners
+                    WHERE name = %s LIMIT 1
+                    """,
+                    (name,),
+                )
+                row = cur.fetchone()
+
+                if row:
+                    screener_id, old_version, old_description, old_is_enabled = row
+
+                    need_update = (
+                            str(old_version or "") != version
+                            or (description is not None and str(old_description or "") != str(description))
+                            or (old_is_enabled is not True)
+                    )
+
+                    if need_update:
+                        cur.execute(
+                            """
+                            UPDATE public.screeners
+                            SET version     = %s,
+                                description = COALESCE(%s, description),
+                                is_enabled  = TRUE,
+                                updated_at  = NOW()
+                            WHERE screener_id = %s
+                            """,
+                            (version, description, int(screener_id)),
+                        )
+
+                    conn.commit()
+                    return int(screener_id)
+
+                # 2) если нет — только тогда INSERT
+                cur.execute(
+                    """
+                    INSERT INTO public.screeners
+                        (name, version, description, is_enabled, created_at, updated_at)
+                    VALUES (%s, %s, %s, TRUE, NOW(), NOW()) RETURNING screener_id
+                    """,
+                    (name, version, description),
+                )
                 screener_id = cur.fetchone()[0]
             conn.commit()
 
@@ -1928,24 +1959,20 @@ class PostgreSQLStorage:
             return
 
         query = """
-            INSERT INTO trades (
-                exchange_id, account_id, trade_id, order_id, symbol_id,
-                strategy_id, pos_uid, side, price, qty, fee, fee_asset,
-                realized_pnl, ts, source, raw_json
-            )
-            VALUES (
-                %(exchange_id)s, %(account_id)s, %(trade_id)s, %(order_id)s, %(symbol_id)s,
-                %(strategy_id)s, %(pos_uid)s, %(side)s, %(price)s, %(qty)s, %(fee)s, %(fee_asset)s,
-                %(realized_pnl)s, %(ts)s, %(source)s, %(raw_json)s
-            )
-            ON CONFLICT (exchange_id, account_id, trade_id)
-            DO UPDATE SET
-                fee = EXCLUDED.fee,
-                fee_asset = EXCLUDED.fee_asset,
-                realized_pnl = EXCLUDED.realized_pnl,
-                ts = EXCLUDED.ts,
-                raw_json = EXCLUDED.raw_json
-        """
+                INSERT INTO trades (exchange_id, account_id, trade_id, order_id, symbol_id, \
+                                    strategy_id, pos_uid, side, price, qty, fee, fee_asset, \
+                                    realized_pnl, ts, source, raw_json)
+                VALUES (%(exchange_id)s, %(account_id)s, %(trade_id)s, %(order_id)s, %(symbol_id)s, \
+                        %(strategy_id)s, %(pos_uid)s, %(side)s, %(price)s, %(qty)s, %(fee)s, %(fee_asset)s, \
+                        %(realized_pnl)s, %(ts)s, %(source)s, %(raw_json)s) ON CONFLICT (exchange_id, account_id, trade_id)
+            DO \
+                UPDATE SET
+                    fee = EXCLUDED.fee, \
+                    fee_asset = EXCLUDED.fee_asset, \
+                    realized_pnl = EXCLUDED.realized_pnl, \
+                    ts = EXCLUDED.ts, \
+                    raw_json = EXCLUDED.raw_json \
+                """
 
         rows = []
         for t in trades:
@@ -1967,11 +1994,10 @@ class PostgreSQLStorage:
                     "ts": t["ts"],
                     "source": str(t.get("source") or "ws"),
                     "raw_json": self._to_jsonb(t),
-
                 }
             )
 
-        self._exec_many(query, prepared)
+        self._exec_many(query, rows)
 
     def get_today_realized_pnl(self, exchange_id: int, account_id: int) -> float:
         query = """

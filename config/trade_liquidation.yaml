@@ -1,354 +1,370 @@
 # ============================================================
 # Trade Platform — конфиг трейдера trade_liquidation
+# Версия: переписанный и прокомментированный вариант
 # ============================================================
 
-# Как часто перезапускать цикл трейдеров (в минутах).
-# 0.25 = 15 секунд.
+# Как часто перезапускать цикл трейдера (в минутах).
+# 0.2 = примерно 12 секунд.
 restart_interval_minutes: 0.2
 
 traders:
-  - name: trade_liquidation            # Имя трейдера (используется в логах/идентификации)
-    enabled: true                      # Включен ли трейдер
+  - name: trade_liquidation            # Имя трейдера (используется в логах и идентификации)
+    enabled: true                      # true = трейдер включен, false = выключен
     version: "1.0"                     # Версия логики трейдера (информативно)
 
     params:
-      # ----------------------------
-      # Идентификация биржи/аккаунта
-      # ----------------------------
+      # ======================================================
+      # Идентификация биржи / аккаунта
+      # ======================================================
 
       exchange_id: 1                   # ID биржи в БД (таблица exchanges)
-      account_name: base_main          # Человеко-читаемое имя аккаунта (для логов/маркировки)
-      account_id: 1                    # ID аккаунта (внутренний ID системы)
+      account_name: base_main          # Человеко-читаемое имя аккаунта
+      account_id: 1                    # Внутренний ID аккаунта
 
-      # ------------------------------------------------
+      # ======================================================
       # Источник сигналов (скринеры) и фильтры по сигналам
-      # ------------------------------------------------
+      # ======================================================
 
-      # Имена скринеров (таблица screeners.name). Поддерживается список.
+      # Какие скринеры используются как источник сигналов.
+      # Можно указывать список имен из таблицы screeners.name
       screener_name: ["scr_liquidation_binance", "scr_oi_binance"]
 
-      signal_status_new: NEW           # Какой статус сигнала считать "новым" (обычно NEW)
+      signal_status_new: NEW           # Какой статус сигнала считать "новым"
 
-      # Разрешённые таймфреймы для сигналов. Поддерживается список.
-      allowed_timeframes: ["5m","15m","1h","4h"]
+      # Разрешённые таймфреймы сигналов
+      allowed_timeframes: ["5m", "15m", "1h", "4h"]
 
-      # Максимальный возраст сигнала (в минутах) от signal_ts.
-      # Сигналы старше этого значения игнорируются.
+      # Максимальный возраст сигнала в минутах от signal_ts
       max_signal_age_minutes: 30
 
-      # Кулдаун по символу (в минутах): не открывать новую сделку по символу,
-      # если недавно уже была попытка/сделка по этому же символу.
+      # Кулдаун по символу:
+      # не открывать новую сделку по тому же символу, если недавно уже была сделка/попытка
       per_symbol_cooldown_minutes: 60
 
-      # Максимум попыток открыть сделку по одному сигналу
+      # Максимум попыток открытия сделки по одному сигналу
       max_attempts_per_signal: 2
 
-      # Пауза (в минутах) между повторными попытками по одному и тому же сигналу
+      # Пауза между повторными попытками по одному и тому же сигналу
       retry_cooldown_minutes: 2
 
-      # Ключ в context (jsonb) для хранения/учёта попыток
+      # Ключ в context/jsonb для хранения счётчика попыток
       attempts_context_key: trade_liquidation
 
-      # Если превышены max_attempts_per_signal — переводить сигнал в expire_status
+      # Если число попыток превышено — переводить сигнал в expire_status
       expire_on_attempts_exceeded: true
 
-      # Статус, который ставить сигналу при экспирации (истечении/выбраковке)
+      # Статус сигнала при экспирации
       expire_status: EXPIRED
 
-      # Включить автоматическую экспирацию старых NEW-сигналов
+      # Автоматически экспирировать старые NEW-сигналы
       expire_old_signals: true
 
-      # Экспирировать сигналы NEW, если они старше этого возраста (в минутах)
+      # Сигнал NEW экспирируется, если старше этого возраста
       expire_max_age_minutes: 120
 
-      # Сколько сигналов максимум обрабатывать за один проход экспирации
+      # Максимум сигналов за один проход блока экспирации
       expire_batch_limit: 5000
 
-      # ----------------------------
+      # ======================================================
       # Режим работы
-      # ----------------------------
+      # ======================================================
 
-      mode: live            # Режим: live (реальные ордера) / "paper" или dry-run (симуляция, если поддерживается)
+      mode: live                       # live = реальные ордера
 
-      # ----------------------------
+      # ======================================================
       # Binance API / сеть
-      # ----------------------------
+      # ======================================================
 
       api_key_env: BINANCE_BASE_MAIN_API_KEY        # Имя переменной окружения с API KEY
       api_secret_env: BINANCE_BASE_MAIN_API_SECRET  # Имя переменной окружения с API SECRET
 
       base_url: https://fapi.binance.com            # Базовый URL Binance Futures API
-      recv_window_ms: 5000                          # recvWindow для подписанных запросов (мс)
-      timeout_sec: 10                               # Таймаут http-запроса по умолчанию (сек)
+      recv_window_ms: 5000                          # recvWindow для signed-запросов
+      timeout_sec: 10                               # Общий таймаут HTTP-запроса
 
-      # Баланс: брать с биржи или из БД (account_balance_snapshots).
-      # true  => брать по /fapi/v2/balance
-      # false => брать из БД
+      # Источник баланса:
+      # true  = брать напрямую с биржи
+      # false = брать из БД
       use_exchange_balance: false
 
-      binance_connect_timeout_sec: 3.0              # Таймаут установления соединения (сек)
-      binance_read_timeout_sec: 15.0                # Таймаут чтения ответа (сек)
-      binance_max_retries: 3                        # Кол-во повторов при сетевых ошибках
-      binance_retry_backoff_sec: 1.0                # Пауза между ретраями (сек)
+      binance_connect_timeout_sec: 3.0              # Таймаут установления TCP/HTTP соединения
+      binance_read_timeout_sec: 15.0                # Таймаут ожидания ответа
+      binance_max_retries: 3                        # Число сетевых ретраев
+      binance_retry_backoff_sec: 1.0                # Пауза между ретраями
 
-      # ----------------------------
+      # ======================================================
       # Получение и кэширование баланса
-      # ----------------------------
+      # ======================================================
 
-      wallet_balance_retries: 2                     # Ретраи получения баланса (если не удалось с первого раза)
-      wallet_balance_retry_backoff_sec: 1.0         # Пауза между ретраями баланса (сек)
+      wallet_balance_retries: 2                     # Сколько раз повторять попытку чтения баланса
+      wallet_balance_retry_backoff_sec: 1.0         # Пауза между ретраями баланса
 
-      # TTL кэша баланса (сек): чтобы не дергать биржу/БД слишком часто
-      wallet_balance_cache_ttl_sec: 180
+      wallet_balance_cache_ttl_sec: 180             # TTL кэша баланса
+      wallet_balance_poll_sec: 10                   # Частота опроса баланса
 
-      # Частота опроса баланса (сек) (если в коде используется периодический polling)
-      wallet_balance_poll_sec: 10
-
-      # ----------------------------
+      # ======================================================
       # Риск и ограничения на позиции
-      # ----------------------------
+      # ======================================================
 
-      leverage: 20                                 # Плечо (leverage) для символа
-      margin_type: CROSSED                         # Тип маржи: CROSSED или ISOLATED
-      hedge_enabled: true                          # Hedge mode: true => positionSide LONG/SHORT
-      # funding-aware hedge sizing
-      hedge_funding_kof_limit: 1.0                 # порог в процентах (1.0 = 1% => 0.01)
-      hedge_koff_funding_boost: 2.0                # hedge_koff когда funding выгоден хеджу
-      hedge_koff: 1.0                              # Hedge qty multiplier vs main position qty
-      hedge_ema_window: 9                          # EMA window
-      hedge_ema_interval: "5m"                     # EMA timeframe (candles.interval)
-      hedge_ema_confirm_bars: 3                    # EMA direction confirmation bars (anti-chop)
-      hedge_ema_min_slope_pct: 0.08                # Minimal EMA slope (% per 5m bar) to treat direction as valid (anti-chop, good for alts)
-      hedge_ema_flip_slope_mult: 0.7               # Close-on-flip uses min_slope * mult (softer threshold for closes)
-      hedge_cooldown_sec: 180                      # Cooldown between hedge open/close actions (anti-chop)
-      hedge_close_on_level: false                  # Close hedge near significant averaging level
-      hedge_close_on_ema_flip: true                # Close hedge if EMA flips against hedge
-      hedge_level_tolerance_pct: 0.10              # Tolerance (%) around level for hedge close
-      hedge_reopen_enabled: true                   # Reopen hedge after it was closed if main still in loss
-      hedge_reopen_drawdown_pct: 0.0               # Reopen threshold drawdown (%). 0 => any negative unrealized PnL
+      leverage: 20                                  # Плечо
+      margin_type: CROSSED                          # Тип маржи: CROSSED / ISOLATED
+      hedge_enabled: true                           # true = hedge mode с LONG/SHORT
 
-      hedge_add_on_main_close_enabled: true        # Добор в hedge, когда main-позиция закрылась, а hedge ещё открыт
-      hedge_add_on_main_close_max_adds: 1          # Лимит таких доборов на одну позицию
+      # --- Hedge sizing с учетом funding
+      hedge_funding_kof_limit: 1.0                  # Порог funding в процентах
+      hedge_koff_funding_boost: 2.0                 # Усиление hedge_koff при выгодном funding
+      hedge_koff: 1.0                               # Множитель размера hedge относительно main
 
-      all_P_L: 5.0                                 # Close BOTH (main+hedge) if combined unrealized PnL >= this USDT
+      # --- EMA-логика для hedge
+      hedge_ema_window: 9                           # EMA window
+      hedge_ema_interval: "5m"                      # Таймфрейм свечей для EMA
+      hedge_ema_confirm_bars: 3                     # Сколько баров нужно для подтверждения направления
+      hedge_ema_min_slope_pct: 0.08                 # Минимальный slope EMA, чтобы считать направление валидным
+      hedge_ema_flip_slope_mult: 0.7                # Смягчение порога slope для закрытия по EMA flip
+      hedge_cooldown_sec: 180                       # Кулдаун между действиями по hedge
+      hedge_close_on_level: false                   # Закрывать hedge возле значимого уровня
+      hedge_close_on_ema_flip: true                 # Закрывать hedge при перевороте EMA
+      hedge_level_tolerance_pct: 0.10               # Допуск вокруг уровня
+      hedge_reopen_enabled: true                    # Повторно открывать hedge после его закрытия
+      hedge_reopen_drawdown_pct: 0.0                # Порог drawdown для повторного открытия hedge
 
-      # --- Hedge trailing (отдельно от основного trailing)
-      hedge_trailing_enabled: true
-      hedge_trailing_activation_pct: 2.5          # % от mark для activationPrice (в сторону профита хеджа)
-      hedge_trailing_trail_pct: 0.5               # callbackRate (%), Binance требует 0.1..10
-      hedge_trailing_activation_buffer_pct: 0.5   # safety буфер (анти "immediately trigger")
-      hedge_trailing_place_retries: 2
-      hedge_trailing_working_type: MARK_PRICE     # MARK_PRICE или CONTRACT_PRICE
+      # Если main закрылась, а hedge остался открыт —
+      # разрешить дополнительное сопровождение hedge
+      hedge_add_on_main_close_enabled: true
+      hedge_add_on_main_close_max_adds: 1
 
-      # reissue hedge trailing when hedge_qty changed
+      # Закрыть обе позиции, если суммарный unrealized PnL >= этого значения
+      all_P_L: 5.0
+
+      # ======================================================
+      # Hedge trailing
+      # ======================================================
+
+      hedge_trailing_enabled: true                  # Включить отдельный trailing для hedge
+      hedge_trailing_activation_pct: 2.5            # Активация trailing в % от mark price
+      hedge_trailing_trail_pct: 0.5                 # callbackRate (%) для trailing
+      hedge_trailing_activation_buffer_pct: 0.5     # Буфер от мгновенного срабатывания
+      hedge_trailing_place_retries: 2               # Ретраи постановки hedge trailing
+      hedge_trailing_working_type: MARK_PRICE       # MARK_PRICE или CONTRACT_PRICE
+
+      # Перевыставлять hedge trailing при изменении qty hedge
       hedge_trailing_reissue_on_qty_change: true
-      hedge_trailing_reissue_cooldown_sec: 30        # чтобы не дергать каждый цикл
-      hedge_trailing_qty_tolerance: 1e-8             # допуск сравнения qty
+      hedge_trailing_reissue_cooldown_sec: 30
+      hedge_trailing_qty_tolerance: 1e-8
 
-      # --- Hedge stop-loss (после открытия hedge позиции)
-      # Ставим reduce-only STOP_MARKET от цены входа hedge.
-      # Закрываем hedge по EMA-flip (если включено) только при hedge_uPnL>0,
-      # но стоп-лосс hedge всегда защитит от сильного движения против hedge.
+      # ======================================================
+      # Hedge stop-loss
+      # ======================================================
 
-      hedge_stop_loss_working_type: MARK_PRICE       # MARK_PRICE или CONTRACT_PRICE
+      hedge_stop_loss_working_type: MARK_PRICE
       hedge_stop_loss_place_retries: 2
-      hedge_stop_loss_reissue_cooldown_sec: 30       # не дергать каждый цикл
-      hedge_stop_loss_qty_tolerance: 1e-8            # допуск сравнения qty
+      hedge_stop_loss_reissue_cooldown_sec: 30
+      hedge_stop_loss_qty_tolerance: 1e-8
 
-      # Hedge Stop Loss (algo order on hedge position). 0 = OFF.
-      # % от цены входа hedge-позиции:
-      #   - если hedge SHORT: stop = entry * (1 + pct/100)
-      #   - если hedge LONG : stop = entry * (1 - pct/100)
-      hedge_stop_loss_pct: 0.0    # 0=OFF. % от hedge entry price (SHORT: entry*(1+pct), LONG: entry*(1-pct))
+      # 0 = выключено
+      # SHORT: stop = entry * (1 + pct/100)
+      # LONG : stop = entry * (1 - pct/100)
+      hedge_stop_loss_pct: 0.0
 
-      # --- Hedge SL move to Break-Even / Profit-Lock ---
-      # Перенос hedge SL в "безубыток" (или небольшой профит) после того, как цена
-      # уйдёт в прибыль на заданный процент от hedge entry.
-      #
-      # Новый стоп выставляется на расстоянии hedge_stop_loss_be_pct% от цены входа hedge:
-      #   - если hedge SHORT: new_stop = entry * (1 - be_pct/100)
-      #   - если hedge LONG : new_stop = entry * (1 + be_pct/100)
-      #
-      # Важно: параметры ниже работают ТОЛЬКО если hedge_stop_loss_pct > 0.
-      hedge_stop_loss_be_pct: 0.6                  # 0=OFF. % от hedge entry, на который переносим стоп (BE/profit-lock)
-      hedge_stop_loss_be_activation_pct: 0.90      # 0=OFF. % прибыли от hedge entry, после которого переносим стоп в BE/profit-lock
+      # ======================================================
+      # Hedge SL move to Break-Even / Profit-Lock
+      # Работает только если hedge_stop_loss_pct > 0
+      # ======================================================
 
-      # --- Limits / clamps for BE params (optional) ---
-      # Ограничения (min/max) для защиты от неправильной конфигурации.
+      hedge_stop_loss_be_pct: 0.6
+      hedge_stop_loss_be_activation_pct: 0.90
+
+      # Ограничения параметров BE
       hedge_stop_loss_be_pct_min: 0.5
       hedge_stop_loss_be_pct_max: 5.0
-
       hedge_stop_loss_be_activation_pct_min: 0.5
       hedge_stop_loss_be_activation_pct_max: 8.0
 
-      # Re-entry filter for hedge reopen after hedge exit (SL/TRL/ALGO)
-      # OFF by default.
-      # If ON:
-      #   - hedge SHORT: reopen only if current mark < last hedge exit price (last_close_px)
-      #   - hedge LONG : reopen only if current mark > last hedge exit price (last_close_px)
+      # После закрытия hedge переоткрывать его только если цена ушла дальше цены прошлого закрытия
       hedge_reopen_price_filter_enabled: true
 
-      # follow/reprice for "after last add" hedge trigger order
+      # Логика сопровождения hedge после последнего добора main
       hedge_after_last_add_follow_enabled: true
-      hedge_close_on_main_positive: false       # close hedge if MAIN unrealized PnL becomes positive
+      hedge_close_on_main_positive: false           # Закрывать hedge, если main вышел в плюс
 
-      hedge_after_last_add_follow_distance_pct: 4.0   # если цена ушла от triggerPrice дальше чем на 4%
-      hedge_after_last_add_follow_pullback_pct: 2.0   # подтягиваем triggerPrice к цене на 2% (в сторону хеджа)
+      hedge_after_last_add_follow_distance_pct: 4.0
+      hedge_after_last_add_follow_pullback_pct: 2.0
+      hedge_after_last_add_follow_cooldown_sec: 120
+      hedge_after_last_add_follow_min_trigger_move_pct: 0.8
+      hedge_after_last_add_cancel_when_main_profit: true
 
-      hedge_after_last_add_follow_cooldown_sec: 120    # минимум 45 сек между перестановками
-      hedge_after_last_add_follow_min_trigger_move_pct: 0.8   # чтобы не переставлять из-за мелочи
-      hedge_after_last_add_cancel_when_main_profit: true      # отменять pending hedge, когда uPnL main > 0
+      # ======================================================
+      # Лимиты по позициям
+      # ======================================================
 
-      max_open_positions: 10                          # Максимум одновременно открытых позиций
+      max_open_positions: 10                        # Максимум одновременно открытых позиций
+      max_position_notional_pct_wallet: 20.0        # Ограничение notional позиции от кошелька
+      risk_wallet_pct: 2.0                          # Риск на сделку от кошелька
 
-      # Максимальный размер позиции относительно кошелька (в % от wallet) — ограничение на notional.
-      max_position_notional_pct_wallet: 20.0
+      # ======================================================
+      # Базовые SL / TP
+      # ======================================================
 
-      # Риск на сделку (в % от wallet). Используется для расчёта размера позиции/добавок.
-      risk_wallet_pct: 2.0
+      stop_loss_pct: 2.0                            # Базовый SL (%)
+      take_profit_pct: 6.0                          # Базовый TP (%)
+      recalc_sl_tp: true                            # Пересчитывать SL/TP после усреднений
 
-      # SL/TP проценты (если используется простая логика от входа)
-      stop_loss_pct: 2.0                            # Стоп-лосс (%)
-      take_profit_pct: 6.0                          # Тейк-профит (%)
-      recalc_sl_tp: true                            # Пересчитывать SL/TP при изменении средней цены/добавках
-
-      # ----------------------------
+      # ======================================================
       # Вход и bracket-ордера
-      # ----------------------------
-      entry_order_type: market                        # Тип входа: market / limit (если поддерживается)
-      sl_order_mode: stop_market                      # Тип/режим SL ордера
-#      sl_order_mode: trailing_stop_market            # Тип/режим SL ордера
-      tp_order_mode: take_profit_market               # Тип/режим TP ордера
+      # ======================================================
 
-      reduce_only: true                              # reduceOnly для защитных/закрывающих ордеров
-      working_type: MARK_PRICE                       # MARK_PRICE или CONTRACT_PRICE для триггеров
-      time_in_force: GTC                             # GTC/IOC/FOK (обычно GTC)
-      client_order_id_prefix: TL                     # Префикс clientOrderId (для поиска/сопоставления ордеров)
-      enable_stop_loss: true                         # Ставить стоп-лосс
-      enable_take_profit: true                       # Ставить тейк-профит
+      entry_order_type: market                      # Тип входа: market / limit
+      sl_order_mode: stop_market                    # Режим постановки SL
+#     sl_order_mode: trailing_stop_market           # Альтернативный режим SL
+      tp_order_mode: take_profit_market             # Режим постановки TP
 
-      # Не ставить SL сразу, пока не сделаны все добавки (если averaging включён)
+      reduce_only: true                             # reduceOnly для защитных/закрывающих ордеров
+      working_type: MARK_PRICE                      # Тип триггерной цены
+      time_in_force: GTC                            # GTC / IOC / FOK
+      client_order_id_prefix: TL                    # Префикс clientOrderId
+      enable_stop_loss: true                        # Включить постановку SL
+      enable_take_profit: true                      # Включить постановку TP
+
+      # Не ставить SL сразу, пока не будут выполнены все доборы
       defer_stop_loss_until_last_add: false
-      # Дистанция SL после последней добавки (%)
+
+      # Дистанция SL после последнего добора
       sl_after_last_add_distance_pct: 2.0
-      # Если не удалось выставить bracket (SL/TP/TS) — что делать
-      abort_on_bracket_fail: true                    # Прервать открытие/сделку, если bracket не выставился корректно
-      close_on_bracket_fail: true                    # Закрыть позицию, если bracket не удалось выставить
-      signal_status_on_bracket_fail: CANCELLED       # В какой статус перевести сигнал при провале bracket
 
-      # ----------------------------
-      # Trailing stop
-      # ----------------------------
-      trailing_enabled: true                         # Включить трейлинг
-      trailing_activation_pct: 2.5                   # Активация трейлинга после +X% в прибыль
-      trailing_trail_pct: 0.5                        # Дистанция трейла (%)
+      # Что делать, если bracket не удалось выставить
+      abort_on_bracket_fail: true
+      close_on_bracket_fail: true
+      signal_status_on_bracket_fail: CANCELLED
 
-      # Safety буферы от markPrice (чтобы не ловить -2021)
-      trailing_activation_buffer_pct: 0.25   # % буфер для activationPrice трейлинга
-      tp_trigger_buffer_pct: 0.25            # % буфер для triggerPrice TP
-      # Сколько раз ретраить выставление, если Binance говорит "would immediately trigger"
+      # ======================================================
+      # Trailing stop для main
+      # ======================================================
+
+      trailing_enabled: true                        # Включить trailing
+      trailing_activation_pct: 2.5                  # Активация trailing после +X% в прибыль
+      trailing_trail_pct: 0.5                       # Дистанция trailing (%)
+
+      # Буферы от мгновенного срабатывания
+      trailing_activation_buffer_pct: 0.25
+      tp_trigger_buffer_pct: 0.25
+
+      # Сколько раз повторять постановку при ошибке Binance
       trailing_place_retries: 2
       tp_place_retries: 2
-      # ----------------------------
+
+      # ======================================================
       # Усреднение (averaging / adds)
-      # ----------------------------
-      averaging_enabled: true                        # Разрешить добавки к позиции
-      averaging_max_adds: 1                          # Максимум добавок (сколько раз усредняться)
-#      averaging_add_size_mode: risk_pct             # Режим размера добавки: risk_pct / fixed / wallet_pct (зависит от реализации)
-#      averaging_add_size_value: 10                  # Значение для выбранного режима (например, %)
-      averaging_add_size_mode: position_mult         # Включение расчета добора позиции
-      averaging_add_position_multiplier: 2.0         # Во сколько раз увеличить позицию при доборе
+      # ======================================================
 
-      # Добор ставим условным MARKET (trigger → market)
-      averaging_order_type: market                   # Тип ордера добавки
+      averaging_enabled: true                       # Разрешить доборы
+      averaging_max_adds: 1                         # Максимум доборов
 
-      # Таймфрейм/метод построения уровней для добавок
-      averaging_levels_tf: 4h                        # TF для расчета уровней (например, 1h)
-      averaging_levels_lookback_hours: 480           # Глубина истории (часы) для уровней
-      averaging_levels_method: combined              # Метод уровней (например, combined / volume_profile / pivots и т.п.)
-      averaging_level_tolerance_pct: 0.15            # Допуск (в %) при сравнении цены с уровнем
+#     averaging_add_size_mode: risk_pct             # Альтернативный режим расчета размера добора
+#     averaging_add_size_value: 10                  # Значение для альтернативного режима
+      averaging_add_size_mode: position_mult        # Режим добора: увеличить позицию в N раз
+      averaging_add_position_multiplier: 2.0        # Во сколько раз увеличивать позицию при ADD1
 
-      # Минимальная дистанция до ближайшего уровня добора (в % от цены-референса: entry до 1-го добора, avg после)
-      averaging_min_level_distance_pct: 5.0          # Если ближайший уровень ближе этого процента — берём следующий.
+      averaging_order_type: market                  # Тип ордера добора
 
-      # Параметры volume profile (если используется)
-      averaging_vp_bins: 48                          # Кол-во корзин VP
-      averaging_vp_top_nodes: 10                     # Сколько верхних "нод" учитывать
+      # Построение уровней для доборов
+      averaging_levels_tf: 4h
+      averaging_levels_lookback_hours: 480
+      averaging_levels_method: combined
+      averaging_level_tolerance_pct: 0.15
 
-      # Параметры pivot/кластеризации (если используется)
-      averaging_pivot_left: 4                        # Pivot left bars
-      averaging_pivot_right: 4                       # Pivot right bars
-      averaging_cluster_tolerance_pct: 0.25          # Допуск объединения уровней в кластер (%)
+      # Минимальная дистанция до уровня добора
+      averaging_min_level_distance_pct: 5.0
 
+      # Параметры volume profile
+      averaging_vp_bins: 48
+      averaging_vp_top_nodes: 10
+
+      # Параметры pivot / кластеризации
+      averaging_pivot_left: 4
+      averaging_pivot_right: 4
+      averaging_cluster_tolerance_pct: 0.25
+
+      # Технические параметры перевыставления/сравнения уровней
       replace_cooldown_sec: 60
       avg_eps_pct: 0.02
       price_eps_ticks: 2
-      # ----------------------------
-      # Debug/логирование
-      # ----------------------------
-      debug: false                                   # Включить расширенные debug-логи
-      debug_top: 10                                  # Сколько элементов/строк выводить в "top" отладочных списков
-      ema_log_enabled: false                         # Включить подробные INFO-логи по EMA ([open]/[close] [EMA] ...). false = без EMA-спама
-      # ----------------------------
-      # Backfill закрытых позиций (заполнение exit/pnl/fees и т.п.)
-      # ----------------------------
-      backfill_run_on_startup: true                  # Запускать backfill при старте трейдера
-      backfill_enabled: true                         # Включить backfill вообще
 
-      backfill_interval_sec: 300                     # Периодический интервал backfill (сек)
-      backfill_lookback_days: 3                      # Смотреть закрытые позиции за последние N дней
-      backfill_batch_limit: 50                       # Размер батча за один проход (сколько записей проверить)
+      # ======================================================
+      # Debug / логирование
+      # ======================================================
 
-      backfill_overwrite: true                       # Перезаписывать рассчитанные поля (если уже заполнены)
-      backfill_fill_fees: true                       # Заполнять комиссии (fees), если это реализовано
-      backfill_diff_tol: 1e-9                        # Допуск сравнения чисел при решении "обновлять/не обновлять"
+      debug: false                                  # Расширенные debug-логи
+      debug_top: 10                                 # Сколько элементов выводить в top/debug
+      ema_log_enabled: false                        # Подробные EMA-логи
 
-      # На старте прогнать backfill "до конца" (пачками), чтобы показать все CLOSED за интервал
-      backfill_drain_on_startup: true
-      # Ограничитель на количество пачек на старте (защита от бесконечного/очень долгого прогона)
-      backfill_max_startup_batches: 200
-      # Логировать backfill даже если updated=0 (чтобы видеть checked)
-      backfill_log_empty: true
-      # Логировать каждую закрытую позицию, которую проверяет backfill (может быть очень много строк!)
-      backfill_log_each: false
-      # ----------------------------
-      # Portfolio cap (ограничение на использование маржи/кошелька)
-      # ----------------------------
-      portfolio_cap_ratio: 0.7       # 0=OFF. Если SUM(position_ledger.position_value_usdt WHERE OPEN)/wallet >= ratio -> не открываем новые сделки.
-                                     # Пример: 0.7 = не превышать 70% от баланса; 1.0 = не превышать 1x wallet.
-      # ----------------------------
-      # Reconcile (сверка позиций биржа vs леджер/БД)
-      # ----------------------------
-      reconcile_enabled: true                           # Включить reconcile
-      reconcile_qty_tolerance: 1e-8                     # Допуск по количеству (qty) при сравнениях
+      # ======================================================
+      # Backfill закрытых позиций
+      # ======================================================
 
-      reconcile_auto_close_ledger: true                 # Автоматически закрывать записи в леджере, если на бирже позиции нет
-      reconcile_auto_adjust_ledger_qty_current: true    # Автоматически корректировать qty_current в леджере по данным биржи
-      reconcile_adjust_only_our_positions: true         # Корректировать только "наши" позиции (по clientOrderId/префиксу)
-      reconcile_ignore_external_positions: true         # Игнорировать внешние позиции (не созданные ботом)
-      reconcile_every_n_cycles: 1                       # Запускать reconcile каждые N циклов
-      reconcile_log_diffs: true                         # Логировать расхождения
-      reconcile_external_log_level: debug               # Уровень логирования внешних позиций (debug/info/warn)
+      backfill_run_on_startup: true                 # Запускать backfill при старте
+      backfill_enabled: true                        # Включить backfill
 
-      # Reconcile averaging adds (ADDn) vs Binance order history (allOrders)
-      reconcile_binance_adds_enabled: true              # Сверять доборы с биржей и чинить расхождения
-      reconcile_binance_adds_every_sec: 300             # Не чаще чем раз в N секунд (rate-limit)
+      backfill_interval_sec: 300                    # Интервал периодического backfill
+      backfill_lookback_days: 3                     # Смотреть закрытые позиции за N дней назад
+      backfill_batch_limit: 50                      # Размер батча backfill
 
-      # ✅ NEW: mark-to-market refresh position_value_usdt (чтобы ledger совпадал с биржей по notional)
-      reconcile_auto_adjust_ledger_value_usdt: true        # обновлять value при value-mismatch (в любом случае, даже когда qty совпал)
-      reconcile_refresh_position_value_usdt: true          # обновлять value "по рынку" в каждом reconcile-цикле (с ограничением по min_delta)
-      reconcile_value_refresh_min_delta_usdt: 0.10         # минимальное изменение value, чтобы писать в БД (anti-spam)
-      reconcile_value_tolerance_usdt: 1.0                  # порог, после которого считаем это DIFF (и точно обновляем при auto_adjust)
-      # ----------------------------
-      # Auto recovery (восстановление защитных ордеров/состояния)
-      # ----------------------------
-      auto_recovery_enabled: true                     # Включить авто-восстановление
-      recovery_place_sl: true                         # Пытаться восстановить SL
-      recovery_place_tp: true                         # Пытаться восстановить TP
-      recovery_max_age_hours: 240                     # Восстанавливать позиции не старше N часов (по леджеру/метаданным)
-      # ----------------------------
-      # Async REST (параллельные запросы к бирже)
-      # ----------------------------
-      async_rest_enabled: true                        # Включить асинхронные запросы (параллелизм)
-      async_rest_workers: 6                           # Кол-во воркеров/потоков для REST
-      async_rest_timeout_sec: 8                       # Таймаут асинхронных запросов (сек)
+      backfill_overwrite: true                      # Перезаписывать уже рассчитанные поля
+      backfill_fill_fees: true                      # Подтягивать/заполнять fees
+      backfill_diff_tol: 1e-9                       # Допуск сравнения при решении об обновлении
+
+      backfill_drain_on_startup: true               # При старте прогнать backfill "до конца"
+      backfill_max_startup_batches: 200             # Ограничение числа стартовых батчей
+      backfill_log_empty: true                      # Логировать пустые проходы backfill
+      backfill_log_each: false                      # Логировать каждую закрытую позицию
+
+      # ======================================================
+      # Portfolio cap
+      # ======================================================
+
+      # Если сумма value открытых позиций / wallet >= ratio,
+      # новые сделки не открывать.
+      # 0 = OFF
+      portfolio_cap_ratio: 0.7
+
+      # ======================================================
+      # Reconcile (сверка биржи и леджера)
+      # ======================================================
+
+      reconcile_enabled: true                       # Включить reconcile вообще
+      reconcile_qty_tolerance: 1e-8                 # Допуск по qty
+
+      reconcile_auto_close_ledger: true             # Автоматически закрывать запись в леджере, если на бирже позиции нет
+      reconcile_auto_adjust_ledger_qty_current: true # Автоматически выравнивать qty_current по бирже
+      reconcile_adjust_only_our_positions: true     # Корректировать только позиции, созданные этим ботом
+      reconcile_ignore_external_positions: true     # Игнорировать внешние позиции
+      reconcile_every_n_cycles: 3                   # Делать reconcile не каждый цикл, а раз в 3 цикла
+      reconcile_log_diffs: true                     # Логировать найденные расхождения
+      reconcile_external_log_level: debug           # Уровень логирования внешних позиций
+
+      # Сверка усреднений ADDn по истории Binance
+      reconcile_binance_adds_enabled: true
+      reconcile_binance_adds_every_sec: 300
+
+      # Эти параметры специально ослаблены для снижения шума по value:
+      # если qty совпадает, не надо каждый цикл дергать value_usdt
+      reconcile_auto_adjust_ledger_value_usdt: false  # Не перетирать ledger value при каждом value mismatch
+      reconcile_refresh_position_value_usdt: false    # Не делать mark-to-market refresh каждый reconcile-цикл
+      reconcile_value_refresh_min_delta_usdt: 2.0     # Минимальное изменение value для обновления
+      reconcile_value_tolerance_usdt: 2.5             # Порог, после которого value mismatch считается значимым
+
+      # ======================================================
+      # Auto recovery
+      # ======================================================
+
+      auto_recovery_enabled: true                  # Включить авто-восстановление защитных ордеров
+      recovery_place_sl: true                      # Пытаться восстанавливать SL
+      recovery_place_tp: true                      # Пытаться восстанавливать TP
+      recovery_max_age_hours: 240                  # Не восстанавливать слишком старые позиции
+
+      # ======================================================
+      # Async REST
+      # ======================================================
+
+      async_rest_enabled: true                     # Включить параллельные REST-запросы
+      async_rest_workers: 6                        # Количество воркеров
+      async_rest_timeout_sec: 8                    # Таймаут async REST

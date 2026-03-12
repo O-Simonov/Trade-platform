@@ -3932,7 +3932,27 @@ class TradeLiquidation:
 
         tok = _coid_token(pos_uid)
         sym_u = (sym or "").upper()
+        prefix = _sanitize_coid_prefix(str(getattr(self.p, "client_order_id_prefix", "TL") or "TL"))
+        cid_add = f"{prefix}_{tok}_ADD1"
 
+        # Refresh adds_done from DB truth before recovery placement.
+        # This protects against re-placing ADD1 after it already filled on a previous cycle
+        # but position_ledger.scale_in_count still lags behind exchange/order-events sync.
+        if self._is_live:
+            try:
+                adds_done_live = int(
+                    self._live_refresh_scale_in_count(
+                        pos_uid=str(pos_uid),
+                        prefix=prefix,
+                        sym=sym_u,
+                        pos_side=str(side or "").upper(),
+                    )
+                    or 0
+                )
+                if adds_done_live >= 1:
+                    return
+            except Exception:
+                pass
 
         # Respect max additions cap: if configured max_adds < 1, never place ADD1.
         max_adds_cfg = int(self._cfg_max_adds() or 0)
@@ -3965,10 +3985,47 @@ class TradeLiquidation:
             # best-effort, non-fatal
             pass
 
-        # If any ADD exists, do nothing
+        # If any ADD exists on the current exchange snapshot, do nothing.
         for cid in (existing_client_ids or set()):
-            if isinstance(cid, str) and (f"TL_{tok}_ADD" in cid):
+            if isinstance(cid, str) and (f"{prefix}_{tok}_ADD" in cid):
                 return
+
+        # Strong DB-side dedupe for ADD1.
+        # Recovery snapshots may lag behind actual fills/cancels, so we also trust our local
+        # order shadow / fills history. If ADD1 is already open or has already filled, do not place it again.
+        try:
+            row = self.store.fetch_one(
+                """
+                SELECT status
+                FROM public.orders
+                WHERE exchange_id=%s AND account_id=%s AND strategy_id=%s
+                  AND client_order_id=%s
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """,
+                (int(self.exchange_id), int(self.account_id), str(self.STRATEGY_ID), str(cid_add)),
+            )
+            if row:
+                db_status = str((row.get("status") if isinstance(row, dict) else row[0]) or "").upper().strip()
+                if db_status in {"NEW", "OPEN", "PARTIALLY_FILLED", "FILLED"}:
+                    return
+        except Exception:
+            pass
+        try:
+            fill_row = self.store.fetch_one(
+                """
+                SELECT 1 AS ok
+                FROM public.order_fills
+                WHERE exchange_id=%s AND account_id=%s AND strategy_id=%s
+                  AND client_order_id=%s
+                LIMIT 1
+                """,
+                (int(self.exchange_id), int(self.account_id), str(self.STRATEGY_ID), str(cid_add)),
+            )
+            if fill_row:
+                return
+        except Exception:
+            pass
 
         if entry_price is None or entry_price <= 0 or pos_qty is None or pos_qty <= 0:
             return
@@ -4006,7 +4063,6 @@ class TradeLiquidation:
         if add_qty <= 0:
             return
 
-        cid_add = f"TL_{tok}_ADD1"
         # Ensure ADD trigger price is on the correct side of current mark price to avoid immediate-trigger (Binance -2021).
         # For LONG we add with BUY when price falls; for SHORT we add with SELL when price rises.
         try:
@@ -5762,6 +5818,68 @@ class TradeLiquidation:
             recent_ts = 0.0
         if recent_ts and (time.time() - recent_ts) < recent_add_guard:
             return False
+
+        def _db_add_already_executed(cid: str) -> bool:
+            cid = str(cid or "")
+            if not cid:
+                return False
+            try:
+                row_done = self.store.fetch_one(
+                    """
+                    SELECT 1 AS ok
+                    FROM public.orders
+                    WHERE exchange_id=%s AND account_id=%s AND strategy_id=%s
+                      AND client_order_id=%s
+                      AND upper(coalesce(status,'')) IN ('FILLED','PARTIALLY_FILLED')
+                    LIMIT 1
+                    """,
+                    (int(self.exchange_id), int(self.account_id), str(self.STRATEGY_ID), cid),
+                )
+                if row_done:
+                    return True
+            except Exception:
+                pass
+            try:
+                fill_row = self.store.fetch_one(
+                    """
+                    SELECT 1 AS ok
+                    FROM public.order_fills
+                    WHERE exchange_id=%s AND account_id=%s AND strategy_id=%s
+                      AND client_order_id=%s
+                    LIMIT 1
+                    """,
+                    (int(self.exchange_id), int(self.account_id), str(self.STRATEGY_ID), cid),
+                )
+                if fill_row:
+                    return True
+            except Exception:
+                pass
+            return False
+
+        if _db_add_already_executed(want_cid):
+            try:
+                if next_n > int(adds_done or 0):
+                    self.store.execute(
+                        """
+                        UPDATE public.position_ledger
+                           SET scale_in_count = GREATEST(COALESCE(scale_in_count,0), %(n)s),
+                               updated_at = NOW()
+                         WHERE exchange_id=%(ex)s AND account_id=%(acc)s AND strategy_id=%(sid)s
+                           AND pos_uid=%(pos_uid)s AND status IN ('OPEN','CLOSED') AND source='live';
+                        """,
+                        {
+                            "ex": int(self.exchange_id),
+                            "acc": int(self.account_id),
+                            "sid": self.STRATEGY_ID,
+                            "pos_uid": str(pos_uid),
+                            "n": int(next_n),
+                        },
+                    )
+                
+            except Exception:
+                pass
+            return False
+
         try:
             row = self.store.query_one(
                 """
@@ -5783,6 +5901,8 @@ class TradeLiquidation:
             if row:
                 db_status = str(row[0] or "").upper()
                 db_source = str(row[1] or "")
+                if db_status in ("FILLED", "PARTIALLY_FILLED"):
+                    return False
                 if db_status in ("NEW", "OPEN", "PARTIALLY_FILLED"):
                     # Shadow order can lag after manual cancel / recovery cleanup.
                     # Let DB block placement only if the same ADD is still present in current exchange snapshots.
@@ -5802,6 +5922,9 @@ class TradeLiquidation:
                         ])
                     ))
                     if add_is_live_on_exchange:
+                        return False
+                    # If we already have a recorded fill for the same ADDn, never recycle this clientOrderId.
+                    if _db_add_already_executed(want_cid):
                         return False
                     # Poisoned recovery ids must not block new averaging orders.
                     if "#BADTP#" not in str(want_cid).upper():

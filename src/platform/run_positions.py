@@ -15,7 +15,7 @@ if not API_KEY or not API_SECRET_RAW:
     raise RuntimeError("Не найдены BINANCE_BASE_MAIN_API_KEY / BINANCE_BASE_MAIN_API_SECRET")
 
 API_SECRET = API_SECRET_RAW.encode()
-BASE = "https://fapi.binance.com"
+BASE = os.getenv("BINANCE_BASE_URL", "https://fapi.binance.com")
 
 
 def signed_get(path: str, params: dict | None = None):
@@ -30,71 +30,141 @@ def signed_get(path: str, params: dict | None = None):
     return r.json()
 
 
-symbols = ["ENAUSDT", "SOLUSDT", "FILUSDT", "XRPUSDT", "PUMPUSDT"]
+def to_float(v, default=0.0):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+print("\n=== POSITION RISK (/fapi/v2/positionRisk) ===")
+all_positions = signed_get("/fapi/v2/positionRisk")
+
+open_positions = [
+    p for p in all_positions
+    if p.get("positionSide") in ("LONG", "SHORT")
+    and abs(to_float(p.get("positionAmt"))) > 0
+]
+
+open_positions = sorted(
+    open_positions,
+    key=lambda p: (p.get("symbol", ""), p.get("positionSide", ""))
+)
+
+symbols = sorted({p.get("symbol") for p in open_positions if p.get("symbol")})
+
+print(f"OPEN POSITIONS COUNT: {len(open_positions)}")
+print(f"OPEN SYMBOLS COUNT: {len(symbols)}")
+print(f"SYMBOLS: {symbols}")
+
+for p in open_positions:
+    print({
+        "symbol": p.get("symbol"),
+        "positionSide": p.get("positionSide"),
+        "positionAmt": p.get("positionAmt"),
+        "entryPrice": p.get("entryPrice"),
+        "breakEvenPrice": p.get("breakEvenPrice"),
+        "markPrice": p.get("markPrice"),
+        "unRealizedProfit": p.get("unRealizedProfit"),
+        "liquidationPrice": p.get("liquidationPrice"),
+        "notional": p.get("notional"),
+        "isolatedWallet": p.get("isolatedWallet"),
+        "leverage": p.get("leverage"),
+        "marginType": p.get("marginType"),
+    })
 
 print("\n=== OPEN NORMAL ORDERS (/fapi/v1/openOrders) ===")
-for sym in symbols:
-    data = signed_get("/fapi/v1/openOrders", {"symbol": sym})
-    print(f"\n--- {sym} ({len(data)}) ---")
-    for o in data:
-        print({
-            "symbol": o.get("symbol"),
-            "clientOrderId": o.get("clientOrderId"),
-            "side": o.get("side"),
-            "type": o.get("type"),
-            "origType": o.get("origType"),
-            "origQty": o.get("origQty"),
-            "price": o.get("price"),
-            "stopPrice": o.get("stopPrice"),
-            "activatePrice": o.get("activatePrice"),
-            "priceRate": o.get("priceRate"),
-            "reduceOnly": o.get("reduceOnly"),
-            "positionSide": o.get("positionSide"),
-            "status": o.get("status"),
-            "workingType": o.get("workingType"),
-        })
+if not symbols:
+    print("Нет открытых позиций на бирже.")
+else:
+    total_normal_orders = 0
+    for sym in symbols:
+        data = signed_get("/fapi/v1/openOrders", {"symbol": sym})
+        total_normal_orders += len(data)
+
+        print(f"\n--- {sym} ({len(data)}) ---")
+        if not data:
+            print("[]")
+            continue
+
+        for o in data:
+            print({
+                "symbol": o.get("symbol"),
+                "orderId": o.get("orderId"),
+                "clientOrderId": o.get("clientOrderId"),
+                "side": o.get("side"),
+                "positionSide": o.get("positionSide"),
+                "type": o.get("type"),
+                "origType": o.get("origType"),
+                "status": o.get("status"),
+                "origQty": o.get("origQty"),
+                "executedQty": o.get("executedQty"),
+                "price": o.get("price"),
+                "stopPrice": o.get("stopPrice"),
+                "activatePrice": o.get("activatePrice"),
+                "priceRate": o.get("priceRate"),
+                "reduceOnly": o.get("reduceOnly"),
+                "closePosition": o.get("closePosition"),
+                "workingType": o.get("workingType"),
+                "timeInForce": o.get("timeInForce"),
+            })
+
+    print(f"\nTOTAL NORMAL OPEN ORDERS: {total_normal_orders}")
 
 print("\n=== OPEN ALGO ORDERS (/fapi/v1/openAlgoOrders) ===")
-for sym in symbols:
-    data = signed_get("/fapi/v1/openAlgoOrders", {"symbol": sym})
-    print(f"\n--- {sym} ({len(data)}) ---")
-    for o in data:
-        print({
-            "symbol": o.get("symbol"),
-            "clientAlgoId": o.get("clientAlgoId"),
-            "algoId": o.get("algoId"),
-            "algoType": o.get("algoType"),
-            "orderType": o.get("orderType"),
-            "side": o.get("side"),
-            "positionSide": o.get("positionSide"),
-            "quantity": o.get("quantity"),
-            "triggerPrice": o.get("triggerPrice"),
-            "price": o.get("price"),
-            "activatePrice": o.get("activatePrice"),
-            "callbackRate": o.get("callbackRate"),
-            "reduceOnly": o.get("reduceOnly"),
-            "closePosition": o.get("closePosition"),
-            "workingType": o.get("workingType"),
-            "algoStatus": o.get("algoStatus"),
-        })
+if not symbols:
+    print("Нет открытых позиций на бирже.")
+else:
+    total_algo_orders = 0
+    for sym in symbols:
+        try:
+            data = signed_get("/fapi/v1/openAlgoOrders", {"symbol": sym})
+        except requests.HTTPError as e:
+            print(f"\n--- {sym} (ERROR) ---")
+            print(f"HTTP error for openAlgoOrders: {e}")
+            continue
 
-print("\n=== POSITION RISK ===")
-pos = signed_get("/fapi/v2/positionRisk")
-for p in pos:
-    if p.get("symbol") in symbols and abs(float(p.get("positionAmt", "0"))) > 0:
-        print({
-            "symbol": p.get("symbol"),
-            "positionSide": p.get("positionSide"),
-            "positionAmt": p.get("positionAmt"),
-            "entryPrice": p.get("entryPrice"),
-            "markPrice": p.get("markPrice"),
-            "unRealizedProfit": p.get("unRealizedProfit"),
-        })
+        if isinstance(data, dict):
+            orders = data.get("orders") or data.get("data") or []
+        else:
+            orders = data or []
+
+        total_algo_orders += len(orders)
+
+        print(f"\n--- {sym} ({len(orders)}) ---")
+        if not orders:
+            print("[]")
+            continue
+
+        for o in orders:
+            print({
+                "symbol": o.get("symbol"),
+                "clientAlgoId": o.get("clientAlgoId"),
+                "algoId": o.get("algoId"),
+                "algoType": o.get("algoType"),
+                "orderType": o.get("orderType"),
+                "side": o.get("side"),
+                "positionSide": o.get("positionSide"),
+                "quantity": o.get("quantity"),
+                "triggerPrice": o.get("triggerPrice"),
+                "price": o.get("price"),
+                "activatePrice": o.get("activatePrice"),
+                "callbackRate": o.get("callbackRate"),
+                "reduceOnly": o.get("reduceOnly"),
+                "closePosition": o.get("closePosition"),
+                "workingType": o.get("workingType"),
+                "algoStatus": o.get("algoStatus"),
+            })
+
+    print(f"\nTOTAL ALGO OPEN ORDERS: {total_algo_orders}")
 
 acct = signed_get("/fapi/v2/account")
-print("\n=== ACCOUNT ===")
+print("\n=== ACCOUNT (/fapi/v2/account) ===")
 print({
     "canTrade": acct.get("canTrade"),
     "totalWalletBalance": acct.get("totalWalletBalance"),
     "totalUnrealizedProfit": acct.get("totalUnrealizedProfit"),
+    "totalMarginBalance": acct.get("totalMarginBalance"),
+    "availableBalance": acct.get("availableBalance"),
+    "maxWithdrawAmount": acct.get("maxWithdrawAmount"),
 })

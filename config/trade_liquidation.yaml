@@ -258,6 +258,7 @@ traders:
 
       averaging_enabled: true                       # Разрешить доборы
       averaging_max_adds: 1                         # Максимум доборов
+      add_or_hedge_invariant_enabled: true          # Гарантировать: если нет добора, то должен быть hedge
 
 #     averaging_add_size_mode: risk_pct             # Альтернативный режим расчета размера добора
 #     averaging_add_size_value: 10                  # Значение для альтернативного режима
@@ -324,7 +325,7 @@ traders:
       # Если сумма value открытых позиций / wallet >= ratio,
       # новые сделки не открывать.
       # 0 = OFF
-      portfolio_cap_ratio: 0.7
+      portfolio_cap_ratio: 0.9
 
       # ======================================================
       # Reconcile (сверка биржи и леджера)
@@ -347,8 +348,8 @@ traders:
 
       # Эти параметры специально ослаблены для снижения шума по value:
       # если qty совпадает, не надо каждый цикл дергать value_usdt
-      reconcile_auto_adjust_ledger_value_usdt: false  # Не перетирать ledger value при каждом value mismatch
-      reconcile_refresh_position_value_usdt: false    # Не делать mark-to-market refresh каждый reconcile-цикл
+      reconcile_auto_adjust_ledger_value_usdt: true  # Не перетирать ledger value при каждом value mismatch
+      reconcile_refresh_position_value_usdt: true    # Не делать mark-to-market refresh каждый reconcile-цикл
       reconcile_value_refresh_min_delta_usdt: 2.0     # Минимальное изменение value для обновления
       reconcile_value_tolerance_usdt: 2.5             # Порог, после которого value mismatch считается значимым
 

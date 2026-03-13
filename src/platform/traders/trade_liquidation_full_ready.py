@@ -102,6 +102,161 @@ def _position_risk_map(rows: List[Dict[str, Any]]) -> Dict[Tuple[str, str], Dict
     return result
 
 
+def _symbol_id_map(self) -> Dict[str, int]:
+    result: Dict[str, int] = {}
+    try:
+        rows = list(
+            self.store.query_dict(
+                """
+                SELECT symbol_id, symbol
+                FROM public.symbols
+                WHERE exchange_id = %(exchange_id)s
+                """,
+                {"exchange_id": int(self.exchange_id)},
+            )
+        )
+        for row in rows:
+            symbol = str(row.get("symbol") or "").upper().strip()
+            symbol_id = int(row.get("symbol_id") or 0)
+            if symbol and symbol_id > 0:
+                result[symbol] = symbol_id
+    except Exception:
+        log.exception("[TL][orphan_ready] failed to load symbols map")
+    return result
+
+
+
+def _ensure_position_ledger_time_guard(store) -> None:
+    """Install DB-level protections for closed_at/opened_at consistency."""
+    trigger_ddl = """
+    CREATE OR REPLACE FUNCTION public.trg_position_ledger_guard_closed_at()
+    RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+    BEGIN
+        IF NEW.opened_at IS NOT NULL AND NEW.closed_at IS NOT NULL AND NEW.closed_at < NEW.opened_at THEN
+            IF NEW.updated_at IS NOT NULL AND NEW.updated_at >= NEW.opened_at THEN
+                NEW.closed_at := NEW.updated_at;
+            ELSE
+                NEW.closed_at := NEW.opened_at;
+            END IF;
+        END IF;
+
+        IF NEW.updated_at IS NOT NULL AND NEW.opened_at IS NOT NULL AND NEW.updated_at < NEW.opened_at THEN
+            NEW.updated_at := NEW.opened_at;
+        END IF;
+
+        RETURN NEW;
+    END;
+    $$;
+
+    DROP TRIGGER IF EXISTS trg_position_ledger_guard_closed_at ON public.position_ledger;
+
+    CREATE TRIGGER trg_position_ledger_guard_closed_at
+    BEFORE INSERT OR UPDATE ON public.position_ledger
+    FOR EACH ROW
+    EXECUTE FUNCTION public.trg_position_ledger_guard_closed_at();
+    """
+    try:
+        store.exec_ddl(trigger_ddl)
+    except Exception:
+        log.exception("[TL][ledger_guard] failed to install trigger guard")
+
+    try:
+        store.execute(
+            """
+            UPDATE public.position_ledger
+               SET closed_at = CASE
+                   WHEN updated_at IS NOT NULL AND opened_at IS NOT NULL AND updated_at >= opened_at THEN updated_at
+                   WHEN opened_at IS NOT NULL THEN opened_at
+                   ELSE closed_at
+               END
+             WHERE opened_at IS NOT NULL
+               AND closed_at IS NOT NULL
+               AND closed_at < opened_at
+            """
+        )
+    except Exception:
+        log.exception("[TL][ledger_guard] failed to normalize invalid closed_at rows")
+
+    try:
+        store.exec_ddl(
+            """
+            ALTER TABLE public.position_ledger
+            DROP CONSTRAINT IF EXISTS chk_position_ledger_closed_at_not_before_opened_at;
+
+            ALTER TABLE public.position_ledger
+            ADD CONSTRAINT chk_position_ledger_closed_at_not_before_opened_at
+            CHECK (closed_at IS NULL OR opened_at IS NULL OR closed_at >= opened_at) NOT VALID;
+            """
+        )
+    except Exception:
+        pass
+
+    try:
+        store.exec_ddl(
+            """
+            ALTER TABLE public.position_ledger
+            VALIDATE CONSTRAINT chk_position_ledger_closed_at_not_before_opened_at;
+            """
+        )
+    except Exception:
+        log.exception("[TL][ledger_guard] failed to validate closed_at constraint")
+
+
+def _position_ledger_time_anomalies(store) -> Dict[str, int]:
+    try:
+        row = None
+        if hasattr(store, "query_one_dict"):
+            row = store.query_one_dict(
+                """
+                SELECT
+                    COALESCE(SUM(CASE WHEN opened_at IS NOT NULL AND closed_at IS NOT NULL AND closed_at < opened_at THEN 1 ELSE 0 END), 0) AS broken_closed_at,
+                    COALESCE(SUM(CASE WHEN opened_at IS NOT NULL AND updated_at IS NOT NULL AND updated_at < opened_at THEN 1 ELSE 0 END), 0) AS broken_updated_at,
+                    COALESCE(SUM(CASE WHEN closed_at IS NOT NULL AND updated_at IS NOT NULL AND closed_at > updated_at THEN 1 ELSE 0 END), 0) AS broken_closed_gt_updated
+                FROM public.position_ledger
+                """
+            )
+        else:
+            row = store.query_one(
+                """
+                SELECT
+                    COALESCE(SUM(CASE WHEN opened_at IS NOT NULL AND closed_at IS NOT NULL AND closed_at < opened_at THEN 1 ELSE 0 END), 0) AS broken_closed_at,
+                    COALESCE(SUM(CASE WHEN opened_at IS NOT NULL AND updated_at IS NOT NULL AND updated_at < opened_at THEN 1 ELSE 0 END), 0) AS broken_updated_at,
+                    COALESCE(SUM(CASE WHEN closed_at IS NOT NULL AND updated_at IS NOT NULL AND closed_at > updated_at THEN 1 ELSE 0 END), 0) AS broken_closed_gt_updated
+                FROM public.position_ledger
+                """
+            )
+
+        if row is None:
+            return {
+                "broken_closed_at": 0,
+                "broken_updated_at": 0,
+                "broken_closed_gt_updated": 0,
+            }
+
+        if isinstance(row, tuple):
+            broken_closed_at = int((row[0] if len(row) > 0 else 0) or 0)
+            broken_updated_at = int((row[1] if len(row) > 1 else 0) or 0)
+            broken_closed_gt_updated = int((row[2] if len(row) > 2 else 0) or 0)
+        else:
+            broken_closed_at = int(row.get("broken_closed_at") or 0)
+            broken_updated_at = int(row.get("broken_updated_at") or 0)
+            broken_closed_gt_updated = int(row.get("broken_closed_gt_updated") or 0)
+
+        return {
+            "broken_closed_at": broken_closed_at,
+            "broken_updated_at": broken_updated_at,
+            "broken_closed_gt_updated": broken_closed_gt_updated,
+        }
+    except Exception:
+        log.exception("[TL][ledger_guard] periodic anomaly check failed")
+        return {
+            "broken_closed_at": 0,
+            "broken_updated_at": 0,
+            "broken_closed_gt_updated": 0,
+        }
+
 def _ensure_hedge_links_table(store) -> None:
     ddl = """
     CREATE TABLE IF NOT EXISTS public.hedge_links (
@@ -351,6 +506,208 @@ def _close_live_hedge_ledger_row(
     )
 
 
+def _sync_live_main_positions_from_position_risk(self) -> Dict[str, int]:
+    """Materialize orphan main positions that already exist on exchange.
+
+    Recovery works from active ledger rows. If an exchange position exists but
+    there is no OPEN source='live' row, TP/TRL/HEDGE recovery will skip it and
+    leave the position fully unprotected. This sync creates missing live rows
+    for true orphan main positions before recovery runs.
+    """
+
+    try:
+        position_risk = getattr(self, "_last_position_risk", None)
+        if not position_risk:
+            position_risk = self._rest_snapshot_get("position_risk") or []
+    except Exception:
+        position_risk = []
+
+    if not isinstance(position_risk, list) or not position_risk:
+        return {"checked": 0, "opened": 0, "skipped": 0}
+
+    symbol_id_by_symbol = _symbol_id_map(self)
+    if not symbol_id_by_symbol:
+        return {"checked": 0, "opened": 0, "skipped": 0}
+
+    active_rows = list(
+        self.store.query_dict(
+            """
+            SELECT
+                symbol_id,
+                symbol,
+                pos_uid,
+                side,
+                source,
+                status
+            FROM public.position_ledger
+            WHERE exchange_id = %(exchange_id)s
+              AND account_id = %(account_id)s
+              AND strategy_id = %(strategy_id)s
+              AND status = 'OPEN'
+              AND COALESCE(source, 'live') IN ('live', 'live_hedge')
+            """,
+            {
+                "exchange_id": int(self.exchange_id),
+                "account_id": int(self.account_id),
+                "strategy_id": str(getattr(self, "STRATEGY_ID", "trade_liquidation")),
+            },
+        )
+    )
+
+    active_by_symbol_side: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    active_live_by_symbol: Dict[str, List[Dict[str, Any]]] = {}
+    for row in active_rows:
+        symbol = str(row.get("symbol") or "").upper().strip()
+        side = str(row.get("side") or "").upper().strip()
+        source = str(row.get("source") or "live").strip().lower()
+        if symbol and side in ("LONG", "SHORT"):
+            active_by_symbol_side[(symbol, side)] = row
+            if source == "live":
+                active_live_by_symbol.setdefault(symbol, []).append(row)
+
+    checked = 0
+    opened = 0
+    skipped = 0
+
+    for p in position_risk:
+        symbol = str((p or {}).get("symbol") or "").upper().strip()
+        side = str((p or {}).get("positionSide") or "").upper().strip()
+        qty = abs(_safe_float((p or {}).get("positionAmt"), 0.0))
+
+        if not symbol or side not in ("LONG", "SHORT") or qty <= 0:
+            continue
+
+        checked += 1
+
+        if (symbol, side) in active_by_symbol_side:
+            continue
+
+        symbol_id = int(symbol_id_by_symbol.get(symbol) or 0)
+        if symbol_id <= 0:
+            skipped += 1
+            continue
+
+        # If the opposite side already exists as an active main row, then the
+        # current exchange leg is most likely a hedge leg and should be handled
+        # by hedge sync, not materialized as another main row.
+        opp_live = active_live_by_symbol.get(symbol, [])
+        if any(str(r.get("side") or "").upper().strip() == _opp_side(side) for r in opp_live):
+            skipped += 1
+            continue
+
+        opened_at = _utc_now()
+        entry_price = _safe_float((p or {}).get("entryPrice"), 0.0)
+        mark_price = _safe_float((p or {}).get("markPrice"), 0.0)
+        notional = abs(_safe_float((p or {}).get("notional"), 0.0))
+        pos_uid = f"ORPHAN-{uuid.uuid4()}"
+
+        raw_meta = {
+            "live_orphan": {
+                "source": "exchange_position_risk",
+                "ts": opened_at.isoformat(),
+                "symbol": symbol,
+                "side": side,
+                "position_side": side,
+                "position_amt": qty,
+                "entry_price": entry_price,
+                "mark_price": mark_price,
+            }
+        }
+
+        columns = [
+            "exchange_id",
+            "account_id",
+            "symbol_id",
+            "symbol",
+            "pos_uid",
+            "strategy_id",
+            "strategy_name",
+            "side",
+            "status",
+            "opened_at",
+            "entry_price",
+            "avg_price",
+            "qty_opened",
+            "qty_current",
+            "position_value_usdt",
+            "scale_in_count",
+            "updated_at",
+            "source",
+        ]
+        values = [
+            "%(exchange_id)s",
+            "%(account_id)s",
+            "%(symbol_id)s",
+            "%(symbol)s",
+            "%(pos_uid)s",
+            "%(strategy_id)s",
+            "%(strategy_name)s",
+            "%(side)s",
+            "'OPEN'",
+            "%(opened_at)s",
+            "%(entry_price)s",
+            "%(avg_price)s",
+            "%(qty_opened)s",
+            "%(qty_current)s",
+            "%(position_value_usdt)s",
+            "0",
+            "%(updated_at)s",
+            "'live'",
+        ]
+
+        if getattr(self, "_pl_has_raw_meta", False):
+            columns.append("raw_meta")
+            values.append("%(raw_meta)s::jsonb")
+
+        sql = f"""
+        INSERT INTO public.position_ledger ({", ".join(columns)})
+        VALUES ({", ".join(values)})
+        ON CONFLICT DO NOTHING
+        """
+
+        params = {
+            "exchange_id": int(self.exchange_id),
+            "account_id": int(self.account_id),
+            "symbol_id": int(symbol_id),
+            "symbol": symbol,
+            "pos_uid": pos_uid,
+            "strategy_id": str(getattr(self, "STRATEGY_ID", "trade_liquidation")),
+            "strategy_name": str(getattr(self, "STRATEGY_ID", "trade_liquidation")),
+            "side": side,
+            "opened_at": opened_at,
+            "entry_price": float(entry_price or mark_price or 0.0),
+            "avg_price": float(entry_price or mark_price or 0.0),
+            "qty_opened": float(qty),
+            "qty_current": float(qty),
+            "position_value_usdt": float(notional or (mark_price * qty)),
+            "updated_at": opened_at,
+            "raw_meta": json.dumps(raw_meta, ensure_ascii=False),
+        }
+
+        try:
+            self.store.execute(sql, params)
+            active_by_symbol_side[(symbol, side)] = {"symbol": symbol, "side": side, "source": "live", "pos_uid": pos_uid}
+            active_live_by_symbol.setdefault(symbol, []).append({"symbol": symbol, "side": side, "source": "live", "pos_uid": pos_uid})
+            opened += 1
+            log.warning(
+                "[TL][orphan_ready] materialized missing live position symbol=%s side=%s qty=%.8f entry=%.8f pos_uid=%s",
+                symbol,
+                side,
+                float(qty),
+                float(entry_price or mark_price or 0.0),
+                pos_uid,
+            )
+        except Exception:
+            skipped += 1
+            log.exception(
+                "[TL][orphan_ready] failed to materialize missing live position symbol=%s side=%s",
+                symbol,
+                side,
+            )
+
+    return {"checked": checked, "opened": opened, "skipped": skipped}
+
+
 def _sync_live_hedge_legs_from_position_risk(self) -> Dict[str, int]:
     if not bool(getattr(self.p, "hedge_enabled", False)):
         return {"checked": 0, "opened": 0, "closed": 0}
@@ -539,28 +896,179 @@ def _sync_live_hedge_legs_from_position_risk(self) -> Dict[str, int]:
     return {"checked": checked, "opened": opened, "closed": closed}
 
 
+
+
+def _enforce_add_or_hedge_invariant(self) -> Dict[str, int]:
+    """Ensure each one-sided live main position has either next ADD or HEDGE stage.
+
+    Strategy intent required by the project:
+      - if averaging capacity remains -> pending ADDn must exist
+      - if averaging cap is exhausted -> pending HEDGE opener must exist
+      - if symbol already has both LONG and SHORT live positions, hedge is already opened
+        and no new HEDGE entry should be created here.
+
+    We delegate actual placement/deduplication to the original
+    ``_live_ensure_next_add_order`` method from ``trade_liquidation.py`` because it
+    already knows how to:
+      - refresh ``adds_done`` from DB truth,
+      - place the next ADD,
+      - or, once ``max_adds`` is reached, place ``_HEDGE`` and after-last-add trailing.
+    """
+    if not getattr(self, '_is_live', False):
+        return {'checked': 0, 'acted': 0, 'skipped_two_sided': 0}
+    if not bool(getattr(getattr(self, 'p', object()), 'averaging_enabled', False)):
+        return {'checked': 0, 'acted': 0, 'skipped_two_sided': 0}
+    if int(getattr(self, '_cfg_max_adds')() or 0) <= 0:
+        return {'checked': 0, 'acted': 0, 'skipped_two_sided': 0}
+
+    rows = list(
+        self.store.query_dict(
+            """
+            SELECT
+                symbol_id,
+                symbol,
+                pos_uid,
+                side,
+                qty_current,
+                avg_price,
+                entry_price,
+                scale_in_count,
+                raw_meta,
+                source,
+                opened_at,
+                updated_at
+            FROM public.position_ledger
+            WHERE exchange_id = %(exchange_id)s
+              AND account_id = %(account_id)s
+              AND strategy_id = %(strategy_id)s
+              AND source = 'live'
+              AND status = 'OPEN'
+            ORDER BY updated_at DESC
+            """,
+            {
+                'exchange_id': int(self.exchange_id),
+                'account_id': int(self.account_id),
+                'strategy_id': str(getattr(self, 'STRATEGY_ID', 'trade_liquidation')),
+            },
+        )
+    )
+
+    by_symbol: Dict[str, List[Dict[str, Any]]] = {}
+    for row in rows:
+        sym = str(row.get('symbol') or '').upper().strip()
+        side = str(row.get('side') or '').upper().strip()
+        if not sym or side not in ('LONG', 'SHORT'):
+            continue
+        by_symbol.setdefault(sym, []).append(row)
+
+    checked = 0
+    acted = 0
+    skipped_two_sided = 0
+
+    for sym, sym_rows in by_symbol.items():
+        live_sides = {str(r.get('side') or '').upper().strip() for r in sym_rows}
+        if 'LONG' in live_sides and 'SHORT' in live_sides:
+            skipped_two_sided += len(sym_rows)
+            continue
+        # One-sided symbol: enforce invariant on the freshest live row only.
+        row = sym_rows[0]
+        checked += 1
+        try:
+            if bool(self._live_ensure_next_add_order(pos=row)):
+                acted += 1
+        except Exception:
+            log.exception('[TL][add_or_hedge] failed invariant for %s %s pos_uid=%s', sym, str(row.get('side') or ''), str(row.get('pos_uid') or ''))
+
+    return {'checked': checked, 'acted': acted, 'skipped_two_sided': skipped_two_sided}
+
 def apply_trade_liquidation_full_ready() -> None:
     from src.platform.traders.trade_liquidation import TradeLiquidation
 
+    TradeLiquidation._sync_live_main_positions_from_position_risk = _sync_live_main_positions_from_position_risk  # type: ignore[attr-defined]
+    TradeLiquidation._position_ledger_time_anomalies = staticmethod(_position_ledger_time_anomalies)  # type: ignore[attr-defined]
     TradeLiquidation._sync_live_hedge_legs_from_position_risk = _sync_live_hedge_legs_from_position_risk  # type: ignore[attr-defined]
     TradeLiquidation._insert_live_hedge_ledger_row = _insert_live_hedge_ledger_row  # type: ignore[attr-defined]
     TradeLiquidation._close_live_hedge_ledger_row = _close_live_hedge_ledger_row  # type: ignore[attr-defined]
+
+    original_auto_recovery_brackets = TradeLiquidation._auto_recovery_brackets
+
+    def _wrapped_auto_recovery_brackets(self):
+        """Pre-sync exchange reality, then run recovery, then enforce ADD-or-HEDGE invariant."""
+        try:
+            if self._is_live:
+                _ensure_position_ledger_time_guard(self.store)
+                anomalies_before = _position_ledger_time_anomalies(self.store)
+                main_sync_result = self._sync_live_main_positions_from_position_risk()
+                if bool(getattr(self.p, "hedge_enabled", False)):
+                    hedge_sync_result = self._sync_live_hedge_legs_from_position_risk()
+                else:
+                    hedge_sync_result = {"checked": 0, "opened": 0, "closed": 0}
+                try:
+                    self._sync_positions_tables_from_position_risk()
+                except Exception:
+                    log.exception("[TL][hedge_ready] positions sync failed before recovery")
+                try:
+                    self._last_orphan_main_sync = dict(main_sync_result)
+                    self._last_orphan_hedge_sync = dict(hedge_sync_result)
+                    self._last_position_ledger_time_anomalies = dict(anomalies_before)
+                except Exception:
+                    pass
+                if any(int(anomalies_before.get(k, 0)) > 0 for k in ("broken_closed_at", "broken_updated_at", "broken_closed_gt_updated")):
+                    log.warning("[TL][ledger_guard] anomalies before recovery closed_lt_open=%s updated_lt_open=%s closed_gt_updated=%s", int(anomalies_before.get("broken_closed_at", 0)), int(anomalies_before.get("broken_updated_at", 0)), int(anomalies_before.get("broken_closed_gt_updated", 0)))
+        except Exception:
+            log.exception("[TL][hedge_ready] pre-recovery hedge sync failed")
+        result = original_auto_recovery_brackets(self)
+        try:
+            if self._is_live and bool(getattr(getattr(self, 'p', object()), 'add_or_hedge_invariant_enabled', True)):
+                inv = _enforce_add_or_hedge_invariant(self)
+                try:
+                    self._last_add_or_hedge_invariant = dict(inv)
+                except Exception:
+                    pass
+        except Exception:
+            log.exception('[TL][add_or_hedge] post-recovery invariant failed')
+        return result
+
+    TradeLiquidation._auto_recovery_brackets = _wrapped_auto_recovery_brackets  # type: ignore[assignment]
 
     original_process_open_positions = TradeLiquidation._process_open_positions
 
     def _wrapped_process_open_positions(self):
         result = original_process_open_positions(self)
         try:
-            if self._is_live and bool(getattr(self.p, "hedge_enabled", False)):
-                sync_result = self._sync_live_hedge_legs_from_position_risk()
+            if self._is_live:
+                _ensure_position_ledger_time_guard(self.store)
+                anomalies_before = _position_ledger_time_anomalies(self.store)
+                main_sync_result = self._sync_live_main_positions_from_position_risk()
+                if bool(getattr(self.p, "hedge_enabled", False)):
+                    hedge_sync_result = self._sync_live_hedge_legs_from_position_risk()
+                else:
+                    hedge_sync_result = {"checked": 0, "opened": 0, "closed": 0}
                 try:
                     self._sync_positions_tables_from_position_risk()
                 except Exception:
                     log.exception("[TL][hedge_ready] positions sync failed after hedge sync")
+                inv = {'checked': 0, 'acted': 0, 'skipped_two_sided': 0}
+                try:
+                    if bool(getattr(getattr(self, 'p', object()), 'add_or_hedge_invariant_enabled', True)):
+                        inv = _enforce_add_or_hedge_invariant(self)
+                except Exception:
+                    log.exception('[TL][add_or_hedge] post-open_positions invariant failed')
+                if any(int(anomalies_before.get(k, 0)) > 0 for k in ("broken_closed_at", "broken_updated_at", "broken_closed_gt_updated")):
+                    log.warning("[TL][ledger_guard] anomalies before open_positions closed_lt_open=%s updated_lt_open=%s closed_gt_updated=%s", int(anomalies_before.get("broken_closed_at", 0)), int(anomalies_before.get("broken_updated_at", 0)), int(anomalies_before.get("broken_closed_gt_updated", 0)))
                 if isinstance(result, dict):
-                    result["hedge_sync_checked"] = int(sync_result.get("checked", 0))
-                    result["hedge_sync_opened"] = int(sync_result.get("opened", 0))
-                    result["hedge_sync_closed"] = int(sync_result.get("closed", 0))
+                    result["orphan_main_sync_checked"] = int(main_sync_result.get("checked", 0))
+                    result["orphan_main_sync_opened"] = int(main_sync_result.get("opened", 0))
+                    result["orphan_main_sync_skipped"] = int(main_sync_result.get("skipped", 0))
+                    result["hedge_sync_checked"] = int(hedge_sync_result.get("checked", 0))
+                    result["hedge_sync_opened"] = int(hedge_sync_result.get("opened", 0))
+                    result["hedge_sync_closed"] = int(hedge_sync_result.get("closed", 0))
+                    result["ledger_broken_closed_at"] = int(anomalies_before.get("broken_closed_at", 0))
+                    result["ledger_broken_updated_at"] = int(anomalies_before.get("broken_updated_at", 0))
+                    result["ledger_broken_closed_gt_updated"] = int(anomalies_before.get("broken_closed_gt_updated", 0))
+                    result["add_or_hedge_checked"] = int(inv.get('checked', 0))
+                    result["add_or_hedge_acted"] = int(inv.get('acted', 0))
+                    result["add_or_hedge_skipped_two_sided"] = int(inv.get('skipped_two_sided', 0))
         except Exception:
             log.exception("[TL][hedge_ready] wrapped process_open_positions failed")
         return result

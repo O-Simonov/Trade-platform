@@ -894,6 +894,11 @@ class BinanceUMFuturesRest:
           activationPrice  -> activatePrice
 
         See Binance docs: New Algo Order (USD-M Futures).
+
+        Idempotency note:
+          Binance may return -4116 (duplicated clientAlgoId) while the algo order is
+          already open on the exchange. In that case we treat the request as success
+          and return the existing open algo order snapshot instead of raising.
         """
 
         p = dict(kwargs)
@@ -913,7 +918,39 @@ class BinanceUMFuturesRest:
         if "closePosition" in p and isinstance(p.get("closePosition"), bool):
             p["closePosition"] = "true" if bool(p["closePosition"]) else "false"
 
-        return self._request("POST", "/fapi/v1/algoOrder", **p)
+        try:
+            return self._request("POST", "/fapi/v1/algoOrder", **p)
+        except Exception as e:
+            msg = str(e)
+            if "-4116" not in msg and "ClientOrderId is duplicated" not in msg:
+                raise
+
+            symbol = str(p.get("symbol") or "").upper().strip()
+            cid = str(p.get("clientAlgoId") or "").strip()
+            try:
+                rows = self.open_algo_orders(symbol=symbol) if symbol else self.open_algo_orders()
+            except Exception:
+                rows = []
+            for row in rows if isinstance(rows, list) else []:
+                try:
+                    if str(row.get("symbol") or "").upper().strip() != symbol:
+                        continue
+                    if str(row.get("clientAlgoId") or "").strip() != cid:
+                        continue
+                    if isinstance(row, dict):
+                        row.setdefault("_duplicate", True)
+                    return row
+                except Exception:
+                    continue
+
+            # Best-effort synthetic response; caller can treat it as already present.
+            return {
+                "symbol": symbol,
+                "clientAlgoId": cid,
+                "algoStatus": "NEW",
+                "status": "NEW",
+                "_duplicate": True,
+            }
 
     def open_algo_orders(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
         params: Dict[str, Any] = {}
@@ -3791,7 +3828,7 @@ class TradeLiquidation:
                     except Exception:
                         pass
                     recent_trl_ts = 0.0
-                    trl_guard_sec = float(getattr(self.p, "trailing_place_guard_sec", 20) or 20)
+                    trl_guard_sec = float(getattr(self.p, "trailing_place_guard_sec", 180) or 180)
                     try:
                         recent_trl_ts = float(getattr(self, "_recent_main_trl_place_ts", {}).get(cid_trl, 0.0) or 0.0)
                     except Exception:
@@ -3874,7 +3911,7 @@ class TradeLiquidation:
                             self._recent_main_trl_place_ts[cid_trl] = time.time()
                         except Exception:
                             pass
-                        log.info("[trade_liquidation][RECOVERY] placed missing TRAILING %s %s pos_uid=%s", sym, side, pos_uid)
+                        log.info("[trade_liquidation][RECOVERY] placed missing TRAILING %s %s pos_uid=%s", sym, side, pos_uid) if not (isinstance(resp_trl, dict) and resp_trl.get("_duplicate")) else None
             except Exception:
                 log.exception("[trade_liquidation][RECOVERY] failed trailing recovery for %s %s pos_uid=%s", sym, side, pos_uid)
 
@@ -4466,6 +4503,34 @@ class TradeLiquidation:
             return 0.0
 
 
+    def _memo_recent_desired_order(self, bucket: str, key: str, payload: dict, ttl_sec: float) -> bool:
+        """Best-effort in-process debounce for identical desired orders.
+
+        Returns True when the same desired payload was seen recently and the caller
+        should skip reissuing in this cycle.
+        """
+        try:
+            ttl = float(ttl_sec or 0.0)
+        except Exception:
+            ttl = 0.0
+        if ttl <= 0:
+            return False
+        try:
+            if not hasattr(self, bucket) or not isinstance(getattr(self, bucket), dict):
+                setattr(self, bucket, {})
+            store = getattr(self, bucket)
+            now = time.time()
+            cur = store.get(str(key))
+            if isinstance(cur, dict):
+                ts = float(cur.get("ts") or 0.0)
+                prev = cur.get("payload")
+                if ts and (now - ts) < ttl and prev == payload:
+                    return True
+            store[str(key)] = {"ts": now, "payload": payload}
+        except Exception:
+            return False
+        return False
+
     def _live_ensure_hedge_after_last_add(
         self,
         *,
@@ -4552,9 +4617,9 @@ class TradeLiquidation:
                  WHERE exchange_id=%(ex)s
                    AND account_id=%(acc)s
                    AND symbol=%(symbol)s
-                   AND client_algo_id=%(cid)s;
+                   AND client_algo_id LIKE %(cid_like)s;
                 """,
-                {"ex": int(self.exchange_id), "acc": int(self.account_id), "symbol": str(sym).upper(), "cid": cid_hedge},
+                {"ex": int(self.exchange_id), "acc": int(self.account_id), "symbol": str(sym).upper(), "cid_like": f"{cid_hedge}%"},
             )
             hedge_seen_at = row[0] if row else None
         except Exception:
@@ -4660,6 +4725,20 @@ class TradeLiquidation:
         if qty_step and qty_step > 0:
             hedge_qty = float(_round_qty_to_step(hedge_qty, qty_step, mode="down"))
         if hedge_qty <= 0:
+            return False
+
+        try:
+            hedge_guard_sec = float(getattr(self.p, "hedge_reissue_cooldown_sec", 120) or 120)
+        except Exception:
+            hedge_guard_sec = 120.0
+        _hedge_payload = {
+            "symbol": str(sym).upper(),
+            "position_side": str(hedge_ps).upper(),
+            "side": str(close_side).upper(),
+            "stop": round(float(stop_price), 12),
+            "qty": round(float(hedge_qty), 12),
+        }
+        if self._memo_recent_desired_order("_recent_hedge_desired", cid_hedge, _hedge_payload, hedge_guard_sec):
             return False
 
         # Find open algos by clientAlgoId
@@ -4880,6 +4959,19 @@ class TradeLiquidation:
 
                         move_pct = abs(new_trigger - cur_f) / max(mark, 1e-12) * 100.0
                         if dist_pct_now >= follow_dist and (follow_min_move <= 0 or move_pct >= follow_min_move):
+                            try:
+                                if not hasattr(self, "_recent_hedge_follow_state") or not isinstance(self._recent_hedge_follow_state, dict):
+                                    self._recent_hedge_follow_state = {}
+                                _f_key = str(cid_hedge)
+                                _f_prev = self._recent_hedge_follow_state.get(_f_key) or {}
+                                _f_prev_stop = float(_f_prev.get("stop") or 0.0)
+                                _f_prev_ts = float(_f_prev.get("ts") or 0.0)
+                                _f_cd = float(getattr(self.p, "hedge_follow_guard_sec", 180) or 180)
+                                _f_tol = max(float(tick or 0.0) * 2.0, abs(float(new_trigger)) * 0.0002, 1e-8)
+                                if _f_prev_ts and (time.time() - _f_prev_ts) < _f_cd and abs(_f_prev_stop - float(new_trigger)) <= _f_tol:
+                                    return False
+                            except Exception:
+                                pass
                             log.info(
                                 "[TL][HEDGE][FOLLOW] reprice after-last-add hedge %s %s: mark=%.8f old=%.8f dist=%.4f%% -> new=%.8f (thr=%.4f%% pull=%.4f%%)",
                                 sym,
@@ -4894,6 +4986,10 @@ class TradeLiquidation:
                             stop_price = float(new_trigger)
                             must_refresh = True
                             refresh_reason = "reprice"
+                            try:
+                                self._recent_hedge_follow_state[str(cid_hedge)] = {"stop": float(new_trigger), "ts": time.time()}
+                            except Exception:
+                                pass
                         else:
                             # if trigger already close enough to desired stop_price and no refresh requested -> keep
                             tol = max(float(tick or 0.0) * 2.0, abs(stop_price) * 0.0002, 1e-8)
@@ -4962,16 +5058,56 @@ class TradeLiquidation:
         # (already computed above and reused for semantic exchange/DB matching)
 
         try:
-            resp = self._binance.new_order(
-                symbol=sym,
-                side=close_side,
-                type="STOP_MARKET",
-                stopPrice=float(stop_price),
-                quantity=float(hedge_qty),
-                workingType=str(getattr(self.p, "working_type", "MARK_PRICE")),
-                newClientOrderId=cid_hedge,
-                positionSide=hedge_ps,
-            )
+            try:
+                if not hasattr(self, "_recent_hedge_place_state") or not isinstance(self._recent_hedge_place_state, dict):
+                    self._recent_hedge_place_state = {}
+                _hedge_guard_sec = float(getattr(self.p, "hedge_place_guard_sec", 180) or 180)
+                _hedge_key = str(cid_hedge)
+                _hedge_prev = self._recent_hedge_place_state.get(_hedge_key) or {}
+                _prev_stop = float(_hedge_prev.get("stop") or 0.0)
+                _prev_ts = float(_hedge_prev.get("ts") or 0.0)
+                _tol = max(float(tick or 0.0) * 2.0, abs(float(stop_price)) * 0.0002, 1e-8)
+                if _prev_ts and (time.time() - _prev_ts) < _hedge_guard_sec and abs(_prev_stop - float(stop_price)) <= _tol:
+                    return False
+            except Exception:
+                pass
+
+            place_cid = str(cid_hedge)
+            # Binance can permanently reserve a clientAlgoId after a cancel/reissue cycle.
+            # If that happens, using the canonical *_HEDGE id again yields -4116 but no live
+            # order appears on exchange. Retry with a short unique suffix and rely on semantic
+            # matching + DB LIKE queries for subsequent detection.
+            try:
+                suffix = format(int(time.time() * 1000) % 65536, '04x')
+                alt_cid = f"{cid_hedge}_{suffix}"
+                if len(alt_cid) > 36:
+                    alt_cid = alt_cid[:36]
+            except Exception:
+                alt_cid = None
+
+            def _place_once(client_id: str):
+                return self._binance.new_order(
+                    symbol=sym,
+                    side=close_side,
+                    type="STOP_MARKET",
+                    stopPrice=float(stop_price),
+                    quantity=float(hedge_qty),
+                    workingType=str(getattr(self.p, "working_type", "MARK_PRICE")),
+                    newClientOrderId=client_id,
+                    positionSide=hedge_ps,
+                )
+
+            try:
+                resp = _place_once(place_cid)
+            except Exception as e:
+                msg = str(e)
+                if alt_cid and ("-4116" in msg or "ClientOrderId is duplicated" in msg):
+                    place_cid = alt_cid
+                    resp = _place_once(place_cid)
+                else:
+                    raise
+            _dup_resp = bool(isinstance(resp, dict) and resp.get("_duplicate"))
+
             # persist algo hedge order (best-effort)
             try:
                 self.store.upsert_algo_orders(
@@ -4979,7 +5115,7 @@ class TradeLiquidation:
                         {
                             "exchange_id": int(self.exchange_id),
                             "account_id": int(self.account_id),
-                            "client_algo_id": str(cid_hedge),
+                            "client_algo_id": str(place_cid),
                             "algo_id": None if resp is None else str(resp.get("algoId") or resp.get("algoOrderId") or resp.get("orderId") or ""),
                             "symbol": str(sym).upper(),
                             "side": str(close_side),
@@ -4991,7 +5127,7 @@ class TradeLiquidation:
                             "status": "OPEN",
                             "strategy_id": str(self.strategy_id),
                             "pos_uid": str(pos_uid),
-                            "raw_json": (resp if isinstance(resp, dict) else {"result": resp}),
+                            "raw_json": (resp if isinstance(resp, dict) else {"result": resp, "canonical_client_algo_id": str(cid_hedge)}),
                         }
                     ]
                 )
@@ -5011,6 +5147,8 @@ class TradeLiquidation:
                         "pct": float(dist_pct),
                         "qty_main": float(qty_main),
                         "qty_hedge": float(hedge_qty),
+                        "client_algo_id": str(place_cid),
+                        "canonical_client_algo_id": str(cid_hedge),
                         "ts": _utc_now().isoformat(),
                     }
                 }
@@ -5038,6 +5176,16 @@ class TradeLiquidation:
         except Exception:
             pass
 
+        try:
+            if not hasattr(self, "_recent_hedge_place_state") or not isinstance(self._recent_hedge_place_state, dict):
+                self._recent_hedge_place_state = {}
+            self._recent_hedge_place_state[str(cid_hedge)] = {"stop": float(stop_price), "ts": time.time()}
+            self._recent_hedge_place_state[str(place_cid)] = {"stop": float(stop_price), "ts": time.time()}
+        except Exception:
+            pass
+
+        if _dup_resp:
+            return False
         self.log.info(
             "[trade_liquidation][LIVE][HEDGE] placed after-last-add STOP_MARKET %s %s stop=%.8f (last_add=%.8f add_n=%s pct=%.4f qty=%.8f koff=%.4f)",
             str(sym).upper(),
@@ -5321,12 +5469,10 @@ class TradeLiquidation:
             # already fresh by DB/open order semantics
             return False
 
-        # Cancel existing TRL (best-effort)
         try:
-            self._binance.cancel_algo_order(symbol=sym, clientAlgoId=cid_trl)
+            trl_guard_sec = float(getattr(self.p, "trailing_reissue_cooldown_sec", 120) or 120)
         except Exception:
-            pass
-
+            trl_guard_sec = 120.0
         hedge_mode = bool(getattr(self.p, "hedge_enabled", False))
         position_side = side_u if hedge_mode else "BOTH"
 
@@ -5361,6 +5507,24 @@ class TradeLiquidation:
             qty_main = float(_round_qty_to_step(qty_main, step, mode="down"))
         if qty_main <= 0:
             return False
+
+        _trl_payload = {
+            "symbol": str(sym).upper(),
+            "position_side": side_u,
+            "side": close_side,
+            "activation": round(float(activation), 12),
+            "trail_pct": round(float(trail_pct), 8),
+            "qty": round(float(qty_main), 12),
+            "mode": "after_last_add",
+        }
+        if self._memo_recent_desired_order("_recent_trl_desired", cid_trl, _trl_payload, trl_guard_sec):
+            return False
+
+        # Cancel existing TRL (best-effort)
+        try:
+            self._binance.cancel_algo_order(symbol=sym, clientAlgoId=cid_trl)
+        except Exception:
+            pass
 
         try:
             # Guard: never (re)place trailing if MAIN position is not open on exchange
@@ -5534,7 +5698,7 @@ class TradeLiquidation:
                 pass
 
             try:
-                guard_sec = float(getattr(self.p, "trailing_place_guard_sec", 20) or 20)
+                guard_sec = float(getattr(self.p, "trailing_place_guard_sec", 180) or 180)
             except Exception:
                 guard_sec = 20.0
             try:
@@ -5568,6 +5732,22 @@ class TradeLiquidation:
             )
             activation = _ensure_tp_trail_side(activation, entry_price, tick, side_u, kind="trail_activate")
 
+            try:
+                trl_guard_sec = float(getattr(self.p, "trailing_reissue_cooldown_sec", 120) or 120)
+            except Exception:
+                trl_guard_sec = 120.0
+            _trl_payload = {
+                "symbol": sym_u,
+                "position_side": position_side or "BOTH",
+                "side": close_side,
+                "activation": round(float(activation), 12),
+                "trail_pct": round(float(trail_pct), 8),
+                "qty": round(float(qty), 12),
+                "mode": "pre_last_add",
+            }
+            if self._memo_recent_desired_order("_recent_trl_desired", cid_trl, _trl_payload, trl_guard_sec):
+                return False
+
             resp = self._binance.new_order(
                 symbol=sym_u,
                 side=close_side,
@@ -5579,6 +5759,7 @@ class TradeLiquidation:
                 newClientOrderId=cid_trl,
                 positionSide=position_side,
             )
+            _dup_resp = bool(isinstance(resp, dict) and resp.get("_duplicate"))
             try:
                 self._upsert_order_shadow(
                     pos_uid=pos_uid,
@@ -5600,6 +5781,8 @@ class TradeLiquidation:
                 self._recent_main_trl_place_ts[cid_trl] = time.time()
             except Exception:
                 pass
+            if _dup_resp:
+                return False
             self.log.info(
                 "[trade_liquidation][LIVE][TP_TRL] placed pre-last-add TRAILING_STOP_MARKET %s %s activation=%.8f (entry=%.8f adds_done=%s/%s trail_pct=%.4f)",
                 sym_u,
@@ -5819,6 +6002,19 @@ class TradeLiquidation:
         if recent_ts and (time.time() - recent_ts) < recent_add_guard:
             return False
 
+        try:
+            add_reissue_guard = float(getattr(self.p, "averaging_reissue_cooldown_sec", 120) or 120)
+        except Exception:
+            add_reissue_guard = 120.0
+        _add_payload = {
+            "symbol": sym,
+            "side": side,
+            "cid": want_cid,
+            "next_n": int(next_n),
+        }
+        if self._memo_recent_desired_order("_recent_add_desired", want_cid, _add_payload, add_reissue_guard):
+            return False
+
         def _db_add_already_executed(cid: str) -> bool:
             cid = str(cid or "")
             if not cid:
@@ -5928,6 +6124,13 @@ class TradeLiquidation:
                         return False
                     # Poisoned recovery ids must not block new averaging orders.
                     if "#BADTP#" not in str(want_cid).upper():
+                        # Extra debounce: when we have just tried to keep/place the same ADD series,
+                        # do not churn DB shadow state in the same/next couple of cycles.
+                        try:
+                            if self._memo_recent_desired_order("_recent_add_shadow_guard", want_cid, _add_payload, add_reissue_guard):
+                                return False
+                        except Exception:
+                            pass
                         try:
                             self.store.execute(
                                 """
@@ -6192,6 +6395,7 @@ class TradeLiquidation:
         except Exception as e:
             log.warning("[trade_liquidation][LIVE][AVG] failed to place ADD%d for %s: %s", int(next_n), sym, e)
             return False
+        _dup_resp = bool(isinstance(resp, dict) and resp.get("_duplicate"))
 
         # Shadow
         try:
@@ -6211,6 +6415,20 @@ class TradeLiquidation:
         except Exception:
             pass
 
+        try:
+            if not hasattr(self, "_recent_add_place_ts") or not isinstance(self._recent_add_place_ts, dict):
+                self._recent_add_place_ts = {}
+            self._recent_add_place_ts[want_cid] = time.time()
+            try:
+                if not hasattr(self, "_recent_add_shadow_guard") or not isinstance(self._recent_add_shadow_guard, dict):
+                    self._recent_add_shadow_guard = {}
+                self._recent_add_shadow_guard[want_cid] = {"ts": time.time(), "payload": _add_payload}
+            except Exception:
+                pass
+        except Exception:
+            pass
+        if _dup_resp:
+            return False
         log.info(
             "[trade_liquidation][LIVE][AVG] placed ADD%d %s %s stop=%.8f qty=%.8f (adds_done=%d/%d)",
             int(next_n),

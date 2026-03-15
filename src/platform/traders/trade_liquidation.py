@@ -365,6 +365,15 @@ class TradeLiquidationParams:
 
     hedge_reopen_enabled: bool = True
     hedge_reopen_drawdown_pct: float = 0.0
+    hedge_reopen_price_filter_enabled: bool = False
+    hedge_reopen_price_move_pct: float = 0.0
+    hedge_reopen_anchor_shift_trigger_pct: float = 0.0
+    hedge_reopen_anchor_shift_step_pct: float = 0.0
+
+    # Close hedge at/near entry after it has first moved into profit by a configured amount.
+    hedge_close_on_entry_enabled: bool = False
+    hedge_close_on_entry_profit_activation_pct: float = 0.0
+    hedge_close_on_entry_buffer_pct: float = 0.0
 
     # After hedge close, optionally add to the main leg by the currently open main volume.
     # Example: main LONG 0.5 + hedge SHORT 0.5 -> hedge closes -> buy extra 0.5 LONG.
@@ -553,6 +562,13 @@ class TradeLiquidationParams:
         params["hedge_level_tolerance_pct"] = float(_as_float(params.get("hedge_level_tolerance_pct", cls().hedge_level_tolerance_pct), cls().hedge_level_tolerance_pct) or cls().hedge_level_tolerance_pct)
         params["hedge_reopen_enabled"] = _as_bool(params.get("hedge_reopen_enabled", cls().hedge_reopen_enabled), cls().hedge_reopen_enabled)
         params["hedge_reopen_drawdown_pct"] = float(_as_float(params.get("hedge_reopen_drawdown_pct", cls().hedge_reopen_drawdown_pct), cls().hedge_reopen_drawdown_pct) or cls().hedge_reopen_drawdown_pct)
+        params["hedge_reopen_price_filter_enabled"] = _as_bool(params.get("hedge_reopen_price_filter_enabled", cls().hedge_reopen_price_filter_enabled), cls().hedge_reopen_price_filter_enabled)
+        params["hedge_reopen_price_move_pct"] = float(_as_float(params.get("hedge_reopen_price_move_pct", cls().hedge_reopen_price_move_pct), cls().hedge_reopen_price_move_pct) or cls().hedge_reopen_price_move_pct)
+        params["hedge_reopen_anchor_shift_trigger_pct"] = float(_as_float(params.get("hedge_reopen_anchor_shift_trigger_pct", cls().hedge_reopen_anchor_shift_trigger_pct), cls().hedge_reopen_anchor_shift_trigger_pct) or cls().hedge_reopen_anchor_shift_trigger_pct)
+        params["hedge_reopen_anchor_shift_step_pct"] = float(_as_float(params.get("hedge_reopen_anchor_shift_step_pct", cls().hedge_reopen_anchor_shift_step_pct), cls().hedge_reopen_anchor_shift_step_pct) or cls().hedge_reopen_anchor_shift_step_pct)
+        params["hedge_close_on_entry_enabled"] = _as_bool(params.get("hedge_close_on_entry_enabled", cls().hedge_close_on_entry_enabled), cls().hedge_close_on_entry_enabled)
+        params["hedge_close_on_entry_profit_activation_pct"] = float(_as_float(params.get("hedge_close_on_entry_profit_activation_pct", cls().hedge_close_on_entry_profit_activation_pct), cls().hedge_close_on_entry_profit_activation_pct) or cls().hedge_close_on_entry_profit_activation_pct)
+        params["hedge_close_on_entry_buffer_pct"] = float(_as_float(params.get("hedge_close_on_entry_buffer_pct", cls().hedge_close_on_entry_buffer_pct), cls().hedge_close_on_entry_buffer_pct) or cls().hedge_close_on_entry_buffer_pct)
         params["hedge_close_add_enabled"] = _as_bool(params.get("hedge_close_add_enabled", cls().hedge_close_add_enabled), cls().hedge_close_add_enabled)
         params["hedge_close_add_max_count"] = int(_as_int(params.get("hedge_close_add_max_count", cls().hedge_close_add_max_count), cls().hedge_close_add_max_count) or 0)
         params["all_P_L"] = float(_as_float(params.get("all_P_L", cls().all_P_L), cls().all_P_L) or cls().all_P_L)
@@ -8038,6 +8054,9 @@ class TradeLiquidation:
             hedge_last_open_ts: float = 0.0
             hedge_last_close_ts: float = 0.0
             hedge_last_close_px: float = 0.0
+            hedge_reopen_anchor_px: float = 0.0
+            hedge_be_best_px: float = 0.0
+            hedge_be_armed: bool = False
             raw_meta = p.get("raw_meta") if isinstance(p, dict) else None
             if raw_meta is not None:
                 try:
@@ -8069,6 +8088,20 @@ class TradeLiquidation:
                                 hedge_last_close_px = float(h.get("last_close_px") or 0.0)
                             except Exception:
                                 hedge_last_close_px = 0.0
+                            try:
+                                hedge_reopen_anchor_px = float(h.get("reopen_anchor_px") or 0.0)
+                            except Exception:
+                                hedge_reopen_anchor_px = 0.0
+                            try:
+                                hedge_be_best_px = float(h.get("be_best_px") or 0.0)
+                            except Exception:
+                                hedge_be_best_px = 0.0
+                            try:
+                                hedge_be_armed = bool(h.get("be_armed"))
+                            except Exception:
+                                hedge_be_armed = False
+                            if hedge_reopen_anchor_px <= 0.0:
+                                hedge_reopen_anchor_px = float(hedge_last_close_px or 0.0)
                 except Exception:
                     hedge_base_qty = None
 
@@ -8094,7 +8127,7 @@ class TradeLiquidation:
                     if float(hedge_last_open_ts or 0.0) > float(hedge_last_close_ts or 0.0):
                         if getattr(self, "_pl_has_raw_meta", False):
                             import json as _json
-                            meta = {"hedge": {"last_close_reason": "ALGO", "last_close_ts": float(time.time()), "last_close_px": float(mark), "last_action_ts": float(time.time())}}
+                            meta = {"hedge": {"last_close_reason": "ALGO", "last_close_ts": float(time.time()), "last_close_px": float(mark), "reopen_anchor_px": float(mark), "last_action_ts": float(time.time())}}
                             uqm = '''
                             UPDATE position_ledger
                             SET raw_meta = COALESCE(raw_meta,'{}'::jsonb) || %(meta)s::jsonb,
@@ -8104,6 +8137,7 @@ class TradeLiquidation:
                             self.store.execute(uqm, {"meta": _json.dumps(meta), "ex": int(self.exchange_id), "acc": int(self.account_id), "pos_uid": str(pos_uid)})
                         hedge_last_close_ts = float(time.time())
                         hedge_last_close_px = float(mark)
+                        hedge_reopen_anchor_px = float(mark)
             except Exception:
                 pass
 
@@ -8880,19 +8914,58 @@ class TradeLiquidation:
 
             
             # Optional extra filter for hedge re-entry after a hedge close (SL/TRL/ALGO).
-            # When enabled, we only allow reopen if price moved beyond the last hedge exit price:
-            #   - hedge SHORT: current mark must be < last_close_px
-            #   - hedge LONG : current mark must be > last_close_px
-            # This prevents immediate re-entries at worse or equal prices.
+            # Re-entry direction is defined relative to the MAIN leg:
+            #   - main LONG  -> re-enter hedge only if price moved ABOVE the last hedge exit anchor
+            #   - main SHORT -> re-enter hedge only if price moved BELOW the last hedge exit anchor
+            # In addition, when price moves far in the opposite direction of the hedge (towards the MAIN),
+            # the anchor is shifted towards the MAIN to gradually reduce the distance for the next hedge entry.
             try:
                 if (not bool(sl_hit)) and bool(getattr(self.p, "hedge_reopen_price_filter_enabled", False)):
-                    lcp = float(hedge_last_close_px or 0.0)
-                    if lcp > 0.0:
-                        hs = str(hedge_side).upper()
-                        if hs == "SHORT" and not (float(mark) < lcp):
-                            open_trigger = False
-                        if hs == "LONG" and not (float(mark) > lcp):
-                            open_trigger = False
+                    anchor_px = float(hedge_reopen_anchor_px or hedge_last_close_px or 0.0)
+                    move_pct = float(getattr(self.p, "hedge_reopen_price_move_pct", 0.0) or 0.0) / 100.0
+                    shift_trigger_pct = float(getattr(self.p, "hedge_reopen_anchor_shift_trigger_pct", 0.0) or 0.0) / 100.0
+                    shift_step_pct = float(getattr(self.p, "hedge_reopen_anchor_shift_step_pct", 0.0) or 0.0) / 100.0
+                    if anchor_px > 0.0:
+                        new_anchor_px = float(anchor_px)
+                        if shift_trigger_pct > 0.0 and shift_step_pct > 0.0:
+                            if str(main_side).upper() == "LONG":
+                                while float(mark) <= new_anchor_px * (1.0 - shift_trigger_pct):
+                                    new_anchor_px = new_anchor_px * (1.0 - shift_step_pct)
+                            else:
+                                while float(mark) >= new_anchor_px * (1.0 + shift_trigger_pct):
+                                    new_anchor_px = new_anchor_px * (1.0 + shift_step_pct)
+                        if abs(new_anchor_px - anchor_px) > 1e-12:
+                            try:
+                                if getattr(self, "_pl_has_raw_meta", False):
+                                    import json as _json
+                                    meta = {"hedge": {"reopen_anchor_px": float(new_anchor_px)}}
+                                    uqm = """
+                                    UPDATE position_ledger
+                                    SET raw_meta = COALESCE(raw_meta,'{}'::jsonb) || %(meta)s::jsonb,
+                                        updated_at = now()
+                                    WHERE exchange_id=%(ex)s AND account_id=%(acc)s AND pos_uid=%(pos_uid)s AND status='OPEN';
+                                    """
+                                    self.store.execute(
+                                        uqm,
+                                        {
+                                            "meta": _json.dumps(meta),
+                                            "ex": int(self.exchange_id),
+                                            "acc": int(self.account_id),
+                                            "pos_uid": str(p.get("pos_uid")),
+                                        },
+                                    )
+                            except Exception:
+                                pass
+                            hedge_reopen_anchor_px = float(new_anchor_px)
+                            anchor_px = float(new_anchor_px)
+                        if str(main_side).upper() == "LONG":
+                            target_px = anchor_px * (1.0 + max(move_pct, 0.0))
+                            if not (float(mark) >= target_px):
+                                open_trigger = False
+                        else:
+                            target_px = anchor_px * (1.0 - max(move_pct, 0.0))
+                            if not (float(mark) <= target_px):
+                                open_trigger = False
             except Exception:
                 pass
             
@@ -8930,7 +9003,7 @@ class TradeLiquidation:
                         if getattr(self, "_pl_has_raw_meta", False):
                             import json as _json
                             reason = "SL" if bool(sl_hit) else "REOPEN"
-                            meta = {"hedge": {"base_qty": float(hedge_qty), "last_open_reason": str(reason), "last_open_ts": float(time.time()), "last_action_ts": float(time.time())}}
+                            meta = {"hedge": {"base_qty": float(hedge_qty), "last_open_reason": str(reason), "last_open_ts": float(time.time()), "last_action_ts": float(time.time()), "be_best_px": float(mark), "be_armed": False}}
                             uqm = '''
                             UPDATE position_ledger
                             SET raw_meta = COALESCE(raw_meta,'{}'::jsonb) || %(meta)s::jsonb,
@@ -8963,7 +9036,70 @@ class TradeLiquidation:
                 if bool(getattr(self.p, "hedge_close_on_main_positive", True)) and main_positive:
                     close_reason = "MAIN_POSITIVE"
 
-                # a) close on significant level
+                # a) close hedge at/near entry after it has first moved into profit enough
+                if close_reason is None and bool(getattr(self.p, "hedge_close_on_entry_enabled", False)):
+                    try:
+                        be_act_pct = float(getattr(self.p, "hedge_close_on_entry_profit_activation_pct", 0.0) or 0.0) / 100.0
+                    except Exception:
+                        be_act_pct = 0.0
+                    try:
+                        be_buf_pct = float(getattr(self.p, "hedge_close_on_entry_buffer_pct", 0.0) or 0.0) / 100.0
+                    except Exception:
+                        be_buf_pct = 0.0
+                    hedge_entry_ref = float(hedge_entry_use or 0.0)
+                    hedge_upnl_now = float(hedge_upnl or 0.0)
+                    hedge_pnl_ok = hedge_upnl_now >= 0.0
+                    if hedge_entry_ref > 0.0:
+                        best_px = float(hedge_be_best_px or hedge_entry_ref or 0.0)
+                        armed_now = bool(hedge_be_armed)
+                        if str(hedge_side).upper() == "SHORT":
+                            if best_px <= 0.0:
+                                best_px = hedge_entry_ref
+                            if float(mark) < best_px:
+                                best_px = float(mark)
+                            trigger_px = hedge_entry_ref * (1.0 - max(be_act_pct, 0.0))
+                            if float(best_px) <= trigger_px:
+                                armed_now = True
+                            entry_close_px = hedge_entry_ref * (1.0 - max(be_buf_pct, 0.0))
+                            if armed_now and hedge_pnl_ok and float(mark) >= entry_close_px:
+                                close_reason = "ENTRY_BE"
+                        else:
+                            if best_px <= 0.0:
+                                best_px = hedge_entry_ref
+                            if float(mark) > best_px:
+                                best_px = float(mark)
+                            trigger_px = hedge_entry_ref * (1.0 + max(be_act_pct, 0.0))
+                            if float(best_px) >= trigger_px:
+                                armed_now = True
+                            entry_close_px = hedge_entry_ref * (1.0 + max(be_buf_pct, 0.0))
+                            if armed_now and hedge_pnl_ok and float(mark) <= entry_close_px:
+                                close_reason = "ENTRY_BE"
+                        if abs(best_px - float(hedge_be_best_px or 0.0)) > 1e-12 or bool(armed_now) != bool(hedge_be_armed):
+                            try:
+                                if getattr(self, "_pl_has_raw_meta", False):
+                                    import json as _json
+                                    meta = {"hedge": {"be_best_px": float(best_px), "be_armed": bool(armed_now)}}
+                                    uqm = """
+                                    UPDATE position_ledger
+                                    SET raw_meta = COALESCE(raw_meta,'{}'::jsonb) || %(meta)s::jsonb,
+                                        updated_at = now()
+                                    WHERE exchange_id=%(ex)s AND account_id=%(acc)s AND pos_uid=%(pos_uid)s AND status='OPEN';
+                                    """
+                                    self.store.execute(
+                                        uqm,
+                                        {
+                                            "meta": _json.dumps(meta),
+                                            "ex": int(self.exchange_id),
+                                            "acc": int(self.account_id),
+                                            "pos_uid": str(p.get("pos_uid")),
+                                        },
+                                    )
+                            except Exception:
+                                pass
+                            hedge_be_best_px = float(best_px)
+                            hedge_be_armed = bool(armed_now)
+
+                # b) close on significant level
                 if bool(getattr(self.p, "hedge_close_on_level", True)):
                     tf_main = str(p.get("timeframe") or "15m")
                     level = self._compute_significant_level(symbol_id, side=main_side, entry_ref=float(entry), timeframe=tf_main)
@@ -9027,7 +9163,10 @@ class TradeLiquidation:
                                         "last_close_reason": str(reason),
                                         "last_close_ts": float(time.time()),
                                         "last_close_px": float(close_px),
+                                        "reopen_anchor_px": float(close_px),
                                         "last_action_ts": float(time.time()),
+                                        "be_armed": False,
+                                        "be_best_px": 0.0,
                                         "close_inflight": False if synthetic_closed else True,
                                         "close_inflight_ts": float(time.time()),
                                     }

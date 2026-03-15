@@ -126,8 +126,20 @@ traders:
       hedge_close_on_ema_flip: true                 # Закрывать hedge при перевороте EMA
       hedge_level_tolerance_pct: 0.10               # Допуск вокруг уровня
       hedge_reopen_enabled: true                    # Повторно открывать hedge после его закрытия
-      hedge_reopen_drawdown_pct: 0.0                # Порог drawdown для повторного открытия hedge
+      hedge_reopen_drawdown_pct: 0.3                # Порог drawdown для повторного открытия hedge
+      hedge_reopen_price_filter_enabled: true       # Включить повторный перезаход по цене относительно прошлого выхода hedge
 
+      hedge_reopen_price_move_pct: 0.3              # Для LONG: цена должна стать выше anchor на 0.3%; для SHORT: ниже на 0.3%
+      hedge_reopen_anchor_shift_trigger_pct: 1.5    # Сдвигать anchor, если цена ушла на 1.5% в сторону основной позиции
+      hedge_reopen_anchor_shift_step_pct: 1.0       # На сколько сдвигать anchor при срабатывании триггера
+
+      # ======================================================
+      # Hedge close at entry (break-even after profit activation)
+      # ======================================================
+
+      hedge_close_on_entry_enabled: true           # Закрывать hedge около цены входа после того, как он уже был в прибыли и текущий P/L hedge >= 0
+      hedge_close_on_entry_profit_activation_pct: 0.3 # Сначала hedge должен уйти в прибыль минимум на 0.3% от своей цены входа
+      hedge_close_on_entry_buffer_pct: 0.05        # Буфер около цены входа для закрытия hedge в безубыток/около безубытка, но только при P/L hedge >= 0
       # Если main закрылась, а hedge остался открыт —
       # разрешить дополнительное сопровождение hedge
       hedge_add_on_main_close_enabled: true
@@ -141,9 +153,9 @@ traders:
       # ======================================================
 
       hedge_trailing_enabled: true                  # Включить отдельный trailing для hedge
-      hedge_trailing_activation_pct: 2.5            # Активация trailing в % от mark price
-      hedge_trailing_trail_pct: 0.5                 # callbackRate (%) для trailing
-      hedge_trailing_activation_buffer_pct: 0.5     # Буфер от мгновенного срабатывания
+      hedge_trailing_activation_pct: 1.5            # Активация trailing в % от mark price
+      hedge_trailing_trail_pct: 0.4                 # callbackRate (%) для trailing
+      hedge_trailing_activation_buffer_pct: 0.3     # Буфер от мгновенного срабатывания
       hedge_trailing_place_retries: 2               # Ретраи постановки hedge trailing
       hedge_trailing_working_type: MARK_PRICE       # MARK_PRICE или CONTRACT_PRICE
 
@@ -179,9 +191,6 @@ traders:
       hedge_stop_loss_be_pct_max: 5.0
       hedge_stop_loss_be_activation_pct_min: 0.5
       hedge_stop_loss_be_activation_pct_max: 8.0
-
-      # После закрытия hedge переоткрывать его только если цена ушла дальше цены прошлого закрытия
-      hedge_reopen_price_filter_enabled: true
 
       # Логика сопровождения hedge после последнего добора main
       hedge_after_last_add_follow_enabled: true
@@ -241,8 +250,8 @@ traders:
       # ======================================================
 
       trailing_enabled: true                        # Включить trailing
-      trailing_activation_pct: 2.5                  # Активация trailing после +X% в прибыль
-      trailing_trail_pct: 0.5                       # Дистанция trailing (%)
+      trailing_activation_pct: 1.5                  # Активация trailing после +X% в прибыль
+      trailing_trail_pct: 0.3                       # Дистанция trailing (%)
 
       # Буферы от мгновенного срабатывания
       trailing_activation_buffer_pct: 0.25

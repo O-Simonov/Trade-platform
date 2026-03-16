@@ -1,47 +1,19 @@
 # -*- coding: utf-8 -*-
-"""
-trade_liquidation_full_ready.py
+from __future__ import annotations
 
-Готовый самодостаточный файл для проекта Trade-platform.
-Назначение:
-- включить корректную материализацию hedge-ног в БД,
-- вести отдельные записи live / live_hedge в position_ledger,
-- поддерживать hedge_links,
-- синхронизировать positions после обновления ledger.
+"""
+Подключаемый модуль-патч для TradeLiquidation.
 
 ВАЖНО:
-Этот файл не является "кусочком diff".
-Это готовый модуль, который можно положить в проект и импортировать.
-Он не требует ручной правки своего содержимого.
+- этот файл нужно сохранять как src/platform/traders/trade_liquidation_full_ready.py
+- в конце src/platform/traders/trade_liquidation.py должно быть:
 
-Подключение:
-1) Скопировать файл в:
-   src/platform/traders/trade_liquidation_full_ready.py
+    from src.platform.traders.trade_liquidation_full_ready import apply_trade_liquidation_full_ready
+    apply_trade_liquidation_full_ready(TradeLiquidation)
 
-2) Добавить ОДНУ строку импорта в запуск:
-   from src.platform.traders import trade_liquidation_full_ready  # noqa: F401
-
-После импорта модуль сам пропатчит TradeLiquidation.
-
-Почему не полная замена старого trade_liquidation.py:
-- исходник вашего полного файла в этой сессии не был предоставлен,
-- поэтому безопаснее дать законченный подключаемый модуль,
-  чем "угадать" и сломать рабочую основную стратегию.
-
-Что исправляет:
-- если на бирже в hedge mode есть противоположная нога, а в БД её нет,
-  создаётся отдельная OPEN запись source='live_hedge'
-- если hedge-нога исчезла на бирже, соответствующая запись live_hedge закрывается
-- создаётся связь в hedge_links
-- после обновления ledger запускается sync в positions / snapshots
-
-Ожидаемый эффект:
-- position_ledger сможет хранить отдельные разнонаправленные ноги
-- positions сможет строиться из ledger уже с учетом hedge mode
-- сопровождение в БД будет не "по одному symbol", а по symbol+side через ledger
+- сам модуль не должен импортировать TradeLiquidation из trade_liquidation.py,
+  иначе возникает circular import.
 """
-
-from __future__ import annotations
 
 import json
 import logging
@@ -81,7 +53,7 @@ def _safe_json_dict(value: Any) -> Dict[str, Any]:
 
 
 def _opp_side(side: str) -> str:
-    side = str(side or "").upper()
+    side = str(side or "").upper().strip()
     if side == "LONG":
         return "SHORT"
     if side == "SHORT":
@@ -125,9 +97,7 @@ def _symbol_id_map(self) -> Dict[str, int]:
     return result
 
 
-
 def _ensure_position_ledger_time_guard(store) -> None:
-    """Install DB-level protections for closed_at/opened_at consistency."""
     trigger_ddl = """
     CREATE OR REPLACE FUNCTION public.trg_position_ledger_guard_closed_at()
     RETURNS trigger
@@ -179,30 +149,6 @@ def _ensure_position_ledger_time_guard(store) -> None:
     except Exception:
         log.exception("[TL][ledger_guard] failed to normalize invalid closed_at rows")
 
-    try:
-        store.exec_ddl(
-            """
-            ALTER TABLE public.position_ledger
-            DROP CONSTRAINT IF EXISTS chk_position_ledger_closed_at_not_before_opened_at;
-
-            ALTER TABLE public.position_ledger
-            ADD CONSTRAINT chk_position_ledger_closed_at_not_before_opened_at
-            CHECK (closed_at IS NULL OR opened_at IS NULL OR closed_at >= opened_at) NOT VALID;
-            """
-        )
-    except Exception:
-        pass
-
-    try:
-        store.exec_ddl(
-            """
-            ALTER TABLE public.position_ledger
-            VALIDATE CONSTRAINT chk_position_ledger_closed_at_not_before_opened_at;
-            """
-        )
-    except Exception:
-        log.exception("[TL][ledger_guard] failed to validate closed_at constraint")
-
 
 def _position_ledger_time_anomalies(store) -> Dict[str, int]:
     try:
@@ -227,35 +173,23 @@ def _position_ledger_time_anomalies(store) -> Dict[str, int]:
                 FROM public.position_ledger
                 """
             )
-
         if row is None:
-            return {
-                "broken_closed_at": 0,
-                "broken_updated_at": 0,
-                "broken_closed_gt_updated": 0,
-            }
-
+            return {"broken_closed_at": 0, "broken_updated_at": 0, "broken_closed_gt_updated": 0}
         if isinstance(row, tuple):
-            broken_closed_at = int((row[0] if len(row) > 0 else 0) or 0)
-            broken_updated_at = int((row[1] if len(row) > 1 else 0) or 0)
-            broken_closed_gt_updated = int((row[2] if len(row) > 2 else 0) or 0)
-        else:
-            broken_closed_at = int(row.get("broken_closed_at") or 0)
-            broken_updated_at = int(row.get("broken_updated_at") or 0)
-            broken_closed_gt_updated = int(row.get("broken_closed_gt_updated") or 0)
-
+            return {
+                "broken_closed_at": int((row[0] if len(row) > 0 else 0) or 0),
+                "broken_updated_at": int((row[1] if len(row) > 1 else 0) or 0),
+                "broken_closed_gt_updated": int((row[2] if len(row) > 2 else 0) or 0),
+            }
         return {
-            "broken_closed_at": broken_closed_at,
-            "broken_updated_at": broken_updated_at,
-            "broken_closed_gt_updated": broken_closed_gt_updated,
+            "broken_closed_at": int(row.get("broken_closed_at") or 0),
+            "broken_updated_at": int(row.get("broken_updated_at") or 0),
+            "broken_closed_gt_updated": int(row.get("broken_closed_gt_updated") or 0),
         }
     except Exception:
         log.exception("[TL][ledger_guard] periodic anomaly check failed")
-        return {
-            "broken_closed_at": 0,
-            "broken_updated_at": 0,
-            "broken_closed_gt_updated": 0,
-        }
+        return {"broken_closed_at": 0, "broken_updated_at": 0, "broken_closed_gt_updated": 0}
+
 
 def _ensure_hedge_links_table(store) -> None:
     ddl = """
@@ -281,7 +215,6 @@ def _ensure_hedge_links_table(store) -> None:
     try:
         store.exec_ddl(ddl)
     except Exception:
-        # best effort
         pass
 
 
@@ -301,10 +234,7 @@ def _insert_live_hedge_ledger_row(
 
     main_meta = _safe_json_dict(main_row.get("raw_meta"))
     hedge_block = main_meta.get("hedge") if isinstance(main_meta.get("hedge"), dict) else {}
-    hedge_pos_uid = str(hedge_block.get("hedge_pos_uid") or "").strip()
-    if not hedge_pos_uid:
-        hedge_pos_uid = str(uuid.uuid4())
-
+    hedge_pos_uid = str(hedge_block.get("hedge_pos_uid") or "").strip() or str(uuid.uuid4())
     opened_at = _utc_now()
 
     raw_meta = {
@@ -320,54 +250,20 @@ def _insert_live_hedge_ledger_row(
     }
 
     columns = [
-        "exchange_id",
-        "account_id",
-        "symbol_id",
-        "pos_uid",
-        "strategy_id",
-        "strategy_name",
-        "side",
-        "status",
-        "opened_at",
-        "entry_price",
-        "avg_price",
-        "qty_opened",
-        "qty_current",
-        "position_value_usdt",
-        "scale_in_count",
-        "updated_at",
-        "source",
+        "exchange_id","account_id","symbol_id","pos_uid","strategy_id","strategy_name","side","status",
+        "opened_at","entry_price","avg_price","qty_opened","qty_current","position_value_usdt",
+        "scale_in_count","updated_at","source",
     ]
     values = [
-        "%(exchange_id)s",
-        "%(account_id)s",
-        "%(symbol_id)s",
-        "%(pos_uid)s",
-        "%(strategy_id)s",
-        "%(strategy_name)s",
-        "%(side)s",
-        "'OPEN'",
-        "%(opened_at)s",
-        "%(entry_price)s",
-        "%(avg_price)s",
-        "%(qty_opened)s",
-        "%(qty_current)s",
-        "%(position_value_usdt)s",
-        "0",
-        "%(updated_at)s",
-        "'live_hedge'",
+        "%(exchange_id)s","%(account_id)s","%(symbol_id)s","%(pos_uid)s","%(strategy_id)s","%(strategy_name)s",
+        "%(side)s","'OPEN'","%(opened_at)s","%(entry_price)s","%(avg_price)s","%(qty_opened)s","%(qty_current)s",
+        "%(position_value_usdt)s","0","%(updated_at)s","'live_hedge'",
     ]
-
     if getattr(self, "_pl_has_raw_meta", False):
         columns.append("raw_meta")
         values.append("%(raw_meta)s::jsonb")
 
-    sql = f"""
-    INSERT INTO public.position_ledger ({", ".join(columns)})
-    VALUES ({", ".join(values)})
-    ON CONFLICT DO NOTHING
-    """
-
+    sql = f"INSERT INTO public.position_ledger ({', '.join(columns)}) VALUES ({', '.join(values)}) ON CONFLICT DO NOTHING"
     params = {
         "exchange_id": int(self.exchange_id),
         "account_id": int(self.account_id),
@@ -385,7 +281,6 @@ def _insert_live_hedge_ledger_row(
         "updated_at": opened_at,
         "raw_meta": json.dumps(raw_meta, ensure_ascii=False),
     }
-
     self.store.execute(sql, params)
 
     if getattr(self, "_pl_has_raw_meta", False):
@@ -423,24 +318,12 @@ def _insert_live_hedge_ledger_row(
         self.store.execute(
             """
             INSERT INTO public.hedge_links (
-                exchange_id,
-                base_account_id,
-                hedge_account_id,
-                symbol_id,
-                base_pos_uid,
-                hedge_pos_uid,
-                hedge_ratio,
-                created_at
+                exchange_id, base_account_id, hedge_account_id, symbol_id,
+                base_pos_uid, hedge_pos_uid, hedge_ratio, created_at
             )
             VALUES (
-                %(exchange_id)s,
-                %(account_id)s,
-                %(account_id)s,
-                %(symbol_id)s,
-                %(base_pos_uid)s,
-                %(hedge_pos_uid)s,
-                %(hedge_ratio)s,
-                NOW()
+                %(exchange_id)s, %(account_id)s, %(account_id)s, %(symbol_id)s,
+                %(base_pos_uid)s, %(hedge_pos_uid)s, %(hedge_ratio)s, NOW()
             )
             ON CONFLICT DO NOTHING
             """,
@@ -458,23 +341,13 @@ def _insert_live_hedge_ledger_row(
 
     log.info(
         "[TL][hedge_ready] created live_hedge row symbol=%s side=%s qty=%.8f base_pos_uid=%s hedge_pos_uid=%s",
-        str(symbol).upper(),
-        str(hedge_side).upper(),
-        float(hedge_qty),
-        str(main_row.get("pos_uid") or ""),
-        str(hedge_pos_uid),
+        str(symbol).upper(), str(hedge_side).upper(), float(hedge_qty),
+        str(main_row.get("pos_uid") or ""), str(hedge_pos_uid),
     )
     return hedge_pos_uid
 
 
-def _close_live_hedge_ledger_row(
-    self,
-    *,
-    hedge_pos_uid: str,
-    symbol: str,
-    hedge_side: str,
-    exit_price: float,
-) -> None:
+def _close_live_hedge_ledger_row(self, *, hedge_pos_uid: str, symbol: str, hedge_side: str, exit_price: float) -> None:
     self.store.execute(
         """
         UPDATE public.position_ledger
@@ -499,29 +372,142 @@ def _close_live_hedge_ledger_row(
     )
     log.info(
         "[TL][hedge_ready] closed live_hedge symbol=%s side=%s hedge_pos_uid=%s exit=%.8f",
-        str(symbol).upper(),
-        str(hedge_side).upper(),
-        str(hedge_pos_uid),
-        float(exit_price or 0.0),
+        str(symbol).upper(), str(hedge_side).upper(), str(hedge_pos_uid), float(exit_price or 0.0),
     )
 
 
+def _promote_live_hedge_to_live_main(
+    self,
+    *,
+    hedge_row: Dict[str, Any],
+    symbol: str,
+    side: str,
+    qty_current: float,
+    entry_price: float,
+    position_value_usdt: float,
+) -> bool:
+    meta = _safe_json_dict(hedge_row.get("raw_meta"))
+    link = meta.get("hedge_link") if isinstance(meta.get("hedge_link"), dict) else {}
+    promoted_meta = dict(meta)
+    promoted_meta["promoted_from_live_hedge"] = {
+        "ts": _utc_now().isoformat(),
+        "old_base_pos_uid": str(link.get("base_pos_uid") or ""),
+        "old_hedge_pos_uid": str(hedge_row.get("pos_uid") or ""),
+        "symbol": str(symbol).upper(),
+        "side": str(side).upper(),
+    }
+    promoted_meta.pop("hedge_link", None)
+    promoted_meta.pop("hedge", None)
+
+    try:
+        params = {
+            "exchange_id": int(self.exchange_id),
+            "account_id": int(self.account_id),
+            "pos_uid": str(hedge_row.get("pos_uid") or ""),
+            "qty_current": float(qty_current),
+            "entry_price": float(entry_price),
+            "avg_price": float(entry_price),
+            "position_value_usdt": float(position_value_usdt),
+            "raw_meta": json.dumps(promoted_meta, ensure_ascii=False),
+        }
+        if getattr(self, "_pl_has_raw_meta", False):
+            self.store.execute(
+                """
+                UPDATE public.position_ledger
+                   SET source = 'live',
+                       qty_current = %(qty_current)s,
+                       qty_opened = CASE
+                           WHEN COALESCE(qty_opened, 0) <= 0 THEN %(qty_current)s
+                           ELSE qty_opened
+                       END,
+                       entry_price = CASE
+                           WHEN COALESCE(%(entry_price)s, 0) > 0 THEN %(entry_price)s
+                           ELSE entry_price
+                       END,
+                       avg_price = CASE
+                           WHEN COALESCE(%(avg_price)s, 0) > 0 THEN %(avg_price)s
+                           ELSE avg_price
+                       END,
+                       position_value_usdt = %(position_value_usdt)s,
+                       raw_meta = %(raw_meta)s::jsonb,
+                       updated_at = NOW()
+                 WHERE exchange_id = %(exchange_id)s
+                   AND account_id = %(account_id)s
+                   AND pos_uid = %(pos_uid)s
+                   AND source = 'live_hedge'
+                   AND status = 'OPEN'
+                """,
+                params,
+            )
+        else:
+            self.store.execute(
+                """
+                UPDATE public.position_ledger
+                   SET source = 'live',
+                       qty_current = %(qty_current)s,
+                       qty_opened = CASE
+                           WHEN COALESCE(qty_opened, 0) <= 0 THEN %(qty_current)s
+                           ELSE qty_opened
+                       END,
+                       entry_price = CASE
+                           WHEN COALESCE(%(entry_price)s, 0) > 0 THEN %(entry_price)s
+                           ELSE entry_price
+                       END,
+                       avg_price = CASE
+                           WHEN COALESCE(%(avg_price)s, 0) > 0 THEN %(avg_price)s
+                           ELSE avg_price
+                       END,
+                       position_value_usdt = %(position_value_usdt)s,
+                       updated_at = NOW()
+                 WHERE exchange_id = %(exchange_id)s
+                   AND account_id = %(account_id)s
+                   AND pos_uid = %(pos_uid)s
+                   AND source = 'live_hedge'
+                   AND status = 'OPEN'
+                """,
+                params,
+            )
+        try:
+            self.store.execute(
+                """
+                DELETE FROM public.hedge_links
+                 WHERE exchange_id = %(exchange_id)s
+                   AND hedge_account_id = %(account_id)s
+                   AND hedge_pos_uid = %(pos_uid)s
+                """,
+                {
+                    "exchange_id": int(self.exchange_id),
+                    "account_id": int(self.account_id),
+                    "pos_uid": str(hedge_row.get("pos_uid") or ""),
+                },
+            )
+        except Exception:
+            pass
+
+        log.info(
+            "[TL][hedge_ready] promoted live_hedge -> live main symbol=%s side=%s pos_uid=%s",
+            str(symbol).upper(),
+            str(side).upper(),
+            str(hedge_row.get("pos_uid") or ""),
+        )
+        return True
+    except Exception:
+        log.exception(
+            "[TL][hedge_ready] failed to promote live_hedge -> live main symbol=%s side=%s pos_uid=%s",
+            str(symbol).upper(),
+            str(side).upper(),
+            str(hedge_row.get("pos_uid") or ""),
+        )
+        return False
+
+
 def _sync_live_main_positions_from_position_risk(self) -> Dict[str, int]:
-    """Materialize orphan main positions that already exist on exchange.
-
-    Recovery works from active ledger rows. If an exchange position exists but
-    there is no OPEN source='live' row, TP/TRL/HEDGE recovery will skip it and
-    leave the position fully unprotected. This sync creates missing live rows
-    for true orphan main positions before recovery runs.
-    """
-
     try:
         position_risk = getattr(self, "_last_position_risk", None)
         if not position_risk:
             position_risk = self._rest_snapshot_get("position_risk") or []
     except Exception:
         position_risk = []
-
     if not isinstance(position_risk, list) or not position_risk:
         return {"checked": 0, "opened": 0, "skipped": 0}
 
@@ -532,13 +518,7 @@ def _sync_live_main_positions_from_position_risk(self) -> Dict[str, int]:
     active_rows = list(
         self.store.query_dict(
             """
-            SELECT
-                symbol_id,
-                symbol,
-                pos_uid,
-                side,
-                source,
-                status
+            SELECT symbol_id, symbol, pos_uid, side, source, status
             FROM public.position_ledger
             WHERE exchange_id = %(exchange_id)s
               AND account_id = %(account_id)s
@@ -565,31 +545,21 @@ def _sync_live_main_positions_from_position_risk(self) -> Dict[str, int]:
             if source == "live":
                 active_live_by_symbol.setdefault(symbol, []).append(row)
 
-    checked = 0
-    opened = 0
-    skipped = 0
+    checked = opened = skipped = 0
 
     for p in position_risk:
         symbol = str((p or {}).get("symbol") or "").upper().strip()
         side = str((p or {}).get("positionSide") or "").upper().strip()
         qty = abs(_safe_float((p or {}).get("positionAmt"), 0.0))
-
         if not symbol or side not in ("LONG", "SHORT") or qty <= 0:
             continue
-
         checked += 1
-
         if (symbol, side) in active_by_symbol_side:
             continue
-
         symbol_id = int(symbol_id_by_symbol.get(symbol) or 0)
         if symbol_id <= 0:
             skipped += 1
             continue
-
-        # If the opposite side already exists as an active main row, then the
-        # current exchange leg is most likely a hedge leg and should be handled
-        # by hedge sync, not materialized as another main row.
         opp_live = active_live_by_symbol.get(symbol, [])
         if any(str(r.get("side") or "").upper().strip() == _opp_side(side) for r in opp_live):
             skipped += 1
@@ -600,7 +570,6 @@ def _sync_live_main_positions_from_position_risk(self) -> Dict[str, int]:
         mark_price = _safe_float((p or {}).get("markPrice"), 0.0)
         notional = abs(_safe_float((p or {}).get("notional"), 0.0))
         pos_uid = f"ORPHAN-{uuid.uuid4()}"
-
         raw_meta = {
             "live_orphan": {
                 "source": "exchange_position_risk",
@@ -615,56 +584,17 @@ def _sync_live_main_positions_from_position_risk(self) -> Dict[str, int]:
         }
 
         columns = [
-            "exchange_id",
-            "account_id",
-            "symbol_id",
-            "symbol",
-            "pos_uid",
-            "strategy_id",
-            "strategy_name",
-            "side",
-            "status",
-            "opened_at",
-            "entry_price",
-            "avg_price",
-            "qty_opened",
-            "qty_current",
-            "position_value_usdt",
-            "scale_in_count",
-            "updated_at",
-            "source",
+            "exchange_id","account_id","symbol_id","symbol","pos_uid","strategy_id","strategy_name","side","status",
+            "opened_at","entry_price","avg_price","qty_opened","qty_current","position_value_usdt","scale_in_count","updated_at","source",
         ]
         values = [
-            "%(exchange_id)s",
-            "%(account_id)s",
-            "%(symbol_id)s",
-            "%(symbol)s",
-            "%(pos_uid)s",
-            "%(strategy_id)s",
-            "%(strategy_name)s",
-            "%(side)s",
-            "'OPEN'",
-            "%(opened_at)s",
-            "%(entry_price)s",
-            "%(avg_price)s",
-            "%(qty_opened)s",
-            "%(qty_current)s",
-            "%(position_value_usdt)s",
-            "0",
-            "%(updated_at)s",
-            "'live'",
+            "%(exchange_id)s","%(account_id)s","%(symbol_id)s","%(symbol)s","%(pos_uid)s","%(strategy_id)s","%(strategy_name)s","%(side)s","'OPEN'",
+            "%(opened_at)s","%(entry_price)s","%(avg_price)s","%(qty_opened)s","%(qty_current)s","%(position_value_usdt)s","0","%(updated_at)s","'live'",
         ]
-
         if getattr(self, "_pl_has_raw_meta", False):
             columns.append("raw_meta")
             values.append("%(raw_meta)s::jsonb")
-
-        sql = f"""
-        INSERT INTO public.position_ledger ({", ".join(columns)})
-        VALUES ({", ".join(values)})
-        ON CONFLICT DO NOTHING
-        """
-
+        sql = f"INSERT INTO public.position_ledger ({', '.join(columns)}) VALUES ({', '.join(values)}) ON CONFLICT DO NOTHING"
         params = {
             "exchange_id": int(self.exchange_id),
             "account_id": int(self.account_id),
@@ -683,7 +613,6 @@ def _sync_live_main_positions_from_position_risk(self) -> Dict[str, int]:
             "updated_at": opened_at,
             "raw_meta": json.dumps(raw_meta, ensure_ascii=False),
         }
-
         try:
             self.store.execute(sql, params)
             active_by_symbol_side[(symbol, side)] = {"symbol": symbol, "side": side, "source": "live", "pos_uid": pos_uid}
@@ -691,36 +620,26 @@ def _sync_live_main_positions_from_position_risk(self) -> Dict[str, int]:
             opened += 1
             log.warning(
                 "[TL][orphan_ready] materialized missing live position symbol=%s side=%s qty=%.8f entry=%.8f pos_uid=%s",
-                symbol,
-                side,
-                float(qty),
-                float(entry_price or mark_price or 0.0),
-                pos_uid,
+                symbol, side, float(qty), float(entry_price or mark_price or 0.0), pos_uid,
             )
         except Exception:
             skipped += 1
-            log.exception(
-                "[TL][orphan_ready] failed to materialize missing live position symbol=%s side=%s",
-                symbol,
-                side,
-            )
+            log.exception("[TL][orphan_ready] failed to materialize missing live position symbol=%s side=%s", symbol, side)
 
     return {"checked": checked, "opened": opened, "skipped": skipped}
 
 
 def _sync_live_hedge_legs_from_position_risk(self) -> Dict[str, int]:
     if not bool(getattr(self.p, "hedge_enabled", False)):
-        return {"checked": 0, "opened": 0, "closed": 0}
-
+        return {"checked": 0, "opened": 0, "closed": 0, "promoted": 0}
     try:
         position_risk = getattr(self, "_last_position_risk", None)
         if not position_risk:
             position_risk = self._rest_snapshot_get("position_risk") or []
     except Exception:
         position_risk = []
-
     if not isinstance(position_risk, list) or not position_risk:
-        return {"checked": 0, "opened": 0, "closed": 0}
+        return {"checked": 0, "opened": 0, "closed": 0, "promoted": 0}
 
     risk_map = _position_risk_map(position_risk)
     symbols_map = self._symbols_map()
@@ -728,17 +647,7 @@ def _sync_live_hedge_legs_from_position_risk(self) -> Dict[str, int]:
     main_rows = list(
         self.store.query_dict(
             """
-            SELECT
-                exchange_id,
-                account_id,
-                symbol_id,
-                symbol,
-                pos_uid,
-                side,
-                qty_current,
-                avg_price,
-                entry_price,
-                raw_meta
+            SELECT exchange_id, account_id, symbol_id, symbol, pos_uid, side, qty_current, avg_price, entry_price, raw_meta
             FROM public.position_ledger
             WHERE exchange_id = %(exchange_id)s
               AND account_id = %(account_id)s
@@ -758,17 +667,7 @@ def _sync_live_hedge_legs_from_position_risk(self) -> Dict[str, int]:
     hedge_rows = list(
         self.store.query_dict(
             """
-            SELECT
-                exchange_id,
-                account_id,
-                symbol_id,
-                symbol,
-                pos_uid,
-                side,
-                qty_current,
-                entry_price,
-                avg_price,
-                raw_meta
+            SELECT exchange_id, account_id, symbol_id, symbol, pos_uid, side, qty_current, entry_price, avg_price, raw_meta
             FROM public.position_ledger
             WHERE exchange_id = %(exchange_id)s
               AND account_id = %(account_id)s
@@ -791,25 +690,20 @@ def _sync_live_hedge_legs_from_position_risk(self) -> Dict[str, int]:
         link = meta.get("hedge_link") if isinstance(meta.get("hedge_link"), dict) else {}
         base_pos_uid = str(link.get("base_pos_uid") or "").strip()
         symbol_id = int(row.get("symbol_id") or 0)
-        side = str(row.get("side") or "").upper()
+        side = str(row.get("side") or "").upper().strip()
         if base_pos_uid and symbol_id > 0 and side:
             hedge_by_base[(symbol_id, base_pos_uid, side)] = row
 
-    checked = 0
-    opened = 0
-    closed = 0
+    checked = opened = closed = promoted = 0
 
     for main_row in main_rows:
         checked += 1
-
         symbol_id = int(main_row.get("symbol_id") or 0)
         if symbol_id <= 0:
             continue
-
         symbol = str(main_row.get("symbol") or symbols_map.get(symbol_id) or "").upper().strip()
         if not symbol:
             continue
-
         main_side = str(main_row.get("side") or "").upper().strip()
         hedge_side = _opp_side(main_side)
         if hedge_side not in ("LONG", "SHORT"):
@@ -873,70 +767,63 @@ def _sync_live_hedge_legs_from_position_risk(self) -> Dict[str, int]:
                 )
                 closed += 1
 
-    live_main_keys = {
-        (int(row.get("symbol_id") or 0), str(row.get("pos_uid") or ""))
-        for row in main_rows
-    }
+    live_main_keys = {(int(row.get("symbol_id") or 0), str(row.get("pos_uid") or "")) for row in main_rows}
 
     for row in hedge_rows:
         meta = _safe_json_dict(row.get("raw_meta"))
         link = meta.get("hedge_link") if isinstance(meta.get("hedge_link"), dict) else {}
         base_pos_uid = str(link.get("base_pos_uid") or "").strip()
         symbol_id = int(row.get("symbol_id") or 0)
-        if symbol_id > 0 and base_pos_uid and (symbol_id, base_pos_uid) not in live_main_keys:
+        symbol = str(row.get("symbol") or symbols_map.get(symbol_id) or "").upper().strip()
+        side = str(row.get("side") or "").upper().strip()
+        if not symbol_id or not base_pos_uid:
+            continue
+        if (symbol_id, base_pos_uid) in live_main_keys:
+            continue
+
+        risk_row = risk_map.get((symbol, side))
+        hedge_amt = abs(_safe_float((risk_row or {}).get("positionAmt"), 0.0))
+        hedge_entry = _safe_float((risk_row or {}).get("entryPrice"), 0.0)
+        hedge_mark = _safe_float((risk_row or {}).get("markPrice"), 0.0)
+        hedge_notional = abs(_safe_float((risk_row or {}).get("notional"), 0.0))
+
+        if hedge_amt > 0:
+            if _promote_live_hedge_to_live_main(
+                self,
+                hedge_row=row,
+                symbol=symbol,
+                side=side,
+                qty_current=float(hedge_amt),
+                entry_price=float(hedge_entry or hedge_mark or _safe_float(row.get("entry_price"), 0.0)),
+                position_value_usdt=float(hedge_notional or (hedge_mark * hedge_amt)),
+            ):
+                promoted += 1
+        else:
             _close_live_hedge_ledger_row(
                 self,
                 hedge_pos_uid=str(row.get("pos_uid") or ""),
-                symbol=str(row.get("symbol") or symbols_map.get(symbol_id) or ""),
-                hedge_side=str(row.get("side") or ""),
-                exit_price=0.0,
+                symbol=symbol,
+                hedge_side=side,
+                exit_price=float(hedge_mark or 0.0),
             )
             closed += 1
 
-    return {"checked": checked, "opened": opened, "closed": closed}
-
-
+    return {"checked": checked, "opened": opened, "closed": closed, "promoted": promoted}
 
 
 def _enforce_add_or_hedge_invariant(self) -> Dict[str, int]:
-    """Ensure each one-sided live main position has either next ADD or HEDGE stage.
-
-    Strategy intent required by the project:
-      - if averaging capacity remains -> pending ADDn must exist
-      - if averaging cap is exhausted -> pending HEDGE opener must exist
-      - if symbol already has both LONG and SHORT live positions, hedge is already opened
-        and no new HEDGE entry should be created here.
-
-    We delegate actual placement/deduplication to the original
-    ``_live_ensure_next_add_order`` method from ``trade_liquidation.py`` because it
-    already knows how to:
-      - refresh ``adds_done`` from DB truth,
-      - place the next ADD,
-      - or, once ``max_adds`` is reached, place ``_HEDGE`` and after-last-add trailing.
-    """
-    if not getattr(self, '_is_live', False):
-        return {'checked': 0, 'acted': 0, 'skipped_two_sided': 0}
-    if not bool(getattr(getattr(self, 'p', object()), 'averaging_enabled', False)):
-        return {'checked': 0, 'acted': 0, 'skipped_two_sided': 0}
-    if int(getattr(self, '_cfg_max_adds')() or 0) <= 0:
-        return {'checked': 0, 'acted': 0, 'skipped_two_sided': 0}
+    if not getattr(self, "_is_live", False):
+        return {"checked": 0, "acted": 0, "skipped_two_sided": 0}
+    if not bool(getattr(getattr(self, "p", object()), "averaging_enabled", False)):
+        return {"checked": 0, "acted": 0, "skipped_two_sided": 0}
+    if int(getattr(self, "_cfg_max_adds")() or 0) <= 0:
+        return {"checked": 0, "acted": 0, "skipped_two_sided": 0}
 
     rows = list(
         self.store.query_dict(
             """
-            SELECT
-                symbol_id,
-                symbol,
-                pos_uid,
-                side,
-                qty_current,
-                avg_price,
-                entry_price,
-                scale_in_count,
-                raw_meta,
-                source,
-                opened_at,
-                updated_at
+            SELECT symbol_id, symbol, pos_uid, side, qty_current, avg_price, entry_price,
+                   scale_in_count, raw_meta, source, opened_at, updated_at
             FROM public.position_ledger
             WHERE exchange_id = %(exchange_id)s
               AND account_id = %(account_id)s
@@ -946,63 +833,55 @@ def _enforce_add_or_hedge_invariant(self) -> Dict[str, int]:
             ORDER BY updated_at DESC
             """,
             {
-                'exchange_id': int(self.exchange_id),
-                'account_id': int(self.account_id),
-                'strategy_id': str(getattr(self, 'STRATEGY_ID', 'trade_liquidation')),
+                "exchange_id": int(self.exchange_id),
+                "account_id": int(self.account_id),
+                "strategy_id": str(getattr(self, "STRATEGY_ID", "trade_liquidation")),
             },
         )
     )
 
     by_symbol: Dict[str, List[Dict[str, Any]]] = {}
     for row in rows:
-        sym = str(row.get('symbol') or '').upper().strip()
-        side = str(row.get('side') or '').upper().strip()
-        if not sym or side not in ('LONG', 'SHORT'):
-            continue
-        by_symbol.setdefault(sym, []).append(row)
+        sym = str(row.get("symbol") or "").upper().strip()
+        side = str(row.get("side") or "").upper().strip()
+        if sym and side in ("LONG", "SHORT"):
+            by_symbol.setdefault(sym, []).append(row)
 
-    checked = 0
-    acted = 0
-    skipped_two_sided = 0
-
+    checked = acted = skipped_two_sided = 0
     for sym, sym_rows in by_symbol.items():
-        live_sides = {str(r.get('side') or '').upper().strip() for r in sym_rows}
-        if 'LONG' in live_sides and 'SHORT' in live_sides:
+        live_sides = {str(r.get("side") or "").upper().strip() for r in sym_rows}
+        if "LONG" in live_sides and "SHORT" in live_sides:
             skipped_two_sided += len(sym_rows)
             continue
-        # One-sided symbol: enforce invariant on the freshest live row only.
         row = sym_rows[0]
         checked += 1
         try:
             if bool(self._live_ensure_next_add_order(pos=row)):
                 acted += 1
         except Exception:
-            log.exception('[TL][add_or_hedge] failed invariant for %s %s pos_uid=%s', sym, str(row.get('side') or ''), str(row.get('pos_uid') or ''))
+            log.exception("[TL][add_or_hedge] failed invariant for %s %s pos_uid=%s", sym, str(row.get("side") or ""), str(row.get("pos_uid") or ""))
 
-    return {'checked': checked, 'acted': acted, 'skipped_two_sided': skipped_two_sided}
+    return {"checked": checked, "acted": acted, "skipped_two_sided": skipped_two_sided}
 
-def apply_trade_liquidation_full_ready() -> None:
-    from src.platform.traders.trade_liquidation import TradeLiquidation
+
+def apply_trade_liquidation_full_ready(TradeLiquidation) -> None:
 
     TradeLiquidation._sync_live_main_positions_from_position_risk = _sync_live_main_positions_from_position_risk  # type: ignore[attr-defined]
     TradeLiquidation._position_ledger_time_anomalies = staticmethod(_position_ledger_time_anomalies)  # type: ignore[attr-defined]
     TradeLiquidation._sync_live_hedge_legs_from_position_risk = _sync_live_hedge_legs_from_position_risk  # type: ignore[attr-defined]
     TradeLiquidation._insert_live_hedge_ledger_row = _insert_live_hedge_ledger_row  # type: ignore[attr-defined]
     TradeLiquidation._close_live_hedge_ledger_row = _close_live_hedge_ledger_row  # type: ignore[attr-defined]
+    TradeLiquidation._promote_live_hedge_to_live_main = _promote_live_hedge_to_live_main  # type: ignore[attr-defined]
 
     original_auto_recovery_brackets = TradeLiquidation._auto_recovery_brackets
 
     def _wrapped_auto_recovery_brackets(self):
-        """Pre-sync exchange reality, then run recovery, then enforce ADD-or-HEDGE invariant."""
         try:
             if self._is_live:
                 _ensure_position_ledger_time_guard(self.store)
                 anomalies_before = _position_ledger_time_anomalies(self.store)
                 main_sync_result = self._sync_live_main_positions_from_position_risk()
-                if bool(getattr(self.p, "hedge_enabled", False)):
-                    hedge_sync_result = self._sync_live_hedge_legs_from_position_risk()
-                else:
-                    hedge_sync_result = {"checked": 0, "opened": 0, "closed": 0}
+                hedge_sync_result = self._sync_live_hedge_legs_from_position_risk() if bool(getattr(self.p, "hedge_enabled", False)) else {"checked": 0, "opened": 0, "closed": 0, "promoted": 0}
                 try:
                     self._sync_positions_tables_from_position_risk()
                 except Exception:
@@ -1013,20 +892,20 @@ def apply_trade_liquidation_full_ready() -> None:
                     self._last_position_ledger_time_anomalies = dict(anomalies_before)
                 except Exception:
                     pass
-                if any(int(anomalies_before.get(k, 0)) > 0 for k in ("broken_closed_at", "broken_updated_at", "broken_closed_gt_updated")):
-                    log.warning("[TL][ledger_guard] anomalies before recovery closed_lt_open=%s updated_lt_open=%s closed_gt_updated=%s", int(anomalies_before.get("broken_closed_at", 0)), int(anomalies_before.get("broken_updated_at", 0)), int(anomalies_before.get("broken_closed_gt_updated", 0)))
         except Exception:
             log.exception("[TL][hedge_ready] pre-recovery hedge sync failed")
+
         result = original_auto_recovery_brackets(self)
+
         try:
-            if self._is_live and bool(getattr(getattr(self, 'p', object()), 'add_or_hedge_invariant_enabled', True)):
+            if self._is_live and bool(getattr(getattr(self, "p", object()), "add_or_hedge_invariant_enabled", True)):
                 inv = _enforce_add_or_hedge_invariant(self)
                 try:
                     self._last_add_or_hedge_invariant = dict(inv)
                 except Exception:
                     pass
         except Exception:
-            log.exception('[TL][add_or_hedge] post-recovery invariant failed')
+            log.exception("[TL][add_or_hedge] post-recovery invariant failed")
         return result
 
     TradeLiquidation._auto_recovery_brackets = _wrapped_auto_recovery_brackets  # type: ignore[assignment]
@@ -1040,22 +919,17 @@ def apply_trade_liquidation_full_ready() -> None:
                 _ensure_position_ledger_time_guard(self.store)
                 anomalies_before = _position_ledger_time_anomalies(self.store)
                 main_sync_result = self._sync_live_main_positions_from_position_risk()
-                if bool(getattr(self.p, "hedge_enabled", False)):
-                    hedge_sync_result = self._sync_live_hedge_legs_from_position_risk()
-                else:
-                    hedge_sync_result = {"checked": 0, "opened": 0, "closed": 0}
+                hedge_sync_result = self._sync_live_hedge_legs_from_position_risk() if bool(getattr(self.p, "hedge_enabled", False)) else {"checked": 0, "opened": 0, "closed": 0, "promoted": 0}
                 try:
                     self._sync_positions_tables_from_position_risk()
                 except Exception:
                     log.exception("[TL][hedge_ready] positions sync failed after hedge sync")
-                inv = {'checked': 0, 'acted': 0, 'skipped_two_sided': 0}
+                inv = {"checked": 0, "acted": 0, "skipped_two_sided": 0}
                 try:
-                    if bool(getattr(getattr(self, 'p', object()), 'add_or_hedge_invariant_enabled', True)):
+                    if bool(getattr(getattr(self, "p", object()), "add_or_hedge_invariant_enabled", True)):
                         inv = _enforce_add_or_hedge_invariant(self)
                 except Exception:
-                    log.exception('[TL][add_or_hedge] post-open_positions invariant failed')
-                if any(int(anomalies_before.get(k, 0)) > 0 for k in ("broken_closed_at", "broken_updated_at", "broken_closed_gt_updated")):
-                    log.warning("[TL][ledger_guard] anomalies before open_positions closed_lt_open=%s updated_lt_open=%s closed_gt_updated=%s", int(anomalies_before.get("broken_closed_at", 0)), int(anomalies_before.get("broken_updated_at", 0)), int(anomalies_before.get("broken_closed_gt_updated", 0)))
+                    log.exception("[TL][add_or_hedge] post-open_positions invariant failed")
                 if isinstance(result, dict):
                     result["orphan_main_sync_checked"] = int(main_sync_result.get("checked", 0))
                     result["orphan_main_sync_opened"] = int(main_sync_result.get("opened", 0))
@@ -1063,19 +937,17 @@ def apply_trade_liquidation_full_ready() -> None:
                     result["hedge_sync_checked"] = int(hedge_sync_result.get("checked", 0))
                     result["hedge_sync_opened"] = int(hedge_sync_result.get("opened", 0))
                     result["hedge_sync_closed"] = int(hedge_sync_result.get("closed", 0))
+                    result["hedge_sync_promoted"] = int(hedge_sync_result.get("promoted", 0))
                     result["ledger_broken_closed_at"] = int(anomalies_before.get("broken_closed_at", 0))
                     result["ledger_broken_updated_at"] = int(anomalies_before.get("broken_updated_at", 0))
                     result["ledger_broken_closed_gt_updated"] = int(anomalies_before.get("broken_closed_gt_updated", 0))
-                    result["add_or_hedge_checked"] = int(inv.get('checked', 0))
-                    result["add_or_hedge_acted"] = int(inv.get('acted', 0))
-                    result["add_or_hedge_skipped_two_sided"] = int(inv.get('skipped_two_sided', 0))
+                    result["add_or_hedge_checked"] = int(inv.get("checked", 0))
+                    result["add_or_hedge_acted"] = int(inv.get("acted", 0))
+                    result["add_or_hedge_skipped_two_sided"] = int(inv.get("skipped_two_sided", 0))
         except Exception:
             log.exception("[TL][hedge_ready] wrapped process_open_positions failed")
         return result
 
     TradeLiquidation._process_open_positions = _wrapped_process_open_positions  # type: ignore[assignment]
-
     log.info("[TL][hedge_ready] full ready module connected")
 
-
-apply_trade_liquidation_full_ready()

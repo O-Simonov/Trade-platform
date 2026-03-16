@@ -7908,7 +7908,7 @@ class TradeLiquidation:
         # NOTE: position_ledger schema can differ between deployments.
         # We only need basic fields + optional raw_meta (for hedge state).
         try:
-            sel = "symbol_id, pos_uid, side, status, qty_current, avg_price, entry_price"
+            sel = "symbol_id, pos_uid, side, status, qty_current, avg_price, entry_price, COALESCE(source,'live') AS source"
             if getattr(self, "_pl_has_raw_meta", False):
                 sel += ", raw_meta"
             led = list(
@@ -7916,7 +7916,7 @@ class TradeLiquidation:
                     f"""
                     SELECT {sel}
                     FROM position_ledger
-                    WHERE exchange_id=%(ex)s AND account_id=%(acc)s AND strategy_id=%(sid)s AND status IN ('OPEN','CLOSED') AND source='live'
+                    WHERE exchange_id=%(ex)s AND account_id=%(acc)s AND strategy_id=%(sid)s AND status IN ('OPEN','CLOSED') AND COALESCE(source,'live') IN ('live','live_hedge')
                     ORDER BY opened_at DESC;
                     """,
                     {"ex": int(self.exchange_id), "acc": int(self.account_id), "sid": str(self.STRATEGY_ID)},
@@ -7927,9 +7927,9 @@ class TradeLiquidation:
             led = list(
                 self.store.query_dict(
                     """
-                    SELECT symbol_id, pos_uid, side, status, qty_current, avg_price, entry_price
+                    SELECT symbol_id, pos_uid, side, status, qty_current, avg_price, entry_price, COALESCE(source,'live') AS source
                     FROM position_ledger
-                    WHERE exchange_id=%(ex)s AND account_id=%(acc)s AND strategy_id=%(sid)s AND status IN ('OPEN','CLOSED') AND source='live'
+                    WHERE exchange_id=%(ex)s AND account_id=%(acc)s AND strategy_id=%(sid)s AND status IN ('OPEN','CLOSED') AND COALESCE(source,'live') IN ('live','live_hedge')
                     ORDER BY opened_at DESC;
                     """,
                     {"ex": int(self.exchange_id), "acc": int(self.account_id), "sid": str(self.STRATEGY_ID)},
@@ -7951,6 +7951,49 @@ class TradeLiquidation:
             if main_side not in {"LONG","SHORT"}:
                 skipped += 1
                 continue
+            src_kind = str(p.get("source") or "live").lower().strip()
+            # IMPORTANT: hedge manager must be driven only by the base/main strategy rows.
+            # OPEN/CLOSED live_hedge rows are auxiliary mirror records for the opposite leg.
+            # If we process them here as if they were independent main positions, the loop starts
+            # managing the hedge-of-a-hedge, which leads to missing or flapping HEDGE_TRL orders
+            # after hedge reopen/recovery (for example ETHUSDT LONG in the user's logs).
+            if src_kind == "live_hedge":
+                # Auxiliary hedge mirror rows must not drive hedge-of-a-hedge logic.
+                # But if such a row is still OPEN while the opposite leg is already
+                # absent on exchange, proactively close the stale mirror here so the
+                # next invariant pass can manage the surviving real leg as the main one.
+                try:
+                    hedge_ps_aux = str(main_side).upper()
+                    hedge_pos_aux = pr_map.get((symbol, hedge_ps_aux))
+                    hedge_amt_aux = 0.0
+                    if hedge_pos_aux:
+                        try:
+                            hedge_amt_aux = abs(float(hedge_pos_aux.get("positionAmt") or 0.0))
+                        except Exception:
+                            hedge_amt_aux = 0.0
+                    if float(hedge_amt_aux or 0.0) <= 0.0 and str(p.get("status") or "OPEN").upper() == "OPEN":
+                        try:
+                            self._close_position_exchange(
+                                p,
+                                exit_price=float(self._get_mark_price(symbol, hedge_ps_aux) or self._get_mark_price(symbol, main_side) or 0.0),
+                                realized_pnl=0.0,
+                                close_time_ms=None,
+                                reason="stale_live_hedge_mirror",
+                                timeframe="hedge_reconcile",
+                            )
+                        except Exception:
+                            log.debug(
+                                "[TL][hedge_ready] failed to auto-close stale live_hedge mirror sym=%s side=%s pos_uid=%s",
+                                symbol,
+                                hedge_ps_aux,
+                                str(p.get("pos_uid") or ""),
+                                exc_info=True,
+                            )
+                except Exception:
+                    pass
+                skipped += 1
+                continue
+
 
             pl_status = str(p.get("status") or "OPEN").upper().strip()
             if pl_status not in {"OPEN", "CLOSED"}:
@@ -8210,6 +8253,38 @@ class TradeLiquidation:
                         hedge_leg_owned = bool(row)
                     except Exception:
                         hedge_leg_owned = False
+
+                    # Fallback: if the explicit hedge_links row is not visible yet (for example,
+                    # immediately after a hedge re-open was detected from exchange state), allow
+                    # the dedicated HEDGE_TRL manager to work when there is any OPEN live_hedge row
+                    # on the same symbol/side for this account. This prevents a reopened hedge leg
+                    # from staying without its own trailing protection just because the link row was
+                    # created later than the exchange position snapshot.
+                    if not hedge_leg_owned:
+                        try:
+                            row_any = self.store.fetch_one(
+                                """
+                                SELECT pl.pos_uid
+                                FROM position_ledger pl
+                                WHERE pl.exchange_id = %s
+                                  AND pl.account_id = %s
+                                  AND pl.symbol_id = %s
+                                  AND pl.side = %s
+                                  AND pl.status = 'OPEN'
+                                  AND COALESCE(pl.source, 'live') = 'live_hedge'
+                                ORDER BY pl.updated_at DESC NULLS LAST, pl.opened_at DESC NULLS LAST
+                                LIMIT 1
+                                """,
+                                (
+                                    int(self.exchange_id),
+                                    int(self.account_id),
+                                    int(symbol_id),
+                                    str(hedge_ps),
+                                ),
+                            )
+                            hedge_leg_owned = bool(row_any)
+                        except Exception:
+                            pass
 
                     # Guard: only manage HEDGE_TRL when hedge position is really open on exchange
                     # and we have a live_hedge row linked to this exact base position.
@@ -9470,7 +9545,38 @@ class TradeLiquidation:
             # But if hedge_enabled is True, we actively manage hedge open/close here.
             if bool(getattr(self.p, "hedge_enabled", False)):
                 hs = self._live_hedge_manage()
-                return {"checked": int(hs.get("checked", 0)), "closed": int(hs.get("closed", 0)), "hedge": hs}
+
+                # After hedge management the state can change within the same cycle:
+                #   - an old hedge leg can be closed,
+                #   - a stale live_hedge mirror row can be reconciled/removed,
+                #   - the surviving leg can effectively become the new main leg.
+                # In those situations we must immediately re-check the invariant for
+                # every still-open main position: there must be either the next ADDn
+                # order (when averaging is still available) or the after-last-add hedge.
+                # Without this second pass a symbol can stay one or more cycles with
+                # only TP/TRL and without ADD/HEDGE protection (the user's ETH case).
+                post_invariant = 0
+                if bool(getattr(self.p, "averaging_enabled", False)) and self._cfg_max_adds() > 0:
+                    try:
+                        open_positions = self._get_open_positions()
+                        for p in open_positions or []:
+                            try:
+                                if self._live_ensure_next_add_order(pos=p):
+                                    post_invariant += 1
+                            except Exception:
+                                log.debug(
+                                    "[trade_liquidation][LIVE][POST_HEDGE][AVG] ensure_next_add failed pos_uid=%s sym=%s",
+                                    str((p or {}).get("pos_uid") or ""),
+                                    str((p or {}).get("symbol") or (p or {}).get("symbol_id") or ""),
+                                    exc_info=True,
+                                )
+                    except Exception:
+                        log.debug("[trade_liquidation][LIVE][POST_HEDGE] invariant refresh failed", exc_info=True)
+
+                out = {"checked": int(hs.get("checked", 0)), "closed": int(hs.get("closed", 0)), "hedge": hs}
+                if post_invariant:
+                    out["post_invariant"] = int(post_invariant)
+                return out
             return {"checked": 0, "closed": 0}
 
         positions = self._get_open_positions()
@@ -11242,3 +11348,13 @@ try:
     TradeLiquidation._expire_old_new_signals = _tl_expire_old_new_signals
 except Exception:
     pass
+
+# Connect external full-ready patch module without circular import.
+try:
+    from src.platform.traders.trade_liquidation_full_ready import apply_trade_liquidation_full_ready
+    apply_trade_liquidation_full_ready(TradeLiquidation)
+except Exception:
+    try:
+        log.exception("[TL] failed to connect trade_liquidation_full_ready patch")
+    except Exception:
+        pass

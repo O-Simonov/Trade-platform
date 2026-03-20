@@ -353,6 +353,10 @@ class TradeLiquidationParams:
     hedge_level_tolerance_pct: float = 0.10  # tolerance around computed level for closing hedge
     hedge_stop_loss_pct: float = 0.0  # 0=OFF. % from hedge entry (SHORT: entry*(1+pct), LONG: entry*(1-pct))
     hedge_stop_loss_working_type: Optional[str] = None  # override workingType for hedge SL (defaults to hedge_trailing_working_type/working_type)
+    hedge_take_profit_enabled: bool = True
+    hedge_take_profit_pct: float = 0.0  # 0=OFF. % from hedge entry (SHORT: entry*(1-pct), LONG: entry*(1+pct))
+    hedge_take_profit_working_type: Optional[str] = None
+    hedge_trailing_reissue_on_avg_entry_change: bool = True
 
     # Move hedge stop-loss to break-even (profit-lock) after activation move
     hedge_stop_loss_be_pct: float = 0.0  # 0=OFF. % from hedge entry to place BE stop (SHORT: entry*(1-pct), LONG: entry*(1+pct))
@@ -1554,49 +1558,113 @@ class TradeLiquidation:
     def _has_open_position_live(self, symbol: str, side: str) -> bool:
         return self._get_position_amt_live(symbol, side) > 0.0
 
-    def _cancel_algo_by_client_id_safe(self, symbol: str, client_algo_id: str) -> None:
-        """Best-effort cancel of a Binance algo/conditional order by clientAlgoId."""
-        if not getattr(self, "_is_live", False) or getattr(self, "_binance", None) is None:
-            return
+    def _refresh_open_algo_snapshot_for_symbol(self, symbol: str) -> List[Dict[str, Any]]:
+        """Refresh openAlgoOrders snapshot for one symbol and merge it into the cached global snapshot."""
         sym = (symbol or "").upper().strip()
-        cid = (client_algo_id or "").strip()
-        if not sym or not cid:
-            return
-
-        # Clear local marker immediately so the next cycle can re-create safely if needed.
+        if not sym or getattr(self, "_binance", None) is None:
+            return []
         try:
-            self._clear_local_algo_open(cid)
+            fresh = self._binance.open_algo_orders(symbol=sym)
+        except Exception:
+            return []
+        if not isinstance(fresh, list):
+            fresh = []
+        try:
+            with self._rest_snapshot_lock:
+                prev = self._rest_snapshot.get("open_algo_orders_all")
+                merged = []
+                if isinstance(prev, list):
+                    for row in prev:
+                        if not isinstance(row, dict):
+                            continue
+                        if str(row.get("symbol") or "").upper().strip() == sym:
+                            continue
+                        merged.append(row)
+                merged.extend(fresh)
+                self._rest_snapshot["open_algo_orders_all"] = merged
         except Exception:
             pass
+        return fresh
 
-        # IMPORTANT: Avoid spamming cancel requests that will 400 if the order is already gone.
-        # We have an openAlgoOrders snapshot each cycle; if the clientAlgoId is not present there,
-        # skip the REST cancel call altogether.
+    def _cancel_algo_by_client_id_safe(
+        self,
+        symbol: str,
+        client_algo_id: str,
+        algo_id: Optional[str] = None,
+        *,
+        verify: bool = True,
+    ) -> bool:
+        """Best-effort cancel of a Binance algo/conditional order.
+
+        Returns True when the order is confirmed absent from openAlgoOrders for the symbol
+        (or was already absent), otherwise False.
+        """
+        if not getattr(self, "_is_live", False) or getattr(self, "_binance", None) is None:
+            return False
+        sym = (symbol or "").upper().strip()
+        cid = (client_algo_id or "").strip()
+        aid = str(algo_id or "").strip()
+        if not sym or (not cid and not aid):
+            return False
+
+        if cid:
+            try:
+                self._clear_local_algo_open(cid)
+            except Exception:
+                pass
+
+        found_in_snapshot = False
         try:
             snap = self._rest_snapshot_get("open_algo_orders_all")
             if isinstance(snap, list) and snap:
-                found = False
                 for o in snap:
                     if not isinstance(o, dict):
                         continue
                     if str(o.get("symbol") or "").upper().strip() != sym:
                         continue
-                    if str(o.get("clientAlgoId") or "").strip() == cid:
-                        found = True
+                    if cid and str(o.get("clientAlgoId") or "").strip() == cid:
+                        found_in_snapshot = True
+                        if not aid:
+                            aid = str(o.get("algoId") or "").strip()
                         break
-                if not found:
-                    return
+                    if aid and str(o.get("algoId") or "").strip() == aid:
+                        found_in_snapshot = True
+                        break
         except Exception:
-            # If snapshot isn't available, fall back to best-effort cancel.
             pass
-        try:
-            self._binance.cancel_algo_order(symbol=sym, clientAlgoId=cid)
-        except Exception:
-            # Some wrappers use different param names or raise if not found; ignore.
-            try:
-                self._binance.cancel_algo_order(symbol=sym, origClientOrderId=cid)  # type: ignore
-            except Exception:
-                pass
+
+        if not found_in_snapshot and not verify:
+            return True
+
+        if found_in_snapshot or aid or cid:
+            cancel_attempts = []
+            if aid and cid:
+                cancel_attempts.append({"algoId": aid, "clientAlgoId": cid})
+            if aid:
+                cancel_attempts.append({"algoId": aid})
+            if cid:
+                cancel_attempts.append({"clientAlgoId": cid})
+            if cid:
+                cancel_attempts.append({"origClientOrderId": cid})
+            for kwargs in cancel_attempts:
+                try:
+                    self._binance.cancel_algo_order(symbol=sym, **kwargs)  # type: ignore[arg-type]
+                    break
+                except Exception:
+                    continue
+
+        if not verify:
+            return True
+
+        fresh = self._refresh_open_algo_snapshot_for_symbol(sym)
+        for row in fresh or []:
+            if not isinstance(row, dict):
+                continue
+            if cid and str(row.get("clientAlgoId") or "").strip() == cid:
+                return False
+            if aid and str(row.get("algoId") or "").strip() == aid:
+                return False
+        return True
 
     def _get_local_algo_open_cache(self) -> Dict[str, Dict[str, Any]]:
         cache = getattr(self, "_algo_local_open", None)

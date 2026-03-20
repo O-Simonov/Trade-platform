@@ -18,6 +18,571 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+
+import time
+
+
+
+
+def _round_price_to_tick(price: float, tick: float, *, mode: str = "nearest") -> float:
+    if tick <= 0:
+        return float(price)
+    n = float(price) / float(tick)
+    if mode == 'up':
+        import math
+        return float(math.ceil(n) * tick)
+    if mode == 'down':
+        import math
+        return float(math.floor(n) * tick)
+    import math
+    return float(round(n) * tick)
+
+
+def _ensure_tp_trail_side(level: float, entry: float, tick: float, pos_side: str, *, kind: str) -> float:
+    level = float(level)
+    entry = float(entry)
+    tick = abs(float(tick or 0.0))
+    side = str(pos_side or '').upper()
+    if entry <= 0:
+        return level
+    if tick <= 0:
+        tick = max(abs(entry) * 1e-8, 1e-8)
+    if side == 'LONG':
+        if level <= entry:
+            return entry + tick
+        return level
+    if side == 'SHORT':
+        if level >= entry:
+            return entry - tick
+        return level
+    return level
+
+
+def _coid_token_local(pos_uid: str, n: int = 20) -> str:
+    import hashlib
+    raw = str(pos_uid or '').encode('utf-8', errors='ignore')
+    return hashlib.sha1(raw).hexdigest()[: max(4, int(n))]
+
+def _algo_trigger_price(row: Optional[Dict[str, Any]]) -> float:
+    if not isinstance(row, dict):
+        return 0.0
+    for key in ("triggerPrice", "stopPrice", "activatePrice", "activationPrice"):
+        try:
+            val = float(row.get(key) or 0.0)
+        except Exception:
+            val = 0.0
+        if val > 0.0:
+            return val
+    return 0.0
+
+
+def _algo_quantity(row: Optional[Dict[str, Any]]) -> float:
+    if not isinstance(row, dict):
+        return 0.0
+    for key in ("origQty", "quantity", "qty"):
+        try:
+            val = abs(float(row.get(key) or 0.0))
+        except Exception:
+            val = 0.0
+        if val > 0.0:
+            return val
+    return 0.0
+
+
+def _reissue_tolerance(self, want_price: float, tick: float) -> float:
+    try:
+        avg_eps_pct = float(getattr(self.p, "avg_eps_pct", 0.02) or 0.02)
+    except Exception:
+        avg_eps_pct = 0.02
+    try:
+        price_eps_ticks = int(getattr(self.p, "price_eps_ticks", 2) or 2)
+    except Exception:
+        price_eps_ticks = 2
+    return max(abs(float(want_price or 0.0)) * (avg_eps_pct / 100.0), abs(float(tick or 0.0)) * float(price_eps_ticks), 1e-12)
+
+
+def _main_order_ids(self, pos_uid: str) -> Dict[str, str]:
+    prefix = str(getattr(self.p, "client_order_id_prefix", "TL") or "TL").strip() or "TL"
+    tok = _coid_token_local(pos_uid, n=20)
+    return {
+        "tp": f"{prefix}_{tok}_TP",
+        "trl": f"{prefix}_{tok}_TRL",
+        "hedge_tp": f"{prefix}_{tok}_HEDGE_TP",
+        "hedge_trl": f"{prefix}_{tok}_HEDGE_TRL",
+    }
+
+
+def _find_algo_any(self, symbol: str, cid: str, *, suffix: str, position_side: str, order_type: str, side: str, close_position: Optional[bool] = None):
+    row = None
+    try:
+        row = self._find_known_algo_order_by_client_id(symbol, cid)
+    except Exception:
+        row = None
+    if row is None:
+        try:
+            row = self._find_semantic_open_algo(
+                symbol,
+                client_suffix=suffix,
+                position_side=position_side,
+                order_type=order_type,
+                side=side,
+                close_position=close_position,
+            )
+        except Exception:
+            row = None
+    return row
+
+
+def _place_main_tp(self, *, symbol: str, side: str, close_side: str, cid_tp: str, tp_price: float) -> None:
+    resp = self._binance.new_order(
+        symbol=symbol,
+        side=close_side,
+        type="TAKE_PROFIT_MARKET",
+        stopPrice=float(tp_price),
+        closePosition=True,
+        workingType=str(getattr(self.p, "working_type", "MARK_PRICE") or "MARK_PRICE"),
+        newClientOrderId=cid_tp,
+        positionSide=str(side).upper(),
+    )
+    try:
+        self._upsert_algo_order_shadow(resp, pos_uid=None, strategy_id=self.STRATEGY_ID)
+    except Exception:
+        pass
+    try:
+        self._mark_local_algo_open(
+            cid_tp,
+            symbol=symbol,
+            position_side=str(side).upper(),
+            order_type="TAKE_PROFIT_MARKET",
+            side=close_side,
+            trigger_price=float(tp_price),
+            close_position=True,
+        )
+    except Exception:
+        pass
+
+
+def _place_main_trailing(self, *, symbol: str, side: str, close_side: str, cid_trl: str, qty: float, activation: float) -> None:
+    resp = self._binance.new_order(
+        symbol=symbol,
+        side=close_side,
+        type="TRAILING_STOP_MARKET",
+        quantity=float(qty),
+        activationPrice=float(activation),
+        callbackRate=float(getattr(self.p, "trailing_trail_pct", 0.6) or 0.6),
+        workingType=str(getattr(self.p, "working_type", "MARK_PRICE") or "MARK_PRICE"),
+        newClientOrderId=cid_trl,
+        positionSide=str(side).upper(),
+    )
+    try:
+        self._upsert_algo_order_shadow(resp, pos_uid=None, strategy_id=self.STRATEGY_ID)
+    except Exception:
+        pass
+    try:
+        self._mark_local_algo_open(
+            cid_trl,
+            symbol=symbol,
+            position_side=str(side).upper(),
+            order_type="TRAILING_STOP_MARKET",
+            side=close_side,
+            quantity=float(qty),
+            trigger_price=float(activation),
+            close_position=False,
+        )
+    except Exception:
+        pass
+
+
+def _hedge_order_spec(self, *, symbol: str, hedge_side: str, hedge_entry: float, hedge_qty: float, pos_uid: str, mark: float) -> Optional[Dict[str, Any]]:
+    if hedge_entry <= 0 or hedge_qty <= 0:
+        return None
+    ids = _main_order_ids(self, pos_uid)
+    hedge_side = str(hedge_side or '').upper()
+    close_side = 'BUY' if hedge_side == 'SHORT' else 'SELL'
+    try:
+        tick = float(self._price_tick_for_symbol(symbol) or 0.0)
+    except Exception:
+        tick = 0.0
+    try:
+        tp_pct = float(getattr(self.p, 'hedge_take_profit_pct', 0.0) or 0.0)
+    except Exception:
+        tp_pct = 0.0
+    try:
+        act_pct = float(getattr(self.p, 'hedge_trailing_activation_pct', 1.5) or 1.5)
+    except Exception:
+        act_pct = 1.5
+    try:
+        buf_pct = float(getattr(self.p, 'hedge_trailing_activation_buffer_pct', 0.25) or 0.25)
+    except Exception:
+        buf_pct = 0.25
+    if hedge_side == 'SHORT':
+        tp_price = hedge_entry * (1.0 - tp_pct / 100.0) if tp_pct > 0 else 0.0
+        activation = hedge_entry * (1.0 - act_pct / 100.0)
+        if mark > 0 and tick > 0:
+            max_act = mark * (1.0 - buf_pct / 100.0)
+            if activation >= max_act:
+                activation = self._safe_price_below_mark(activation, mark, tick, buf_pct)
+    else:
+        tp_price = hedge_entry * (1.0 + tp_pct / 100.0) if tp_pct > 0 else 0.0
+        activation = hedge_entry * (1.0 + act_pct / 100.0)
+        if mark > 0 and tick > 0:
+            min_act = mark * (1.0 + buf_pct / 100.0)
+            if activation <= min_act:
+                activation = self._safe_price_above_mark(activation, mark, tick, buf_pct)
+    if tick > 0:
+        if tp_price > 0:
+            tp_price = float(_ensure_tp_trail_side(
+                _round_price_to_tick(tp_price, tick, mode=('down' if hedge_side == 'SHORT' else 'up')),
+                hedge_entry,
+                tick,
+                hedge_side,
+                kind='hedge_tp',
+            ))
+        activation = float(_ensure_tp_trail_side(
+            _round_price_to_tick(activation, tick, mode=('down' if hedge_side == 'SHORT' else 'up')),
+            hedge_entry,
+            tick,
+            hedge_side,
+            kind='hedge_trail_activate',
+        ))
+    return {
+        'cid_tp': ids['hedge_tp'],
+        'cid_trl': ids['hedge_trl'],
+        'close_side': close_side,
+        'tp_price': float(tp_price or 0.0),
+        'activation': float(activation or 0.0),
+        'qty': float(hedge_qty),
+        'tick': float(tick or 0.0),
+    }
+
+
+def _ensure_live_main_tp_trailing(self, pos: Dict[str, Any], avg_price: float) -> bool:
+    if not getattr(self, '_is_live', False) or getattr(self, '_binance', None) is None:
+        return False
+    symbol = str(pos.get('symbol') or '').upper().strip()
+    side = str(pos.get('side') or '').upper().strip()
+    pos_uid = str(pos.get('pos_uid') or '').strip()
+    if not symbol or side not in ('LONG', 'SHORT') or not pos_uid or avg_price <= 0:
+        return False
+    close_side = 'SELL' if side == 'LONG' else 'BUY'
+    ids = _main_order_ids(self, pos_uid)
+    try:
+        tick = float(self._price_tick_for_symbol(symbol) or 0.0)
+    except Exception:
+        tick = 0.0
+    mark = float(self._get_mark_price_live(symbol, side) or 0.0)
+    tp_pct = float(getattr(self.p, 'take_profit_pct', 0.0) or 0.0)
+    if side == 'LONG':
+        tp_price = avg_price * (1.0 + tp_pct / 100.0)
+        activation = avg_price * (1.0 + float(getattr(self.p, 'trailing_activation_pct', 0.0) or 0.0) / 100.0)
+        if mark > 0 and tick > 0:
+            activation = self._safe_price_above_mark(activation, mark, tick, float(getattr(self.p, 'trailing_activation_buffer_pct', 0.2) or 0.2))
+    else:
+        tp_price = avg_price * (1.0 - tp_pct / 100.0)
+        activation = avg_price * (1.0 - float(getattr(self.p, 'trailing_activation_pct', 0.0) or 0.0) / 100.0)
+        if mark > 0 and tick > 0:
+            activation = self._safe_price_below_mark(activation, mark, tick, float(getattr(self.p, 'trailing_activation_buffer_pct', 0.2) or 0.2))
+    if tick > 0:
+        tp_price = float(_ensure_tp_trail_side(_round_price_to_tick(tp_price, tick, mode=('up' if side == 'LONG' else 'down')), avg_price, tick, side, kind='tp'))
+        activation = float(_ensure_tp_trail_side(_round_price_to_tick(activation, tick, mode=('up' if side == 'LONG' else 'down')), avg_price, tick, side, kind='trail_activate'))
+    changed = False
+    tp_existing = _find_algo_any(self, symbol, ids['tp'], suffix='_TP', position_side=side, order_type='TAKE_PROFIT_MARKET', side=close_side, close_position=True)
+    tp_need = True
+    if isinstance(tp_existing, dict):
+        cur_tp = _algo_trigger_price(tp_existing)
+        tp_need = not (cur_tp > 0 and abs(cur_tp - tp_price) <= _reissue_tolerance(self, tp_price, tick))
+        if tp_need:
+            self._cancel_algo_by_client_id_safe(symbol, str(tp_existing.get('clientAlgoId') or ids['tp']))
+            changed = True
+    if tp_need:
+        _place_main_tp(self, symbol=symbol, side=side, close_side=close_side, cid_tp=ids['tp'], tp_price=tp_price)
+        changed = True
+    if bool(getattr(self.p, 'trailing_enabled', False)):
+        qty = float(self._get_position_amt_live(symbol, side) or abs(float(pos.get('qty_current') or 0.0)) or 0.0)
+        trl_existing = _find_algo_any(self, symbol, ids['trl'], suffix='_TRL', position_side=side, order_type='TRAILING_STOP_MARKET', side=close_side)
+        trl_need = qty > 0
+        if isinstance(trl_existing, dict) and qty > 0:
+            cur_act = _algo_trigger_price(trl_existing)
+            cur_qty = _algo_quantity(trl_existing)
+            qty_tol = max(float(getattr(self.p, 'hedge_trailing_qty_tolerance', 1e-8) or 1e-8), 1e-12)
+            trl_need = not (
+                cur_act > 0 and abs(cur_act - activation) <= _reissue_tolerance(self, activation, tick)
+                and cur_qty > 0 and abs(cur_qty - qty) <= qty_tol
+            )
+            if trl_need:
+                self._cancel_algo_by_client_id_safe(symbol, str(trl_existing.get('clientAlgoId') or ids['trl']))
+                changed = True
+        if qty > 0 and trl_need:
+            _place_main_trailing(self, symbol=symbol, side=side, close_side=close_side, cid_trl=ids['trl'], qty=qty, activation=activation)
+            changed = True
+    return changed
+
+
+def _live_reanchor_tp_and_trailing_after_avg_change(self, pos: Dict[str, Any], avg_price: float) -> bool:
+    try:
+        return bool(_ensure_live_main_tp_trailing(self, pos, float(avg_price or 0.0)))
+    except Exception:
+        log.exception('[TL][REANCHOR] failed for pos_uid=%s', str((pos or {}).get('pos_uid') or ''))
+        return False
+
+
+def _ensure_live_hedge_tp_trailing(self, *, base_pos: Dict[str, Any], symbol: str, hedge_side: str, hedge_entry: float, hedge_qty: float) -> bool:
+    if not getattr(self, '_is_live', False) or getattr(self, '_binance', None) is None:
+        return False
+    pos_uid = str(base_pos.get('pos_uid') or '').strip()
+    if not pos_uid:
+        return False
+    mark = float(self._get_mark_price_live(symbol, hedge_side) or 0.0)
+    spec = _hedge_order_spec(self, symbol=symbol, hedge_side=hedge_side, hedge_entry=float(hedge_entry), hedge_qty=float(hedge_qty), pos_uid=pos_uid, mark=mark)
+    if not spec:
+        return False
+    changed = False
+    close_side = str(spec['close_side'])
+    tick = float(spec['tick'])
+    qty_tol = max(float(getattr(self.p, 'hedge_trailing_qty_tolerance', 1e-8) or 1e-8), 1e-12)
+    if float(spec['tp_price']) > 0 and bool(getattr(self.p, 'hedge_take_profit_enabled', True)):
+        tp_existing = _find_algo_any(self, symbol, spec['cid_tp'], suffix='_HEDGE_TP', position_side=hedge_side, order_type='TAKE_PROFIT_MARKET', side=close_side)
+        tp_need = True
+        if isinstance(tp_existing, dict):
+            cur_tp = _algo_trigger_price(tp_existing)
+            cur_qty = _algo_quantity(tp_existing)
+            tp_match = cur_tp > 0 and abs(cur_tp - float(spec['tp_price'])) <= _reissue_tolerance(self, float(spec['tp_price']), tick)
+            qty_match = cur_qty > 0 and abs(cur_qty - float(spec['qty'])) <= qty_tol
+            tp_need = not (tp_match and qty_match)
+            if tp_need:
+                self._cancel_algo_by_client_id_safe(symbol, str(tp_existing.get('clientAlgoId') or spec['cid_tp']))
+                changed = True
+        if tp_need:
+            resp = self._binance.new_order(
+                symbol=symbol,
+                side=close_side,
+                type='TAKE_PROFIT_MARKET',
+                stopPrice=float(spec['tp_price']),
+                quantity=float(spec['qty']),
+                workingType=str(getattr(self.p, 'hedge_take_profit_working_type', getattr(self.p, 'hedge_trailing_working_type', 'MARK_PRICE')) or 'MARK_PRICE'),
+                newClientOrderId=str(spec['cid_tp']),
+                positionSide=str(hedge_side).upper(),
+            )
+            try:
+                self._upsert_algo_order_shadow(resp, pos_uid=pos_uid, strategy_id=self.STRATEGY_ID)
+            except Exception:
+                pass
+            try:
+                self._mark_local_algo_open(str(spec['cid_tp']), symbol=symbol, position_side=str(hedge_side).upper(), order_type='TAKE_PROFIT_MARKET', side=close_side, quantity=float(spec['qty']), trigger_price=float(spec['tp_price']), close_position=False, pos_uid=pos_uid)
+            except Exception:
+                pass
+            changed = True
+    if bool(getattr(self.p, 'hedge_trailing_enabled', False)) and float(spec['activation']) > 0 and float(spec['qty']) > 0:
+        trl_existing = _find_algo_any(self, symbol, spec['cid_trl'], suffix='_HEDGE_TRL', position_side=hedge_side, order_type='TRAILING_STOP_MARKET', side=close_side)
+        trl_need = True
+        reissue_on_avg = bool(getattr(self.p, 'hedge_trailing_reissue_on_avg_entry_change', True))
+        if isinstance(trl_existing, dict):
+            cur_act = _algo_trigger_price(trl_existing)
+            cur_qty = _algo_quantity(trl_existing)
+            act_match = cur_act > 0 and abs(cur_act - float(spec['activation'])) <= _reissue_tolerance(self, float(spec['activation']), tick)
+            qty_match = cur_qty > 0 and abs(cur_qty - float(spec['qty'])) <= qty_tol
+            trl_need = not ((act_match if reissue_on_avg else True) and qty_match)
+            if trl_need:
+                self._cancel_algo_by_client_id_safe(symbol, str(trl_existing.get('clientAlgoId') or spec['cid_trl']))
+                changed = True
+        if trl_need:
+            resp = self._binance.new_order(
+                symbol=symbol,
+                side=close_side,
+                type='TRAILING_STOP_MARKET',
+                quantity=float(spec['qty']),
+                positionSide=str(hedge_side).upper(),
+                newClientOrderId=str(spec['cid_trl']),
+                activationPrice=float(spec['activation']),
+                callbackRate=float(getattr(self.p, 'hedge_trailing_trail_pct', 0.5) or 0.5),
+                workingType=str(getattr(self.p, 'hedge_trailing_working_type', 'MARK_PRICE') or 'MARK_PRICE'),
+            )
+            try:
+                self._upsert_algo_order_shadow(resp, pos_uid=pos_uid, strategy_id=self.STRATEGY_ID)
+            except Exception:
+                pass
+            try:
+                self._mark_local_algo_open(str(spec['cid_trl']), symbol=symbol, position_side=str(hedge_side).upper(), order_type='TRAILING_STOP_MARKET', side=close_side, quantity=float(spec['qty']), trigger_price=float(spec['activation']), close_position=False, pos_uid=pos_uid)
+            except Exception:
+                pass
+            changed = True
+    return changed
+
+
+def _maintain_live_hedge_exit_orders(self) -> Dict[str, int]:
+    stats = {'checked': 0, 'changed': 0, 'canceled': 0}
+    if not getattr(self, '_is_live', False) or not bool(getattr(self.p, 'hedge_enabled', False)):
+        return stats
+
+    rows = list(self.store.query_dict(
+        """
+        SELECT symbol_id, symbol, pos_uid, side, qty_current, avg_price, entry_price, status, raw_meta, updated_at
+        FROM public.position_ledger
+        WHERE exchange_id = %(exchange_id)s
+          AND account_id = %(account_id)s
+          AND strategy_id = %(strategy_id)s
+          AND COALESCE(source, 'live') = 'live'
+          AND status = 'OPEN'
+        ORDER BY updated_at DESC NULLS LAST, opened_at DESC NULLS LAST
+        """,
+        {
+            'exchange_id': int(self.exchange_id),
+            'account_id': int(self.account_id),
+            'strategy_id': str(getattr(self, 'STRATEGY_ID', 'trade_liquidation')),
+        },
+    ))
+
+    pr_map = _position_risk_map(list(self._rest_snapshot_get('position_risk') or []))
+    open_algos = list(self._rest_snapshot_get('open_algo_orders_all') or [])
+
+    desired_by_pair: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    seen_pairs: set[Tuple[str, str]] = set()
+
+    for row in rows:
+        symbol = str(row.get('symbol') or '').upper().strip()
+        side = str(row.get('side') or '').upper().strip()
+        pos_uid = str(row.get('pos_uid') or '').strip()
+        if not symbol or side not in ('LONG', 'SHORT') or not pos_uid:
+            continue
+
+        pair = (symbol, side)
+        if pair in seen_pairs:
+            continue
+        seen_pairs.add(pair)
+
+        main_pos = pr_map.get((symbol, side))
+        if not isinstance(main_pos, dict):
+            continue
+        try:
+            main_qty = abs(float(main_pos.get('positionAmt') or 0.0))
+        except Exception:
+            main_qty = 0.0
+        if main_qty <= 0:
+            continue
+
+        hedge_side = _opp_side(side)
+        hedge_pos = pr_map.get((symbol, hedge_side))
+        if not isinstance(hedge_pos, dict):
+            continue
+        try:
+            hedge_qty = abs(float(hedge_pos.get('positionAmt') or 0.0))
+        except Exception:
+            hedge_qty = 0.0
+        try:
+            hedge_entry = abs(float(hedge_pos.get('entryPrice') or hedge_pos.get('avgEntryPrice') or 0.0))
+        except Exception:
+            hedge_entry = 0.0
+        if hedge_qty <= 0 or hedge_entry <= 0:
+            continue
+
+        desired_by_pair[(symbol, hedge_side)] = {
+            'row': row,
+            'hedge_entry': float(hedge_entry),
+            'hedge_qty': float(hedge_qty),
+            'spec': _hedge_order_spec(
+                self,
+                symbol=symbol,
+                hedge_side=hedge_side,
+                hedge_entry=float(hedge_entry),
+                hedge_qty=float(hedge_qty),
+                pos_uid=pos_uid,
+                mark=float(self._get_mark_price_live(symbol, hedge_side) or 0.0),
+            ),
+        }
+
+    # Cancel stale or duplicate hedge exit algos before ensuring desired ones.
+    for algo in open_algos:
+        if not isinstance(algo, dict):
+            continue
+        symbol = str(algo.get('symbol') or '').upper().strip()
+        cid = str(algo.get('clientAlgoId') or '').strip()
+        if not symbol or not cid:
+            continue
+        cid_u = cid.upper()
+        is_h_tp = cid_u.endswith('_HEDGE_TP')
+        is_h_trl = cid_u.endswith('_HEDGE_TRL')
+        if not (is_h_tp or is_h_trl):
+            continue
+        ps = str(algo.get('positionSide') or '').upper().strip()
+        pair = (symbol, ps)
+        desired = desired_by_pair.get(pair)
+        cancel = False
+        if not desired or not isinstance(desired.get('spec'), dict):
+            cancel = True
+        else:
+            spec = desired['spec']
+            want_cid = str(spec['cid_tp'] if is_h_tp else spec['cid_trl'])
+            if cid != want_cid:
+                cancel = True
+            else:
+                want_type = 'TAKE_PROFIT_MARKET' if is_h_tp else 'TRAILING_STOP_MARKET'
+                have_type = str(algo.get('orderType') or algo.get('type') or '').upper().strip()
+                if have_type and have_type != want_type:
+                    cancel = True
+        if cancel:
+            try:
+                removed = self._cancel_algo_by_client_id_safe(symbol, cid, str(algo.get('algoId') or ''))
+                if removed:
+                    stats['canceled'] += 1
+                    stats['changed'] += 1
+                    log.info('[TL][HEDGE_EXIT] canceled stale hedge algo %s %s cid=%s', symbol, ps or '?', cid)
+                else:
+                    log.warning('[TL][HEDGE_EXIT] stale hedge algo still open after cancel attempt %s %s cid=%s', symbol, ps or '?', cid)
+            except Exception:
+                log.exception('[TL][HEDGE_EXIT] failed to cancel stale hedge algo %s %s cid=%s', symbol, ps or '?', cid)
+
+    # Cancel legacy closePosition hedge TP/TRL that belong to the active hedge side but use non-hedge suffixes.
+    for (symbol, hedge_side), payload in desired_by_pair.items():
+        spec = payload.get('spec') or {}
+        close_side = str((spec or {}).get('close_side') or ('BUY' if hedge_side == 'SHORT' else 'SELL')).upper()
+        for suffix, order_type in (('_TP', 'TAKE_PROFIT_MARKET'), ('_TRL', 'TRAILING_STOP_MARKET')):
+            try:
+                legacy = self._find_semantic_open_algo(
+                    symbol,
+                    client_suffix=suffix,
+                    position_side=hedge_side,
+                    order_type=order_type,
+                    side=close_side,
+                )
+            except Exception:
+                legacy = None
+            if isinstance(legacy, dict):
+                legacy_cid = str(legacy.get('clientAlgoId') or '').strip()
+                if legacy_cid and '_HEDGE_' not in legacy_cid.upper():
+                    try:
+                        removed = self._cancel_algo_by_client_id_safe(symbol, legacy_cid, str(legacy.get('algoId') or ''))
+                        if removed:
+                            stats['canceled'] += 1
+                            stats['changed'] += 1
+                            log.info('[TL][HEDGE_EXIT] canceled legacy hedge semantic duplicate %s %s cid=%s', symbol, hedge_side, legacy_cid)
+                        else:
+                            log.warning('[TL][HEDGE_EXIT] legacy hedge semantic duplicate still open after cancel attempt %s %s cid=%s', symbol, hedge_side, legacy_cid)
+                    except Exception:
+                        log.exception('[TL][HEDGE_EXIT] failed to cancel legacy hedge semantic duplicate %s %s cid=%s', symbol, hedge_side, legacy_cid)
+
+    for (symbol, hedge_side), payload in desired_by_pair.items():
+        row = payload.get('row') or {}
+        spec = payload.get('spec') or {}
+        pos_uid = str(row.get('pos_uid') or '').strip()
+        hedge_entry = float(payload.get('hedge_entry') or 0.0)
+        hedge_qty = float(payload.get('hedge_qty') or 0.0)
+        if not pos_uid or not isinstance(spec, dict) or hedge_entry <= 0 or hedge_qty <= 0:
+            continue
+        stats['checked'] += 1
+        try:
+            if _ensure_live_hedge_tp_trailing(
+                self,
+                base_pos=row,
+                symbol=symbol,
+                hedge_side=hedge_side,
+                hedge_entry=hedge_entry,
+                hedge_qty=hedge_qty,
+            ):
+                stats['changed'] += 1
+        except Exception:
+            log.exception('[TL][HEDGE_EXIT] failed for %s %s pos_uid=%s', symbol, hedge_side, pos_uid)
+    return stats
+
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -872,6 +1437,8 @@ def apply_trade_liquidation_full_ready(TradeLiquidation) -> None:
     TradeLiquidation._insert_live_hedge_ledger_row = _insert_live_hedge_ledger_row  # type: ignore[attr-defined]
     TradeLiquidation._close_live_hedge_ledger_row = _close_live_hedge_ledger_row  # type: ignore[attr-defined]
     TradeLiquidation._promote_live_hedge_to_live_main = _promote_live_hedge_to_live_main  # type: ignore[attr-defined]
+    TradeLiquidation._live_reanchor_tp_and_trailing_after_avg_change = _live_reanchor_tp_and_trailing_after_avg_change  # type: ignore[attr-defined]
+    TradeLiquidation._maintain_live_hedge_exit_orders = _maintain_live_hedge_exit_orders  # type: ignore[attr-defined]
 
     original_auto_recovery_brackets = TradeLiquidation._auto_recovery_brackets
 
@@ -896,6 +1463,16 @@ def apply_trade_liquidation_full_ready(TradeLiquidation) -> None:
             log.exception("[TL][hedge_ready] pre-recovery hedge sync failed")
 
         result = original_auto_recovery_brackets(self)
+
+        try:
+            if self._is_live and bool(getattr(self.p, "hedge_enabled", False)):
+                hedge_exit = self._maintain_live_hedge_exit_orders()
+                try:
+                    self._last_hedge_exit_maintenance = dict(hedge_exit)
+                except Exception:
+                    pass
+        except Exception:
+            log.exception("[TL][HEDGE_EXIT] recovery maintenance failed")
 
         try:
             if self._is_live and bool(getattr(getattr(self, "p", object()), "add_or_hedge_invariant_enabled", True)):
@@ -930,6 +1507,16 @@ def apply_trade_liquidation_full_ready(TradeLiquidation) -> None:
                         inv = _enforce_add_or_hedge_invariant(self)
                 except Exception:
                     log.exception("[TL][add_or_hedge] post-open_positions invariant failed")
+                hedge_exit = {"checked": 0, "changed": 0}
+                try:
+                    if bool(getattr(self.p, "hedge_enabled", False)):
+                        hedge_exit = self._maintain_live_hedge_exit_orders()
+                        try:
+                            self._last_hedge_exit_maintenance = dict(hedge_exit)
+                        except Exception:
+                            pass
+                except Exception:
+                    log.exception("[TL][HEDGE_EXIT] process_open_positions maintenance failed")
                 if isinstance(result, dict):
                     result["orphan_main_sync_checked"] = int(main_sync_result.get("checked", 0))
                     result["orphan_main_sync_opened"] = int(main_sync_result.get("opened", 0))
@@ -944,6 +1531,8 @@ def apply_trade_liquidation_full_ready(TradeLiquidation) -> None:
                     result["add_or_hedge_checked"] = int(inv.get("checked", 0))
                     result["add_or_hedge_acted"] = int(inv.get("acted", 0))
                     result["add_or_hedge_skipped_two_sided"] = int(inv.get("skipped_two_sided", 0))
+                    result["hedge_exit_checked"] = int(hedge_exit.get("checked", 0))
+                    result["hedge_exit_changed"] = int(hedge_exit.get("changed", 0))
         except Exception:
             log.exception("[TL][hedge_ready] wrapped process_open_positions failed")
         return result

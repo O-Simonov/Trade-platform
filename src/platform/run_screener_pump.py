@@ -1,7 +1,6 @@
 # src/platform/run_screener_pump.py
 from __future__ import annotations
 
-import os
 import time
 import logging
 from pathlib import Path
@@ -11,6 +10,12 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import yaml
 from psycopg.errors import UniqueViolation
 
+from src.platform.config.env import (
+    get_environment,
+    get_log_level,
+    get_pg_dsn,
+    require,
+)
 from src.platform.data.storage.postgres.pool import create_pool
 from src.platform.data.storage.postgres.storage import PostgreSQLStorage
 from src.platform.screeners.scr_pump_binance import ScrPumpBinance
@@ -18,6 +23,17 @@ from src.platform.notifications import telegram as tg
 from src.platform.core.utils.candles import interval_to_timedelta
 
 log = logging.getLogger("platform.run_screener_pump")
+
+
+def _setup_logging() -> None:
+    level_name = get_log_level()
+    level = getattr(logging, level_name, logging.INFO)
+
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        force=True,
+    )
 
 
 def _utc_now() -> datetime:
@@ -41,12 +57,26 @@ def _jsonable(v: Any) -> Any:
     return str(v)
 
 
-def _load_cfg() -> dict:
-    cfg_path = os.getenv("PUMP_SCREENERS_CONFIG", "config/screener_pump.yaml")
-    p = Path(cfg_path)
+def _resolve_cfg_path() -> Path:
+    raw = require("PUMP_SCREENERS_CONFIG")
+    p = Path(raw).expanduser()
+
+    if not p.is_absolute():
+        p = (Path.cwd() / p).resolve()
+    else:
+        p = p.resolve()
+
     if not p.exists():
         raise FileNotFoundError(f"PUMP_SCREENERS_CONFIG not found: {p}")
-    return yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+
+    if not p.is_file():
+        raise FileNotFoundError(f"PUMP_SCREENERS_CONFIG is not a file: {p}")
+
+    return p
+
+
+def _load_cfg(path: Path) -> dict:
+    return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
 
 
 def _get_screeners(cfg: dict) -> List[dict]:
@@ -443,10 +473,6 @@ def _send_telegram_plots_if_enabled(
 
 
 def _pick_buy_sell_intervals(params: dict) -> Tuple[str, str]:
-    """
-    ✅ BUY = buy_interval (default: самый младший из intervals)
-    ✅ SELL = sell_interval (default: самый старший из intervals)
-    """
     buy_itv = str(params.get("buy_interval") or "").strip()
     sell_itv = str(params.get("sell_interval") or "").strip()
 
@@ -480,13 +506,6 @@ def _filter_fresh_signals(
     interval: str,
     params: dict,
 ) -> list:
-    """
-    ✅ Оставляем только свежие сигналы.
-    Приоритет:
-      1) params['max_signal_age_minutes']
-      2) params['max_signal_age_candles']  (умножаем на TF)
-      3) default = 2 свечи TF
-    """
     if not signals:
         return []
 
@@ -529,21 +548,37 @@ def _filter_fresh_signals(
     return out
 
 
+def _ping_db(store: PostgreSQLStorage) -> tuple[datetime, int]:
+    row_now = store.query_one("SELECT now()")
+    now = row_now[0] if row_now else _utc_now()
+
+    row_cnt = store.query_one("SELECT COUNT(*) FROM screeners")
+    screeners_total = int(row_cnt[0] if row_cnt else 0)
+
+    return now, screeners_total
+
+
 def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-        force=True,
-    )
+    _setup_logging()
 
-    from src.platform.notifications.telegram import load_dotenv_file
-    load_dotenv_file(".env", override=False)
+    environment = get_environment()
 
-    cfg_path = os.getenv("PUMP_SCREENERS_CONFIG", "config/screener_pump.yaml")
+    try:
+        loaded = int(tg.load_dotenv_file(".env", override=False) or 0)
+        if loaded:
+            log.info("Loaded .env: %s", str(Path(".env").resolve()))
+    except OSError:
+        pass
+    except Exception:
+        log.debug("Failed to load .env", exc_info=True)
+
+    cfg_path = _resolve_cfg_path()
+
     log.info("=== RUN PUMP SCREENER START ===")
-    log.info("PUMP_SCREENERS_CONFIG=%s", cfg_path)
+    log.info("Environment: %s", environment)
+    log.info("PUMP_SCREENERS_CONFIG=%s", str(cfg_path))
 
-    cfg = _load_cfg()
+    cfg = _load_cfg(cfg_path)
     restart_interval_minutes = int(cfg.get("restart_interval_minutes", 2))
     items = _get_screeners(cfg)
 
@@ -552,12 +587,15 @@ def main() -> None:
         log.warning("No screeners found in config")
         return
 
-    dsn = os.getenv("PG_DSN")
-    if not dsn:
-        raise RuntimeError("PG_DSN env not set")
-
+    dsn = get_pg_dsn()
     pool = create_pool(dsn)
     store = PostgreSQLStorage(pool)
+
+    try:
+        db_now, screeners_total = _ping_db(store)
+        log.info("DB ping OK: now=%s | screeners_total=%d", str(db_now), int(screeners_total))
+    except Exception:
+        log.exception("DB ping failed")
 
     screener_registry = {"scr_pump_binance": ScrPumpBinance}
 
@@ -751,9 +789,6 @@ def main() -> None:
                             packed_rows=packed_for_telegram,
                         )
 
-                    # -------------------------
-                    # PLOTS
-                    # -------------------------
                     enable_plots = bool(params_i.get("enable_plots", True))
                     telegram_send_plots = bool(params_i.get("telegram_send_plots", True))
                     telegram_max_plot_signals = int(params_i.get("telegram_max_plot_signals", 30))
@@ -867,6 +902,7 @@ def main() -> None:
                                     cvd_series=cvd_series,
                                     base_avg_price=base_avg_price,
                                     base_lookback_bars=base_lookback_bars,
+                                    keep_plots_days=params_i.get("keep_plots_days"),
                                 )
 
                                 saved += 1
@@ -903,8 +939,9 @@ def main() -> None:
         except Exception:
             log.exception("RUN PUMP SCREENER FAILED")
 
+        sleep_s = max(1, restart_interval_minutes * 60)
         log.info("Sleeping for %d minutes before next run...", restart_interval_minutes)
-        time.sleep(restart_interval_minutes * 60)
+        time.sleep(sleep_s)
 
 
 if __name__ == "__main__":

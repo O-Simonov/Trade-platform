@@ -19,11 +19,6 @@ import json
 import logging
 import uuid
 
-import time
-
-
-
-
 def _round_price_to_tick(price: float, tick: float, *, mode: str = "nearest") -> float:
     if tick <= 0:
         return float(price)
@@ -34,9 +29,8 @@ def _round_price_to_tick(price: float, tick: float, *, mode: str = "nearest") ->
     if mode == 'down':
         import math
         return float(math.floor(n) * tick)
-    import math
-    return float(round(n) * tick)
 
+    return float(round(n) * tick)
 
 def _ensure_tp_trail_side(level: float, entry: float, tick: float, pos_side: str, *, kind: str) -> float:
     level = float(level)

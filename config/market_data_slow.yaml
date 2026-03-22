@@ -105,7 +105,7 @@ open_interest:
 funding:
   enabled: true
   backfill_on_start: true
-  backfill_days: 14               # было 30 (сильно снижает стартовую нагрузку)
+  backfill_days: 3               # было 3 (сильно снижает стартовую нагрузку)
 
   use_ws: true
 
@@ -115,8 +115,8 @@ funding:
   symbols_per_cycle: 10            # было 20
   req_sleep_sec: 0.25              # было 0.20
 
-  limit: 1000
-  max_pages: 25                    # было 50
+  limit: 500
+  max_pages: 10                    # было 25
   page_sleep_sec: 0.05             # было 0.0
 
   overlap_hours: 72

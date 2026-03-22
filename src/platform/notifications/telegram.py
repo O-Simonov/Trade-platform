@@ -2,15 +2,134 @@
 from __future__ import annotations
 
 import os
+import time
 import logging
 from dataclasses import dataclass
-from typing import Optional, List
+from typing import Optional, List, Tuple
 
 import requests
+from requests import Response
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 log = logging.getLogger("platform.notifications.telegram")
 
+
 TELEGRAM_MAX_LEN = 3900  # безопасный лимит (<4096)
+
+_DEFAULT_CONNECT_TIMEOUT = 10
+_DEFAULT_READ_TIMEOUT = 45
+_DEFAULT_MEDIA_READ_TIMEOUT = 90
+_DEFAULT_RETRIES = 2
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = _env(name)
+    if not raw:
+        return int(default)
+    try:
+        v = int(raw)
+        return v if v > 0 else int(default)
+    except Exception:
+        return int(default)
+
+
+def _timeout_pair(*, media: bool = False) -> Tuple[int, int]:
+    connect_timeout = _env_int('TELEGRAM_CONNECT_TIMEOUT', _DEFAULT_CONNECT_TIMEOUT)
+    base_read = _DEFAULT_MEDIA_READ_TIMEOUT if media else _DEFAULT_READ_TIMEOUT
+    read_timeout = _env_int('TELEGRAM_READ_TIMEOUT', base_read)
+    return connect_timeout, read_timeout
+
+
+def _build_session() -> requests.Session:
+    retries = Retry(
+        total=_env_int('TELEGRAM_RETRIES', _DEFAULT_RETRIES),
+        connect=_env_int('TELEGRAM_RETRIES', _DEFAULT_RETRIES),
+        read=_env_int('TELEGRAM_RETRIES', _DEFAULT_RETRIES),
+        status=_env_int('TELEGRAM_RETRIES', _DEFAULT_RETRIES),
+        backoff_factor=1.0,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset({'POST'}),
+        raise_on_status=False,
+        respect_retry_after_header=True,
+    )
+
+    session = requests.Session()
+    adapter = HTTPAdapter(max_retries=retries, pool_connections=10, pool_maxsize=10)
+    session.mount('https://', adapter)
+    session.mount('http://', adapter)
+
+    if _env('TELEGRAM_DISABLE_PROXY').lower() in {'1', 'true', 'yes', 'on'}:
+        session.trust_env = False
+
+    return session
+
+
+def _log_telegram_http_error(prefix: str, resp: Response, target: TelegramTarget) -> None:
+    body = ''
+    try:
+        body = (resp.text or '')[:500]
+    except Exception:
+        body = '<no-body>'
+
+    log.error(
+        '%s failed target=%s chat_id=%s status=%s body=%s',
+        prefix,
+        target.name,
+        target.chat_id,
+        resp.status_code,
+        body,
+    )
+
+
+def _sleep_before_retry(attempt: int) -> None:
+    if attempt <= 0:
+        return
+    time.sleep(min(2.0 * attempt, 5.0))
+
+
+def _post_telegram(
+    url: str,
+    *,
+    target: TelegramTarget,
+    json: Optional[dict] = None,
+    data: Optional[dict] = None,
+    files: Optional[dict] = None,
+    media: bool = False,
+    action_name: str = 'Telegram request',
+) -> bool:
+    session = _build_session()
+    timeout = _timeout_pair(media=media)
+    attempts = max(1, _env_int('TELEGRAM_ATTEMPTS', 2))
+
+    try:
+        for attempt in range(1, attempts + 1):
+            try:
+                r = session.post(url, json=json, data=data, files=files, timeout=timeout)
+                if r.status_code == 200:
+                    return True
+
+                _log_telegram_http_error(action_name, r, target)
+
+                if r.status_code not in (429, 500, 502, 503, 504):
+                    return False
+            except requests.exceptions.Timeout:
+                log.warning(
+                    '%s timeout target=%s chat_id=%s attempt=%d/%d timeout=%s',
+                    action_name, target.name, target.chat_id, attempt, attempts, timeout
+                )
+            except requests.exceptions.RequestException:
+                log.exception(
+                    '%s request exception target=%s chat_id=%s attempt=%d/%d',
+                    action_name, target.name, target.chat_id, attempt, attempts
+                )
+
+            if attempt < attempts:
+                _sleep_before_retry(attempt)
+
+        return False
+    finally:
+        session.close()
 
 
 # -------------------------
@@ -131,32 +250,57 @@ def resolve_targets_from_env(
     fallback_friend_token_to_primary: bool = True,
 ) -> List[TelegramTarget]:
     """
-    Собирает targets только из env (как ты хочешь):
+    Собирает targets из env.
 
-    MAIN:
-      TELEGRAM_BOT_TOKEN
-      TELEGRAM_CHAT_ID
+    Поддерживаемые направления:
+
+    LEGACY/PRIMARY:
+      TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID
+
+    MAIN (личка):
+      TELEGRAM_MAIN_BOT_TOKEN + TELEGRAM_MAIN_CHAT_ID
+
+    CHANNEL:
+      TELEGRAM_TOKEN + TELEGRAM_CHANNEL
 
     FRIENDS:
-      TELEGRAM_FRIEND_BOT_TOKEN_1
-      TELEGRAM_FRIEND_CHAT_ID_1
-      TELEGRAM_FRIEND_BOT_TOKEN_2
-      TELEGRAM_FRIEND_CHAT_ID_2
+      TELEGRAM_FRIEND_BOT_TOKEN_1 + TELEGRAM_FRIEND_CHAT_ID_1
       ...
 
-    Если fallback_friend_token_to_primary=True и FRIEND_BOT_TOKEN_i пустой,
-    то будет использован основной TELEGRAM_BOT_TOKEN (если он есть).
+    ВАЖНО:
+    - если заданы и MAIN, и CHANNEL, сообщения будут отправлены в ОБА направления;
+    - если задан LEGACY/PRIMARY, он тоже участвует в рассылке;
+    - дубликаты token/chat_id автоматически убираются.
     """
     targets: List[TelegramTarget] = []
+    seen: set[tuple[str, str]] = set()
+
+    def _add_target(name: str, token: str, chat: str) -> None:
+        token = str(token or '').strip()
+        chat = str(chat or '').strip()
+        if not token or not chat:
+            return
+        key = (token, chat)
+        if key in seen:
+            return
+        seen.add(key)
+        targets.append(TelegramTarget(name=name, bot_token=token, chat_id=chat))
 
     primary_token = _env("TELEGRAM_BOT_TOKEN")
     primary_chat = _env("TELEGRAM_CHAT_ID")
+    main_token = _env("TELEGRAM_MAIN_BOT_TOKEN")
+    main_chat = _env("TELEGRAM_MAIN_CHAT_ID")
+    channel_token = _env("TELEGRAM_TOKEN")
+    channel_chat = _env("TELEGRAM_CHANNEL")
 
-    if primary_token and primary_chat:
-        targets.append(TelegramTarget(name="primary", bot_token=primary_token, chat_id=primary_chat))
+    _add_target("primary", primary_token, primary_chat)
+    _add_target("main", main_token, main_chat)
+    _add_target("channel", channel_token, channel_chat)
 
     if not include_friends:
         return targets
+
+    friend_fallback_token = primary_token or main_token or channel_token
 
     for i in range(1, max(1, int(max_friends)) + 1):
         chat = _env(f"TELEGRAM_FRIEND_CHAT_ID_{i}")
@@ -166,12 +310,12 @@ def resolve_targets_from_env(
             continue
 
         if not token and fallback_friend_token_to_primary:
-            token = primary_token
+            token = friend_fallback_token
 
         if not token:
             continue
 
-        targets.append(TelegramTarget(name=f"friend_{i}", bot_token=token, chat_id=chat))
+        _add_target(f"friend_{i}", token, chat)
 
     return targets
 
@@ -219,15 +363,13 @@ def send_telegram_message(
         "disable_notification": bool(disable_notification),
     }
 
-    try:
-        r = requests.post(url, json=payload, timeout=15)
-        if r.status_code != 200:
-            log.error("Telegram send failed: %s %s", r.status_code, r.text[:300])
-            return False
-        return True
-    except Exception:
-        log.exception("Telegram send exception")
-        return False
+    return _post_telegram(
+        url,
+        target=target,
+        json=payload,
+        media=False,
+        action_name='Telegram sendMessage',
+    )
 
 
 # -------------------------
@@ -281,14 +423,16 @@ def send_telegram_photo(
     try:
         with open(photo_path, "rb") as f:
             files = {"photo": f}
-            r = requests.post(url, data=data, files=files, timeout=30)
-
-        if r.status_code != 200:
-            log.error("Telegram sendPhoto failed: %s %s", r.status_code, r.text[:300])
-            return False
-        return True
+            return _post_telegram(
+                url,
+                target=target,
+                data=data,
+                files=files,
+                media=True,
+                action_name='Telegram sendPhoto',
+            )
     except Exception:
-        log.exception("Telegram sendPhoto exception")
+        log.exception("Telegram sendPhoto exception target=%s chat_id=%s path=%s", target.name, target.chat_id, photo_path)
         return False
 
 
@@ -333,14 +477,16 @@ def send_telegram_document(
     try:
         with open(file_path, "rb") as f:
             files = {"document": f}
-            r = requests.post(url, data=data, files=files, timeout=60)
-
-        if r.status_code != 200:
-            log.error("Telegram sendDocument failed: %s %s", r.status_code, r.text[:300])
-            return False
-        return True
+            return _post_telegram(
+                url,
+                target=target,
+                data=data,
+                files=files,
+                media=True,
+                action_name='Telegram sendDocument',
+            )
     except Exception:
-        log.exception("Telegram sendDocument exception")
+        log.exception("Telegram sendDocument exception target=%s chat_id=%s path=%s", target.name, target.chat_id, file_path)
         return False
 
 

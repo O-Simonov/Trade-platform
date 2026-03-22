@@ -1,6 +1,7 @@
 # src/platform/exchanges/binance/collector_funding.py
 from __future__ import annotations
 
+import inspect
 import logging
 import threading
 import time
@@ -58,7 +59,7 @@ def _classify_http_error(exc: Exception) -> Optional[int]:
 
 def _normalize_funding_time(dt: Optional[datetime]) -> Optional[datetime]:
     """
-    ✅ ВАЖНО: Binance funding time дискретен (обычно 00/08/16 UTC),
+    Binance funding time дискретен (обычно 00/08/16 UTC),
     а WS иногда приходит с микро/миллисекундами.
     Нормализуем до начала часа, чтобы REST и WS попадали в один и тот же PK.
     """
@@ -92,7 +93,11 @@ def _upsert_funding_rows(*, storage, rows: List[dict]) -> int:
             n = fn(rows)
             return int(n or 0)
         except Exception as e:
-            logger.warning("[Funding] storage.upsert_funding failed -> fallback SQL UPSERT (%s)", e, exc_info=True)
+            logger.warning(
+                "[Funding] storage.upsert_funding failed -> fallback SQL UPSERT (%s)",
+                e,
+                exc_info=True,
+            )
 
     pool = getattr(storage, "pool", None)
     if pool is None:
@@ -101,20 +106,24 @@ def _upsert_funding_rows(*, storage, rows: List[dict]) -> int:
     params_full: List[Tuple[Any, ...]] = []
     params_min: List[Tuple[Any, ...]] = []
     for r in rows:
-        params_full.append((
-            int(r.get("exchange_id")),
-            int(r.get("symbol_id")),
-            r.get("funding_time"),
-            _safe_float(r.get("funding_rate"), 0.0),
-            (None if r.get("mark_price") is None else _safe_float(r.get("mark_price"), 0.0)),
-            str(r.get("source") or ""),
-        ))
-        params_min.append((
-            int(r.get("exchange_id")),
-            int(r.get("symbol_id")),
-            r.get("funding_time"),
-            _safe_float(r.get("funding_rate"), 0.0),
-        ))
+        params_full.append(
+            (
+                int(r.get("exchange_id")),
+                int(r.get("symbol_id")),
+                r.get("funding_time"),
+                _safe_float(r.get("funding_rate"), 0.0),
+                (None if r.get("mark_price") is None else _safe_float(r.get("mark_price"), 0.0)),
+                str(r.get("source") or ""),
+            )
+        )
+        params_min.append(
+            (
+                int(r.get("exchange_id")),
+                int(r.get("symbol_id")),
+                r.get("funding_time"),
+                _safe_float(r.get("funding_rate"), 0.0),
+            )
+        )
 
     sql_full = """
     INSERT INTO public.funding (exchange_id, symbol_id, funding_time, funding_rate, mark_price, source)
@@ -139,7 +148,6 @@ def _upsert_funding_rows(*, storage, rows: List[dict]) -> int:
             try:
                 cur.executemany(sql_full, params_full)
             except Exception:
-                # если таблица не имеет mark_price/source — упадём сюда и вставим минимально
                 cur.executemany(sql_min, params_min)
         try:
             conn.commit()
@@ -264,7 +272,7 @@ def _parse_ws_mark_price_update(
         "T": ...      # next funding time
       }
 
-    Мы пишем funding_time = nextFundingTime (T) — будущая точка.
+    Пишем funding_time = nextFundingTime (T) — будущая точка.
     UPSERT будет обновлять rate/mark_price по одному ключу.
     """
     if not isinstance(msg, dict):
@@ -484,9 +492,9 @@ def _run_backfill_all_symbols(
 
         except Exception as e:
             code = _classify_http_error(e)
-            if code in (418, 429):
-                logger.warning("[Funding][Backfill] %s HTTP=%s -> cooldown 30m", sym, code, exc_info=True)
-                cooldown_until[sym] = _utc_now() + timedelta(minutes=30)
+            if code in (418, 429, 403):
+                logger.warning("[Funding][Backfill] %s HTTP=%s -> cooldown 60m", sym, code, exc_info=True)
+                cooldown_until[sym] = _utc_now() + timedelta(minutes=60)
             elif code == 451:
                 logger.warning("[Funding][Backfill] %s HTTP=451 -> cooldown 6h", sym, code, exc_info=True)
                 cooldown_until[sym] = _utc_now() + timedelta(hours=6)
@@ -505,6 +513,26 @@ def _run_backfill_all_symbols(
 # -------------------------
 # WS Funding (markPrice@arr)
 # -------------------------
+
+def _make_binance_ws_compatible(**kwargs) -> BinanceWS:
+    """
+    Создаёт BinanceWS, передавая только те kwargs,
+    которые реально поддерживаются текущей сигнатурой BinanceWS.__init__().
+    """
+    sig = inspect.signature(BinanceWS.__init__)
+    params = sig.parameters
+
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return BinanceWS(**kwargs)
+
+    supported = {k: v for k, v in kwargs.items() if k in params}
+    dropped = [k for k in kwargs.keys() if k not in params]
+
+    if dropped:
+        logger.warning("[Funding][WS] dropped unsupported BinanceWS args: %s", dropped)
+
+    return BinanceWS(**supported)
+
 
 def start_funding_ws_collector(
     *,
@@ -553,11 +581,13 @@ def start_funding_ws_collector(
             except Exception:
                 logger.exception("[Funding][WS] upsert failed rows=%d", len(rows))
 
-    ws = BinanceWS(
+    ws = _make_binance_ws_compatible(
         url=url,
         on_message=_on_message,
         name="BinanceFundingWS",
         reconnect_delay_sec=2.0,
+        reconnect_min_delay=2.0,
+        reconnect_max_delay=20.0,
         ping_interval=20,
         ping_timeout=10,
     )
@@ -660,12 +690,16 @@ def run_funding_collector(
 
     ws_client: Optional[BinanceWS] = None
     if use_ws and total > 0:
-        ws_client = start_funding_ws_collector(
-            storage=storage,
-            exchange_id=int(exchange_id),
-            symbol_ids=dict(symbol_ids or {}),
-            stop_event=stop_event,
-        )
+        try:
+            ws_client = start_funding_ws_collector(
+                storage=storage,
+                exchange_id=int(exchange_id),
+                symbol_ids=dict(symbol_ids or {}),
+                stop_event=stop_event,
+            )
+        except Exception:
+            logger.exception("[Funding][WS] failed to start")
+            ws_client = None
 
     if not rest_safety_poll:
         logger.info("[Funding] REST safety poll disabled -> WS only mode")
@@ -733,9 +767,9 @@ def run_funding_collector(
 
                 except Exception as e:
                     code = _classify_http_error(e)
-                    if code in (418, 429):
-                        logger.warning("[Funding][REST] %s HTTP=%s -> cooldown 30m", sym, code, exc_info=True)
-                        cooldown_until[sym] = _utc_now() + timedelta(minutes=30)
+                    if code in (418, 429, 403):
+                        logger.warning("[Funding][REST] %s HTTP=%s -> cooldown 60m", sym, code, exc_info=True)
+                        cooldown_until[sym] = _utc_now() + timedelta(minutes=60)
                     elif code == 451:
                         logger.warning("[Funding][REST] %s HTTP=451 -> cooldown 6h", sym, code, exc_info=True)
                         cooldown_until[sym] = _utc_now() + timedelta(hours=6)

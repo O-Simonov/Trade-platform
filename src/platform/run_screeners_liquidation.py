@@ -1,40 +1,93 @@
 # src/platform/run_screeners_liquidation.py
 from __future__ import annotations
 
-import os
-import time
 import logging
-import shutil
+import os
 import re
+import shutil
+import time
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from datetime import datetime, timezone, date, timedelta
-from typing import Any, Dict, List, Tuple, Set, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import yaml
 from psycopg.errors import UniqueViolation
 
+from src.platform.config.env import (
+    get_environment,
+    get_log_level,
+    get_pg_dsn,
+    require,
+)
+from src.platform.core.utils.candles import (
+    aggregate_candles,
+    interval_to_timedelta,
+    slice_window,
+)
 from src.platform.data.storage.postgres.pool import create_pool
 from src.platform.data.storage.postgres.storage import PostgreSQLStorage
-from src.platform.screeners.scr_liquidation_binance import ScrLiquidationBinance
-
 from src.platform.notifications.telegram import (
     load_dotenv_file,
     resolve_targets_from_env,
-    split_long_message,
+    send_telegram_document,
     send_telegram_message,
     send_telegram_photo,
-    send_telegram_document,
+    split_long_message,
 )
-
-from src.platform.core.utils.candles import aggregate_candles, interval_to_timedelta, slice_window
+from src.platform.screeners.scr_liquidation_binance import ScrLiquidationBinance
 
 log = logging.getLogger("platform.run_screeners_liquidation")
 
 _PLOTS_CLEANUP_LAST: Dict[str, datetime] = {}
 
 
+def _setup_logging() -> None:
+    level_name = get_log_level()
+    level = getattr(logging, level_name, logging.INFO)
+
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        force=True,
+    )
+
+
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _resolve_cfg_path() -> Path:
+    raw_path = (
+        os.getenv("SCREENERS_LIQUIDATION_CONFIG", "").strip()
+        or os.getenv("SCREENERS_CONFIG", "").strip()
+        or require("SCREENERS_LIQUIDATION_CONFIG")
+    )
+
+    path = Path(raw_path).expanduser()
+    if not path.is_absolute():
+        path = (Path.cwd() / path).resolve()
+    else:
+        path = path.resolve()
+
+    if not path.exists():
+        raise FileNotFoundError(f"Config not found: {path}")
+
+    if not path.is_file():
+        raise FileNotFoundError(f"SCREENERS_LIQUIDATION_CONFIG is not a file: {path}")
+
+    return path
+
+
+def _load_cfg(path: Path) -> Dict[str, Any]:
+    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    if not isinstance(data, dict):
+        raise ValueError("Config root must be a mapping")
+    return data
+
+
+def _get_screeners(cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
+    items = cfg.get("screeners") or []
+    return [it for it in items if isinstance(it, dict)] if isinstance(items, list) else []
 
 
 def _ensure_dt_utc(v: Any) -> Optional[datetime]:
@@ -82,6 +135,16 @@ def _jsonable(v: Any) -> Any:
     return str(v)
 
 
+def _ping_db(store: PostgreSQLStorage) -> tuple[datetime, int]:
+    row_now = store.query_one("SELECT now()")
+    now = row_now[0] if row_now else _utc_now()
+
+    row_cnt = store.query_one("SELECT COUNT(*) FROM screeners")
+    screeners_total = int(row_cnt[0] if row_cnt else 0)
+
+    return now, screeners_total
+
+
 # -----------------------------
 # plots cleanup
 # -----------------------------
@@ -111,7 +174,6 @@ def _cleanup_plots_dir(plots_dir: Path, *, keep_days: int, now: Optional[datetim
     deleted_dirs = 0
     deleted_files = 0
 
-    # удаляем папки дат
     for day_dir in plots_dir.glob("*/*/*"):
         if not day_dir.is_dir():
             continue
@@ -129,7 +191,6 @@ def _cleanup_plots_dir(plots_dir: Path, *, keep_days: int, now: Optional[datetim
             except OSError:
                 pass
 
-    # страховка: чистим png по mtime
     for p in plots_dir.rglob("*.png"):
         if not p.is_file():
             continue
@@ -150,26 +211,6 @@ def _cleanup_plots_dir(plots_dir: Path, *, keep_days: int, now: Optional[datetim
 # -----------------------------
 # YAML helpers
 # -----------------------------
-def _load_cfg() -> Dict[str, Any]:
-    cfg_path = (
-        os.getenv("SCREENERS_LIQUIDATION_CONFIG")
-        or os.getenv("SCREENERS_CONFIG")
-        or "config/screeners_liquidation.yaml"
-    )
-    p = Path(cfg_path)
-    if not p.exists():
-        raise FileNotFoundError(f"Config not found: {cfg_path}")
-    data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
-    if not isinstance(data, dict):
-        raise ValueError("Config root must be a mapping")
-    return data
-
-
-def _get_screeners(cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
-    items = cfg.get("screeners") or []
-    return [it for it in items if isinstance(it, dict)] if isinstance(items, list) else []
-
-
 def _normalize_intervals(v: Any) -> List[str]:
     if v is None:
         return []
@@ -234,7 +275,7 @@ def _build_interval_liq_pairs(params: Dict[str, Any]) -> List[Tuple[str, Optiona
 
 
 # -----------------------------
-# Telegram helpers (твои функции)
+# Telegram helpers
 # -----------------------------
 def _resolve_targets(params: dict) -> list:
     extras_enabled = bool(params.get("telegram_extras_enabled", False))
@@ -286,7 +327,6 @@ def _send_telegram_text_if_enabled(*, screener_name: str, timeframe: str, params
     else:
         msgs = split_long_message(build_msg(rows))
 
-    # noinspection PyBroadException
     try:
         ok = 0
         total = 0
@@ -319,7 +359,6 @@ def _send_telegram_plots_if_enabled(
         log.warning("Telegram plots enabled but no targets resolved (check env)")
         return
 
-    # noinspection PyBroadException
     try:
         ok = 0
         total = 0
@@ -397,27 +436,26 @@ def _insert_signals_safe(store: PostgreSQLStorage, rows: List[Dict[str, Any]]) -
 # main
 # -----------------------------
 def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-        force=True,
-    )
+    _setup_logging()
 
-    # env (tokens etc.)
+    environment = get_environment()
+
     try:
-        load_dotenv_file(".env", override=False)
+        loaded = int(load_dotenv_file(".env", override=False) or 0)
+        if loaded:
+            log.info("Loaded .env: %s", str(Path(".env").resolve()))
     except OSError:
         pass
+    except Exception:
+        log.debug("Failed to load .env", exc_info=True)
 
-    cfg_path = (
-        os.getenv("SCREENERS_LIQUIDATION_CONFIG")
-        or os.getenv("SCREENERS_CONFIG")
-        or "config/screeners_liquidation.yaml"
-    )
+    cfg_path = _resolve_cfg_path()
+
     log.info("=== RUN SCREENERS LIQUIDATION START ===")
-    log.info("CONFIG=%s", cfg_path)
+    log.info("Environment: %s", environment)
+    log.info("Config: %s", str(cfg_path))
 
-    cfg = _load_cfg()
+    cfg = _load_cfg(cfg_path)
     restart_interval_minutes = int(cfg.get("restart_interval_minutes", 5))
     items = _get_screeners(cfg)
 
@@ -426,21 +464,26 @@ def main() -> None:
         log.warning("No screeners found in config")
         return
 
-    dsn = os.getenv("PG_DSN")
-    if not dsn:
-        raise RuntimeError("PG_DSN env not set")
-
+    dsn = get_pg_dsn()
     pool = create_pool(dsn)
     store = PostgreSQLStorage(pool)
 
-    screener_registry = {"scr_liquidation_binance": ScrLiquidationBinance}
+    try:
+        db_now, screeners_total = _ping_db(store)
+        log.info("DB ping OK: now=%s | screeners_total=%d", str(db_now), int(screeners_total))
+    except Exception:
+        log.exception("DB ping failed")
+
+    screener_registry = {
+        "scr_liquidation_binance": ScrLiquidationBinance,
+    }
+    log.info("Screener registry: %s", ", ".join(sorted(screener_registry.keys())))
 
     while True:
         total_inserted = 0
         total_skipped_dup = 0
         total_plots = 0
 
-        # noinspection PyBroadException
         try:
             for item in items:
                 if not bool(item.get("enabled", False)):
@@ -481,7 +524,6 @@ def main() -> None:
                     if liq_limit is not None:
                         params_i["volume_liquid_limit"] = float(liq_limit)
 
-                    # volume_change_pct can be scalar OR list mapped by intervals order OR dict {interval: pct}
                     vcp = params.get("volume_change_pct")
                     if isinstance(vcp, list):
                         vlist = _normalize_float_list(vcp)
@@ -505,7 +547,6 @@ def main() -> None:
                     if not signals:
                         continue
 
-                    # ✅ СВЕЖЕСТЬ: fresh_signal_minutes_map + close-time (signal_ts + interval)
                     now_ts = _utc_now()
 
                     fresh_map = params_i.get("fresh_signal_minutes_map") or {}
@@ -533,13 +574,17 @@ def main() -> None:
                                 filtered.append(sig)
 
                         if len(filtered) != len(signals):
-                            log.info("Skip old signals (> %dm) interval=%s: %d", fresh_minutes, interval, len(signals) - len(filtered))
+                            log.info(
+                                "Skip old signals (> %dm) interval=%s: %d",
+                                fresh_minutes,
+                                interval,
+                                len(signals) - len(filtered),
+                            )
                         signals = filtered
 
                     if not signals:
                         continue
 
-                    # dedup по (symbol_id, signal_ts)
                     pairs_key = [(int(sig.symbol_id), sig.signal_ts) for sig in signals]
                     existing = _fetch_existing_signal_pairs(
                         store,
@@ -550,13 +595,17 @@ def main() -> None:
                     )
 
                     new_signals = [sig for sig in signals if (int(sig.symbol_id), sig.signal_ts) not in existing]
+                    total_skipped_dup += max(0, len(signals) - len(new_signals))
                     if not new_signals:
                         continue
 
-                    # funding snapshot (best-effort)
                     try:
                         symbol_ids = sorted({int(sig.symbol_id) for sig in new_signals})
-                        funding_map = store.fetch_next_funding_bulk(exchange_id=int(exchange_id), symbol_ids=symbol_ids, as_of=now_ts)
+                        funding_map = store.fetch_next_funding_bulk(
+                            exchange_id=int(exchange_id),
+                            symbol_ids=symbol_ids,
+                            as_of=now_ts,
+                        )
                     except Exception:
                         funding_map = {}
                         log.warning("Funding snapshot load failed", exc_info=True)
@@ -569,13 +618,11 @@ def main() -> None:
                         signal_day = sig.signal_ts.date()
                         ctx = _jsonable(dict(sig.context or {}))
 
-                        # Optional fields for signals table (may be absent in screener Signal object)
                         confidence = getattr(sig, "confidence", None)
                         score = getattr(sig, "score", None)
                         reason = getattr(sig, "reason", None)
                         source = getattr(sig, "source", None) or str(name)
 
-                        # If reason not provided explicitly, try to take it from context
                         if not reason:
                             r0 = ctx.get("reason") or ctx.get("signal_reason")
                             if isinstance(r0, str) and r0.strip():
@@ -613,13 +660,10 @@ def main() -> None:
                             "exit_price": sig.exit_price,
                             "stop_loss": sig.stop_loss,
                             "take_profit": sig.take_profit,
-
-                            # required placeholders in SQL insert_signals()
                             "confidence": confidence,
                             "score": score,
                             "reason": reason,
                             "source": source,
-
                             "context": ctx,
                         }
                         rows.append(row)
@@ -644,11 +688,13 @@ def main() -> None:
                         continue
 
                     total_inserted += inserted
-                    _send_telegram_text_if_enabled(screener_name=name, timeframe=interval, params=params_i, rows=packed)
+                    _send_telegram_text_if_enabled(
+                        screener_name=name,
+                        timeframe=interval,
+                        params=params_i,
+                        rows=packed,
+                    )
 
-                    # --------------------------
-                    # plots
-                    # --------------------------
                     enable_plots = bool(params_i.get("enable_plots", False))
                     if not enable_plots:
                         continue
@@ -665,9 +711,14 @@ def main() -> None:
                             _PLOTS_CLEANUP_LAST[key] = now_ts
                             dd, df = _cleanup_plots_dir(plots_dir, keep_days=plots_keep_days, now=now_ts)
                             if dd or df:
-                                log.info("Plots cleanup: deleted_dirs=%d deleted_files=%d keep_days=%d", dd, df, plots_keep_days)
+                                log.info(
+                                    "Plots cleanup: deleted_dirs=%d deleted_files=%d keep_days=%d",
+                                    dd,
+                                    df,
+                                    plots_keep_days,
+                                )
 
-                    from src.platform.screeners.plotting_liquidation import save_signal_plot  # local import
+                    from src.platform.screeners.plotting_liquidation import save_signal_plot
 
                     lookback = int(params_i.get("plot_lookback", 120) or 120)
                     look_fwd = int(params_i.get("plot_lookforward", 40) or 40)
@@ -676,12 +727,10 @@ def main() -> None:
 
                     plot_items: List[Tuple[Path, dict]] = []
 
-                    # noinspection PyBroadException
                     try:
                         for sig in new_signals[: max(1, max_plots)]:
                             center_ts = sig.signal_ts
 
-                            # candles (live agg optional)
                             candles = []
                             live_enabled = bool(params_i.get("live_candles_enabled", True))
                             live_prefer_agg = bool(params_i.get("live_prefer_agg", True))
@@ -729,7 +778,6 @@ def main() -> None:
                             if not candles:
                                 continue
 
-                            # liq series (используется!)
                             liq_series = None
                             try:
                                 start_ts = candles[0]["ts"]
@@ -784,14 +832,29 @@ def main() -> None:
                         log.exception("Plot generation failed")
 
                     if plot_items:
-                        _send_telegram_plots_if_enabled(screener_name=name, timeframe=interval, params=params_i, plot_items=plot_items)
+                        _send_telegram_plots_if_enabled(
+                            screener_name=name,
+                            timeframe=interval,
+                            params=params_i,
+                            plot_items=plot_items,
+                        )
 
         except Exception:
             log.exception("RUN SCREENERS FAILED")
 
-        log.info("=== RUN SCREENERS DONE === inserted=%d skipped_dup=%d plots=%d", total_inserted, total_skipped_dup, total_plots)
-        log.info("Sleeping for %d minutes before next run...", restart_interval_minutes)
-        time.sleep(restart_interval_minutes * 60)
+        log.info(
+            "=== RUN SCREENERS DONE === inserted=%d skipped_dup=%d plots=%d",
+            total_inserted,
+            total_skipped_dup,
+            total_plots,
+        )
+        sleep_s = max(1.0, float(restart_interval_minutes) * 60.0)
+        log.info(
+            "Cycle sleep %.1fs (restart_interval_minutes=%s)",
+            sleep_s,
+            str(restart_interval_minutes),
+        )
+        time.sleep(sleep_s)
 
 
 if __name__ == "__main__":

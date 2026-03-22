@@ -27,22 +27,22 @@ traders:
 
       # Какие скринеры используются как источник сигналов.
       # Можно указывать список имен из таблицы screeners.name
-      screener_name: ["scr_liquidation_binance", "scr_oi_binance", "screener"]
+      screener_name: ["scr_liquidation_binance", "scr_oi_binance","scr_pump_binance"]
 
       signal_status_new: NEW           # Какой статус сигнала считать "новым"
 
       # Разрешённые таймфреймы сигналов
-      allowed_timeframes: ["5m", "15m", "1h", "4h"]
+      allowed_timeframes: ["5m", "15m", "1h"]
 
       # Максимальный возраст сигнала в минутах от signal_ts
-      max_signal_age_minutes: 60
+      max_signal_age_minutes: 120
 
       # Кулдаун по символу:
       # не открывать новую сделку по тому же символу, если недавно уже была сделка/попытка
-      per_symbol_cooldown_minutes: 60
+      per_symbol_cooldown_minutes: 120
 
       # Максимум попыток открытия сделки по одному сигналу
-      max_attempts_per_signal: 2
+      max_attempts_per_signal: 3
 
       # Пауза между повторными попытками по одному и тому же сигналу
       retry_cooldown_minutes: 2
@@ -96,8 +96,8 @@ traders:
       # Получение и кэширование баланса
       # ======================================================
 
-      wallet_balance_retries: 2                     # Сколько раз повторять попытку чтения баланса
-      wallet_balance_retry_backoff_sec: 1.0         # Пауза между ретраями баланса
+      wallet_balance_retries: 3                     # Сколько раз повторять попытку чтения баланса
+      wallet_balance_retry_backoff_sec: 3.0         # Пауза между ретраями баланса
 
       wallet_balance_cache_ttl_sec: 180             # TTL кэша баланса
       wallet_balance_poll_sec: 10                   # Частота опроса баланса
@@ -111,8 +111,8 @@ traders:
       hedge_enabled: true                           # true = hedge mode с LONG/SHORT
 
       # --- Hedge sizing с учетом funding
-      hedge_funding_kof_limit: 1.0                  # Порог funding в процентах, после которого разрешается корректировка размера hedge
-      hedge_koff_funding_boost: 2.0                 # Усиление hedge_koff при выгодном funding
+      hedge_funding_kof_limit: 0.6                  # Порог funding в процентах, после которого разрешается корректировка размера hedge
+      hedge_koff_funding_boost: 1.5                 # Усиление hedge_koff при выгодном funding
       hedge_koff: 1.0                               # Множитель размера hedge относительно main
 
       # --- EMA-логика для hedge
@@ -124,8 +124,8 @@ traders:
       hedge_cooldown_sec: 180                       # Кулдаун между действиями по hedge
       hedge_close_on_level: true                    # Закрывать hedge возле значимого уровня
       hedge_close_on_ema_flip: true                 # Закрывать hedge при перевороте EMA
-      hedge_level_tolerance_pct: 0.10               # Допуск вокруг уровня в процентах
-      hedge_reopen_enabled: true                    # Повторно открывать hedge после его закрытия
+      hedge_level_tolerance_pct: 0.05               # Допуск вокруг уровня в процентах
+      hedge_reopen_enabled: false                   # Повторно открывать hedge после его закрытия
       hedge_reopen_drawdown_pct: 0.5                # Порог drawdown main-позиции для повторного открытия hedge
 
       hedge_reopen_price_filter_enabled: true       # Включить повторный перезаход по цене относительно прошлого выхода hedge
@@ -138,7 +138,7 @@ traders:
       # ======================================================
 
       hedge_close_on_entry_enabled: true              # Закрывать hedge около цены входа после того, как он уже был в прибыли и текущий P/L hedge >= 0
-      hedge_close_on_entry_profit_activation_pct: 0.5 # Сначала hedge должен уйти в прибыль минимум на 0.3% от своей цены входа
+      hedge_close_on_entry_profit_activation_pct: 0.5 # Сначала hedge должен уйти в прибыль минимум на 0.5% от своей цены входа
       hedge_close_on_entry_buffer_pct: 0.35           # Буфер около цены входа для закрытия hedge в безубыток/около безубытка, но только при P/L hedge >= 0
 
       # Если main закрылась, а hedge остался открыт —
@@ -156,7 +156,7 @@ traders:
       hedge_trailing_activation_pct: 1.5            # Активация trailing в % от средней цены входа hedge
       hedge_trailing_trail_pct: 0.5                 # callbackRate (%) для trailing
       hedge_trailing_activation_buffer_pct: 0.3     # Буфер от мгновенного срабатывания
-      hedge_trailing_place_retries: 2               # Ретраи постановки hedge trailing
+      hedge_trailing_place_retries: 3               # Ретраи постановки hedge trailing
       hedge_trailing_working_type: MARK_PRICE       # MARK_PRICE или CONTRACT_PRICE
       hedge_trailing_reissue_on_avg_entry_change: true  # Перевыставлять hedge trailing при изменении средней цены hedge
 
@@ -169,7 +169,7 @@ traders:
       # ======================================================
 
       hedge_take_profit_enabled: true               # Включить отдельный take-profit для hedge
-      hedge_take_profit_pct: 6.0                    # Процент тейк-профита hedge относительно средней цены входа hedge
+      hedge_take_profit_pct: 2.0                    # Процент тейк-профита hedge относительно средней цены входа hedge
       hedge_take_profit_working_type: MARK_PRICE    # Тип триггерной цены для hedge TP: MARK_PRICE или CONTRACT_PRICE
 
       # ======================================================
@@ -177,7 +177,7 @@ traders:
       # ======================================================
 
       hedge_stop_loss_working_type: MARK_PRICE      # Тип триггерной цены для hedge stop-loss
-      hedge_stop_loss_place_retries: 2              # Сколько раз пытаться поставить hedge stop-loss при ошибке
+      hedge_stop_loss_place_retries: 3              # Сколько раз пытаться поставить hedge stop-loss при ошибке
       hedge_stop_loss_reissue_cooldown_sec: 30      # Минимальная пауза между перевыставлениями hedge stop-loss
       hedge_stop_loss_qty_tolerance: 1e-8           # Допуск сравнения qty для hedge stop-loss
 
@@ -201,7 +201,7 @@ traders:
       hedge_stop_loss_be_activation_pct_max: 8.0    # Максимально допустимое значение hedge_stop_loss_be_activation_pct
 
       # Логика сопровождения hedge после последнего добора main
-      hedge_after_last_add_follow_enabled: true           # Включить отдельное сопровождение hedge после последнего добора основной позиции
+      hedge_after_last_add_follow_enabled: false          # Включить отдельное сопровождение hedge после последнего добора основной позиции
       hedge_close_on_main_positive: false                 # Закрывать hedge, если основная позиция вышла в плюс
 
       hedge_after_last_add_follow_distance_pct: 2.0       # Дистанция сопровождения hedge после последнего добора main
@@ -209,15 +209,19 @@ traders:
       hedge_after_last_add_follow_cooldown_sec: 120       # Кулдаун между действиями follow-логики hedge
       hedge_after_last_add_follow_min_trigger_move_pct: 0.8 # Минимальное движение цены, после которого включается follow-логика
 
-      hedge_after_last_add_cancel_when_main_profit: true  # Отменять это сопровождение hedge, если main уже вышла в прибыль
+      hedge_after_last_add_cancel_when_main_profit: false  # Отменять это сопровождение hedge, если main уже вышла в прибыль
 
       # ======================================================
       # Лимиты по позициям
       # ======================================================
 
-      max_open_positions: 8                        # Максимум одновременно открытых позиций
-      max_position_notional_pct_wallet: 20.0       # Ограничение notional одной позиции как % от кошелька
+      max_open_positions: 5                        # Максимум одновременно открытых позиций
+      max_position_notional_pct_wallet: 15.0       # Ограничение notional одной позиции как % от кошелька
       risk_wallet_pct: 2.0                         # Риск на сделку от кошелька
+
+      live_entry_reduce_on_max_position: true
+      live_entry_reduce_steps: 5
+      live_entry_reduce_factor: 0.85
 
       # ======================================================
       # Базовые SL / TP
@@ -258,11 +262,11 @@ traders:
       trailing_activation_pct: 1.5                 # Активация trailing после +X% в прибыль
       trailing_trail_pct: 0.5                      # Дистанция trailing (%)
 
-      trailing_activation_buffer_pct: 0.25         # Буфер от мгновенного срабатывания trailing после его постановки
-      tp_trigger_buffer_pct: 0.25                  # Буфер для triggerPrice TP, чтобы ордер не срабатывал мгновенно
+      trailing_activation_buffer_pct: 0.5         # Буфер от мгновенного срабатывания trailing после его постановки
+      tp_trigger_buffer_pct: 0.5                  # Буфер для triggerPrice TP, чтобы ордер не срабатывал мгновенно
 
-      trailing_place_retries: 2                    # Сколько раз повторять постановку trailing при ошибке Binance
-      tp_place_retries: 2                          # Сколько раз повторять постановку TP при ошибке Binance
+      trailing_place_retries: 3                    # Сколько раз повторять постановку trailing при ошибке Binance
+      tp_place_retries: 3                          # Сколько раз повторять постановку TP при ошибке Binance
 
       # ======================================================
       # Усреднение (averaging / adds)
@@ -292,8 +296,8 @@ traders:
       averaging_vp_top_nodes: 10                   # Сколько top volume nodes учитывать при выборе уровней
 
       # Параметры pivot / кластеризации
-      averaging_pivot_left: 4                      # Количество свечей слева для определения pivot
-      averaging_pivot_right: 4                     # Количество свечей справа для определения pivot
+      averaging_pivot_left: 5                      # Количество свечей слева для определения pivot
+      averaging_pivot_right: 5                     # Количество свечей справа для определения pivot
       averaging_cluster_tolerance_pct: 0.25        # Допуск для объединения близких уровней в кластер
 
       # Технические параметры перевыставления/сравнения уровней
@@ -336,7 +340,7 @@ traders:
       # Если сумма value открытых позиций / wallet >= ratio,
       # новые сделки не открывать.
       # 0 = OFF
-      portfolio_cap_ratio: 0.9                     # Максимальная суммарная загрузка портфеля относительно кошелька
+      portfolio_cap_ratio: 0.7                     # Максимальная суммарная загрузка портфеля относительно кошелька
 
       # ======================================================
       # Reconcile (сверка биржи и леджера)

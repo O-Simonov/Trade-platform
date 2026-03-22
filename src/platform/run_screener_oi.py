@@ -1,23 +1,27 @@
 # src/platform/run_screener_oi.py
 from __future__ import annotations
 
-import os
 import time
 import logging
 import shutil
 from pathlib import Path
 from datetime import datetime, timezone, date, timedelta
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Set, Tuple
 
 import yaml
 from psycopg.errors import UniqueViolation
 
+from src.platform.config.env import (
+    get_environment,
+    get_log_level,
+    get_pg_dsn,
+    require,
+)
 from src.platform.data.storage.postgres.pool import create_pool
 from src.platform.data.storage.postgres.storage import PostgreSQLStorage
 from src.platform.screeners.scr_oi_binance import ScrOiBinance, ScreenerSignal
 from src.platform.screeners.plotting_oi import save_oi_signal_plot
 
-# Telegram helpers (same style as run_screeners.py)
 from src.platform.notifications.telegram import (
     load_dotenv_file,
     resolve_targets_from_env,
@@ -29,6 +33,17 @@ from src.platform.notifications.telegram import (
 from src.platform.core.utils.candles import interval_to_timedelta
 
 log = logging.getLogger("platform.run_screener_oi")
+
+
+def _setup_logging() -> None:
+    level_name = get_log_level()
+    level = getattr(logging, level_name, logging.INFO)
+
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        force=True,
+    )
 
 
 def _utc_now() -> datetime:
@@ -52,12 +67,26 @@ def _jsonable(v: Any) -> Any:
     return str(v)
 
 
-def _load_cfg() -> dict:
-    cfg_path = os.getenv("OI_SCREENERS_CONFIG", "config/screener_oi.yaml")
-    p = Path(cfg_path)
-    if not p.exists():
-        raise FileNotFoundError(f"OI_SCREENERS_CONFIG not found: {p}")
-    return yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+def _resolve_cfg_path() -> Path:
+    raw_path = require("OI_SCREENERS_CONFIG")
+    path = Path(raw_path).expanduser()
+
+    if not path.is_absolute():
+        path = (Path.cwd() / path).resolve()
+    else:
+        path = path.resolve()
+
+    if not path.exists():
+        raise FileNotFoundError(f"OI_SCREENERS_CONFIG not found: {path}")
+
+    if not path.is_file():
+        raise FileNotFoundError(f"OI_SCREENERS_CONFIG is not a file: {path}")
+
+    return path
+
+
+def _load_cfg(path: Path) -> dict:
+    return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
 
 
 # -----------------------------
@@ -145,6 +174,16 @@ def _insert_signals_safe(store: PostgreSQLStorage, rows: List[Dict[str, Any]]) -
     except UniqueViolation:
         log.warning("Signals insert skipped: duplicates (UniqueViolation)")
         return 0
+
+
+def _ping_db(store: PostgreSQLStorage) -> tuple[datetime, int]:
+    row_now = store.query_one("SELECT now()")
+    now = row_now[0] if row_now else _utc_now()
+
+    row_cnt = store.query_one("SELECT COUNT(*) FROM screeners")
+    screeners_total = int(row_cnt[0] if row_cnt else 0)
+
+    return now, screeners_total
 
 
 # -----------------------------
@@ -257,7 +296,6 @@ def _cleanup_old_plots(root: Path, *, keep_days: int) -> None:
                 except Exception:
                     pass
 
-        # remove empty symbol folder
         try:
             if sym_dir.exists() and sym_dir.is_dir() and not any(sym_dir.iterdir()):
                 sym_dir.rmdir()
@@ -285,7 +323,7 @@ def run_once(store: PostgreSQLStorage, screener_cfg: dict) -> None:
         return
 
     exchange_id = int(params.get("exchange_id", 1))
-    # interval(s): allow either "interval: 5m" or "intervals: [5m, 15m]"
+
     _raw_intervals = params.get("intervals", params.get("interval", "5m"))
     if isinstance(_raw_intervals, (list, tuple)):
         intervals = [str(x).strip() for x in _raw_intervals if str(x).strip()]
@@ -298,18 +336,21 @@ def run_once(store: PostgreSQLStorage, screener_cfg: dict) -> None:
     if not intervals:
         intervals = ["5m"]
 
-    # plot settings
     plots_enabled = bool(params.get("plots_enabled", True))
     plots_dir = Path(params.get("plots_dir", "artifacts/screener_plots"))
     keep_plots_days = int(params.get("keep_plots_days", 2))
     plot_lookback_bars = int(params.get("plot_lookback_bars", 220))
 
-    # telegram settings
     tg_send_messages = bool(params.get("telegram_send_messages", True))
     tg_send_plots = bool(params.get("telegram_send_plots", True))
     tg_silent = bool(params.get("telegram_silent", False))
-    screener_id = store.ensure_screener(name=name, version=version, description="Open Interest screener (multi-tf)")
-    scr = registry[name]()  # type: ignore
+
+    screener_id = store.ensure_screener(
+        name=name,
+        version=version,
+        description="Open Interest screener (multi-tf)",
+    )
+    scr = registry[name]()
 
     for interval in intervals:
         interval = str(interval).strip() or "5m"
@@ -325,27 +366,35 @@ def run_once(store: PostgreSQLStorage, screener_cfg: dict) -> None:
             signals = scr.run(storage=store, exchange_id=exchange_id, interval=interval, params=params_i) or []
             total_found = len(signals)
 
-            # freshness filter
             now_ts = _utc_now()
             fresh: List[ScreenerSignal] = []
             for s in signals:
                 age_min = (now_ts - s.signal_ts).total_seconds() / 60.0
-                if age_min < -5:  # future signal -> skip
+                if age_min < -5:
                     continue
                 if age_min <= float(max_signal_age_minutes_i):
                     fresh.append(s)
 
-            # dedup
             pairs = [(s.symbol_id, s.signal_ts) for s in fresh]
-            existing = _fetch_existing_signal_pairs(store, exchange_id=exchange_id, screener_id=screener_id, timeframe=interval, pairs=pairs)
+            existing = _fetch_existing_signal_pairs(
+                store,
+                exchange_id=exchange_id,
+                screener_id=screener_id,
+                timeframe=interval,
+                pairs=pairs,
+            )
             new_signals = [s for s in fresh if (s.symbol_id, s.signal_ts) not in existing]
             total_new = len(new_signals)
 
-            # insert rows
             rows: List[Dict[str, Any]] = []
             for s in new_signals:
                 signal_day = s.signal_ts.date()
-                day_seq = store.next_signal_seq(exchange_id=exchange_id, symbol_id=s.symbol_id, screener_id=screener_id, signal_day=signal_day)
+                day_seq = store.next_signal_seq(
+                    exchange_id=exchange_id,
+                    symbol_id=s.symbol_id,
+                    screener_id=screener_id,
+                    signal_day=signal_day,
+                )
 
                 rows.append(
                     {
@@ -373,7 +422,6 @@ def run_once(store: PostgreSQLStorage, screener_cfg: dict) -> None:
 
             inserted = _insert_signals_safe(store, rows)
 
-            # telegram
             if inserted > 0 and (tg_send_messages or tg_send_plots):
                 targets = _resolve_telegram_targets(params)
 
@@ -384,25 +432,23 @@ def run_once(store: PostgreSQLStorage, screener_cfg: dict) -> None:
                         for t in targets:
                             send_telegram_message(part, target=t, disable_notification=bool(tg_silent))
 
-                # plots (save + optional send)
-                if bool(params_i.get('plots_enabled', plots_enabled)) or tg_send_plots:
+                if bool(params_i.get("plots_enabled", plots_enabled)) or tg_send_plots:
                     td = interval_to_timedelta(interval)
-                    # OI key for plotting (can differ from calc key)
                     oi_plot_key = str(
                         params_i.get("oi_plot_key")
-                        or params_i.get("oi_value_key")  # backward-compat
+                        or params_i.get("oi_value_key")
                         or "open_interest_value"
                     ).strip()
                     if oi_plot_key not in ("open_interest_value", "open_interest"):
                         oi_plot_key = "open_interest_value"
+
                     for s in new_signals:
                         signal_day = s.signal_ts.date().isoformat()
                         ts_tag = s.signal_ts.strftime("%Y%m%d_%H%M%S")
                         out_path = plots_dir / name / s.symbol / signal_day / f"{s.symbol}_{interval}_{s.side}_{ts_tag}.png"
 
-                        # candles window for plot
                         center = s.signal_ts
-                        lookback = max(50, int(params_i.get('plot_lookback_bars', plot_lookback_bars)))
+                        lookback = max(50, int(params_i.get("plot_lookback_bars", plot_lookback_bars)))
                         candles = store.fetch_candles_window(
                             exchange_id=int(exchange_id),
                             symbol_id=int(s.symbol_id),
@@ -412,13 +458,12 @@ def run_once(store: PostgreSQLStorage, screener_cfg: dict) -> None:
                             lookforward=0,
                         ) or []
 
-                        # oi series for plot (same range)
                         start_ts = center - td * lookback
                         end_ts = center + td * 2
                         oi_rows = _fetch_oi_series(
                             store,
                             exchange_id=exchange_id,
-                            symbol_id=s.symbol_id,
+                            symbol_id=int(s.symbol_id),
                             interval=interval,
                             start_ts=start_ts,
                             end_ts=end_ts,
@@ -432,8 +477,8 @@ def run_once(store: PostgreSQLStorage, screener_cfg: dict) -> None:
                         title_extra = ""
                         try:
                             ctx = s.context or {}
-                            funding_pct = ctx.get('funding_pct', None)
-                            funding_s = '' if funding_pct is None else f" | Funding {float(funding_pct):.4g}%"
+                            funding_pct = ctx.get("funding_pct", None)
+                            funding_s = "" if funding_pct is None else f" | Funding {float(funding_pct):.4g}%"
                             title_extra = (
                                 f"{oi_plot_key} | "
                                 f"OI {ctx.get('oi_trigger_ret_pct', 0):.2f}% | "
@@ -473,8 +518,10 @@ def run_once(store: PostgreSQLStorage, screener_cfg: dict) -> None:
                                     disable_notification=bool(tg_silent),
                                 )
 
-                    # retention (keep only last N days)
-                    _cleanup_old_plots(plots_dir / name, keep_days=int(params_i.get('keep_plots_days', keep_plots_days)))
+                    _cleanup_old_plots(
+                        plots_dir / name,
+                        keep_days=int(params_i.get("keep_plots_days", keep_plots_days)),
+                    )
 
             elapsed = time.time() - t0
             store.finish_screener_run(
@@ -499,37 +546,49 @@ def run_once(store: PostgreSQLStorage, screener_cfg: dict) -> None:
                 elapsed,
             )
         except Exception as e:
-            store.finish_screener_run(run_id=run_id, status="FAILED", error=str(e), stats={"found": int(total_found)})
+            store.finish_screener_run(
+                run_id=run_id,
+                status="FAILED",
+                error=str(e),
+                stats={"found": int(total_found)},
+            )
             raise
 
 
 def main() -> None:
-    logging.basicConfig(
-        level=os.getenv("LOG_LEVEL", "INFO").upper(),
-        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    )
+    _setup_logging()
 
-    # env (tokens etc.)
+    environment = get_environment()
+
     try:
-        load_dotenv_file(".env", override=False)
+        loaded = int(load_dotenv_file(".env", override=False) or 0)
+        if loaded:
+            log.info("Loaded .env: %s", str(Path(".env").resolve()))
     except OSError:
         pass
+    except Exception:
+        log.debug("Failed to load .env", exc_info=True)
 
-    cfg = _load_cfg()
+    cfg_path = _resolve_cfg_path()
+    cfg = _load_cfg(cfg_path)
     restart_min = int(cfg.get("restart_interval_minutes", 5))
     screeners = _get_screeners(cfg)
 
     log.info("=== RUN OI SCREENER START ===")
-    log.info("OI_SCREENERS_CONFIG=%s", os.getenv("OI_SCREENERS_CONFIG", "config/screener_oi.yaml"))
+    log.info("Environment: %s", environment)
+    log.info("OI_SCREENERS_CONFIG=%s", str(cfg_path))
     log.info("Screeners in config: %s", len(screeners))
     log.info("------------------------------------------------------------")
 
-    dsn = os.getenv("PG_DSN") or os.getenv("POSTGRES_DSN") or os.getenv("DATABASE_URL")
-    if not dsn:
-        raise RuntimeError("PG_DSN (or POSTGRES_DSN/DATABASE_URL) env is not set")
-
+    dsn = get_pg_dsn()
     pool = create_pool(dsn)
     store = PostgreSQLStorage(pool)
+
+    try:
+        db_now, screeners_total = _ping_db(store)
+        log.info("DB ping OK: now=%s | screeners_total=%d", str(db_now), int(screeners_total))
+    except Exception:
+        log.exception("DB ping failed")
 
     while True:
         for sc in screeners:
@@ -538,7 +597,9 @@ def main() -> None:
         if restart_min <= 0:
             break
 
-        time.sleep(max(5, restart_min * 60))
+        sleep_s = max(5, restart_min * 60)
+        log.info("Cycle sleep %ss (restart_interval_minutes=%s)", sleep_s, restart_min)
+        time.sleep(sleep_s)
 
 
 if __name__ == "__main__":

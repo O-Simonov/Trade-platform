@@ -22,9 +22,33 @@ from urllib.parse import urlencode
 import websocket  # type: ignore
 
 from src.platform.data.storage.postgres.pool import create_pool
+from src.platform.config.env import get_environment, get_log_level, get_pg_dsn, optional
 
 
 log = logging.getLogger("platform.run_balance")
+
+
+def _setup_logging() -> None:
+    level_name = get_log_level()
+    level = getattr(logging, level_name, logging.INFO)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    )
+
+
+def _resolve_instances_cfg_path() -> Path:
+    raw_path = optional("INSTANCES_CONFIG", "config/balance_instances.yaml") or "config/balance_instances.yaml"
+    path = Path(raw_path).expanduser()
+    if not path.is_absolute():
+        path = (Path.cwd() / path).resolve()
+    else:
+        path = path.resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"INSTANCES_CONFIG points to missing file: {path}")
+    if not path.is_file():
+        raise FileNotFoundError(f"INSTANCES_CONFIG is not a file: {path}")
+    return path
 
 
 class RateLimitError(RuntimeError):
@@ -91,11 +115,7 @@ def _load_dotenv_if_present() -> Optional[Path]:
 
 
 def _get_env(name: str, default: Optional[str] = None) -> Optional[str]:
-    v = os.getenv(name)
-    if v is None:
-        return default
-    v = v.strip()
-    return v if v else default
+    return optional(name, default)
 
 
 # =============================================================================
@@ -2134,10 +2154,7 @@ class AccountBalanceWriter:
 # =============================================================================
 
 def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    )
+    _setup_logging()
 
     log.info("=== RUN BALANCE WRITER START ===")
 
@@ -2145,12 +2162,12 @@ def main() -> None:
     if env_loaded:
         log.info("Loaded .env: %s", env_loaded)
 
-    dsn = os.getenv("PG_DSN", "").strip()
-    if not dsn:
-        raise RuntimeError("PG_DSN env var is required")
-
-    cfg_path = Path(os.getenv("INSTANCES_CONFIG", "config/balance_instances.yaml")).resolve()
+    environment = get_environment()
+    dsn = get_pg_dsn()
+    cfg_path = _resolve_instances_cfg_path()
     instances = _parse_instances(cfg_path)
+
+    log.info("Environment: %s", environment)
     log.info("Config: %s | instances=%s", cfg_path, len(instances))
 
     pool = create_pool(dsn)

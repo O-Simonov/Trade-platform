@@ -5,7 +5,7 @@ import os
 import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 # ======================================================================
 # HARD-SAFE matplotlib setup (Windows Server / no GUI / no crashes)
@@ -37,6 +37,48 @@ from matplotlib.patches import Rectangle
 
 def _ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
+
+
+def _cleanup_old_plot_files(*, root_dir: Path, keep_days: int) -> int:
+    """
+    Удаляет PNG-файлы графиков старше keep_days дней внутри root_dir.
+    Возвращает количество удалённых файлов.
+
+    keep_days:
+      - <= 0 -> очистка отключена
+      - 1 -> хранить примерно последние 24 часа
+      - 2 -> хранить примерно последние 48 часов
+    """
+    try:
+        keep_days = int(keep_days)
+    except Exception:
+        return 0
+
+    if keep_days <= 0:
+        return 0
+
+    try:
+        root = Path(root_dir)
+        if not root.exists() or not root.is_dir():
+            return 0
+
+        cutoff = datetime.now(timezone.utc) - timedelta(days=keep_days)
+        removed = 0
+
+        for fp in root.rglob('*.png'):
+            try:
+                if not fp.is_file():
+                    continue
+                mtime = datetime.fromtimestamp(fp.stat().st_mtime, tz=timezone.utc)
+                if mtime < cutoff:
+                    fp.unlink(missing_ok=True)
+                    removed += 1
+            except Exception:
+                continue
+
+        return removed
+    except Exception:
+        return 0
 
 
 def _utc(dt: Any) -> Optional[datetime]:
@@ -400,6 +442,8 @@ def save_pump_plot(
     # AVG
     base_avg_price: Optional[float] = None,
     base_lookback_bars: Optional[int] = None,
+    # retention
+    keep_plots_days: Optional[int] = None,
 ) -> None:
     if not candles:
         return
@@ -611,6 +655,20 @@ def save_pump_plot(
     _safe_tight_layout(fig)
     fig.savefig(str(out_path), bbox_inches="tight")
 
+    if keep_plots_days is not None:
+        try:
+            cleanup_root = out_path.parent
+            try:
+                parents = out_path.parents
+                if len(parents) >= 3:
+                    cleanup_root = parents[2]  # plots_dir / screener_name
+            except Exception:
+                cleanup_root = out_path.parent
+
+            _cleanup_old_plot_files(root_dir=cleanup_root, keep_days=int(keep_plots_days))
+        except Exception:
+            pass
+
 
 def save_pump_signal_plot(
     *,
@@ -634,6 +692,7 @@ def save_pump_signal_plot(
     cvd_series: Optional[List[Dict[str, Any]]] = None,
     base_avg_price: Optional[float] = None,
     base_lookback_bars: Optional[int] = None,
+    keep_plots_days: Optional[int] = None,
 ) -> None:
     save_pump_plot(
         out_path=out_path,
@@ -655,4 +714,5 @@ def save_pump_signal_plot(
         take_profit=take_profit,
         base_avg_price=base_avg_price,
         base_lookback_bars=base_lookback_bars,
+        keep_plots_days=keep_plots_days,
     )

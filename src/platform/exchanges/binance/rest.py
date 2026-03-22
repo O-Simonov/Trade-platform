@@ -540,6 +540,9 @@ class BinanceFuturesREST:
             try:
                 data = self._safe_json(response)
             except BinanceRESTError as e:
+                # Fail-fast for fundingRate non-JSON/403 responses
+                if "/fapi/v1/fundingRate" in path and ("403" in str(e) or "non-json response" in str(e)):
+                    raise
                 if attempt <= self.max_retries:
                     sleep_s = min(backoff, self.max_backoff) + random.uniform(0.0, 0.3)
                     log.warning(
@@ -594,6 +597,9 @@ class BinanceFuturesREST:
                 raise BinanceRESTError(method=method, path=path, status=status, payload=data, message="rate-limited")
 
             if status >= 400:
+                # Fail-fast for fundingRate 403 (WAF/HTML) – do not retry
+                if "/fapi/v1/fundingRate" in path and int(status) == 403:
+                    raise BinanceRESTError(method=method, path=path, status=status, payload=data, message="forbidden")
                 if attempt <= self.max_retries and _is_retryable_http(status):
                     sleep_s = min(backoff, self.max_backoff) + random.uniform(0.0, 0.3)
                     log.warning(

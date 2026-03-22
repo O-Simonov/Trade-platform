@@ -385,6 +385,9 @@ class ScrParams:
     max_symbols: int = 0
     scan_lookback_bars: int = 200
 
+    # plots retention
+    keep_plots_days: int = 0
+
     # debug
     debug: bool = False
     debug_top: int = 3
@@ -537,6 +540,9 @@ def _parse_params(params: Dict[str, Any]) -> ScrParams:
     # scan
     p.max_symbols = _to_int(params.get("max_symbols"), p.max_symbols)
     p.scan_lookback_bars = max(50, _to_int(params.get("scan_lookback_bars"), p.scan_lookback_bars))
+
+    # plots retention
+    p.keep_plots_days = max(0, _to_int(params.get("keep_plots_days"), p.keep_plots_days))
 
     # debug
     p.debug = bool(params.get("debug", p.debug))

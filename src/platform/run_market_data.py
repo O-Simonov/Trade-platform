@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import inspect
 import logging
-import os
 import signal
 import threading
 import time
@@ -12,6 +11,13 @@ from typing import Any, Dict, Optional
 import math
 import yaml
 
+from src.platform.config.env import (
+    get_environment,
+    get_log_level,
+    get_marketdata_config,
+    get_marketdata_instance,
+    get_pg_dsn,
+)
 from src.platform.data.retention.retention_worker import RetentionWorker
 from src.platform.data.storage.postgres.pool import create_pool
 from src.platform.data.storage.postgres.storage import PostgreSQLStorage
@@ -74,54 +80,31 @@ log = logging.getLogger("platform.run_market_data")
 # ============================================================
 
 def _setup_logging() -> None:
+    level_name = get_log_level()
+    level = getattr(logging, level_name, logging.INFO)
+
     logging.basicConfig(
-        level=logging.INFO,
+        level=level,
         format="%(asctime)s | %(levelname)s | %(name)s | %(threadName)s | %(message)s",
     )
 
 
-def _find_cfg_candidate(base: Path) -> Optional[Path]:
-    """
-    Ищем config/market_data.yaml вверх по дереву.
-    MARKETDATA_CONFIG (env) имеет приоритет.
-    """
-    base = base.resolve()
-    for _ in range(0, 12):
-        p = (base / "config" / "market_data.yaml").resolve()
-        if p.exists():
-            return p
-        if base.parent == base:
-            break
-        base = base.parent
-    return None
-
-
 def _resolve_cfg_path() -> Path:
-    tried: list[str] = []
+    raw_path = get_marketdata_config()
+    path = Path(raw_path).expanduser()
 
-    p_env = os.environ.get("MARKETDATA_CONFIG")
-    if p_env:
-        cand = Path(p_env).expanduser()
-        cand = (Path.cwd() / cand).resolve() if not cand.is_absolute() else cand.resolve()
-        tried.append(str(cand))
-        if cand.exists():
-            return cand
+    if not path.is_absolute():
+        path = (Path.cwd() / path).resolve()
+    else:
+        path = path.resolve()
 
-    cand = _find_cfg_candidate(Path.cwd())
-    if cand:
-        return cand
-    tried.append(str((Path.cwd() / "config" / "market_data.yaml").resolve()))
+    if not path.exists():
+        raise FileNotFoundError(f"MARKETDATA_CONFIG points to missing file: {path}")
 
-    here = Path(__file__).resolve()
-    cand = _find_cfg_candidate(here.parent)
-    if cand:
-        return cand
-    tried.append(str((here.parent / "config" / "market_data.yaml").resolve()))
+    if not path.is_file():
+        raise FileNotFoundError(f"MARKETDATA_CONFIG is not a file: {path}")
 
-    raise FileNotFoundError(
-        "Не найден MarketData конфиг. Пробовали:\n- " + "\n- ".join(tried)
-        + "\nПодсказка: установи MARKETDATA_CONFIG на явный путь к YAML."
-    )
+    return path
 
 
 def _load_cfg() -> dict:
@@ -149,7 +132,6 @@ def _estimate_seed_pages(seed_days: int, interval: str, limit: int) -> int:
     limit = max(50, min(int(limit), 1500))
     itv = str(interval).strip().lower()
 
-    # seconds per candle
     if itv.endswith("m"):
         sec = int(itv[:-1]) * 60
     elif itv.endswith("h"):
@@ -162,6 +144,7 @@ def _estimate_seed_pages(seed_days: int, interval: str, limit: int) -> int:
     bars = int((seed_days * 86400) / max(1, sec))
     pages = max(1, math.ceil(bars / limit))
     return int(pages)
+
 
 # ============================================================
 # REST LIMITS / REST CLIENT
@@ -185,6 +168,8 @@ def _apply_rest_limits_from_cfg(cfg: dict) -> None:
     max_rps = _f(limits.get("max_rps", 5.0), 5.0)
     max_rpm = _i(limits.get("max_rpm", 300), 300)
     force = bool(limits.get("force", False))
+
+    import os
 
     env_rps = os.environ.get("BINANCE_REST_MAX_RPS")
     env_rpm = os.environ.get("BINANCE_REST_MAX_RPM")
@@ -255,10 +240,6 @@ def _make_symbol_id_to_symbol(symbol_map: Dict[str, int]) -> Dict[int, str]:
 
 # ============================================================
 # WATERMARKS (1 SQL query) — ускорение старта
-# Под твою реальную схему БД:
-#  - candles(exchange_id, symbol_id, interval, open_time)
-#  - open_interest(exchange_id, symbol_id, interval, ts)
-#  - candles_trades_agg(exchange_id, symbol_id, interval, open_time)
 # ============================================================
 
 def _uniq_keep_order(xs: list[str]) -> list[str]:
@@ -318,11 +299,6 @@ def _load_watermarks_one_query(
         "open_interest": { "123": { "5m": ts, ... }, ... },
         "trades_agg": { "123": { "1m": ts, "5m": ts }, ... },
       }
-
-    Важно:
-      - candles: MAX(open_time)
-      - open_interest: MAX(ts)
-      - candles_trades_agg: MAX(open_time)
     """
     candle_intervals = _uniq_keep_order([x for x in (candle_intervals or []) if x])
     oi_intervals = _uniq_keep_order([x for x in (oi_intervals or []) if x])
@@ -632,20 +608,44 @@ def _symbols_refresher(
 
 def main() -> None:
     _setup_logging()
+
+    instance_name = get_marketdata_instance()
+    environment = get_environment()
     cfg = _load_cfg()
+    cfg_path = cfg.get("_path")
 
     log.info("=== RUN MARKET DATA START ===")
-    log.info("Config: %s", cfg.get("_path"))
+    log.info("Instance: %s", instance_name)
+    log.info("Environment: %s", environment)
+    log.info("Config: %s", cfg_path)
 
-    dsn = os.environ.get("PG_DSN") or os.environ.get("POSTGRES_DSN")
-    if not dsn:
-        raise RuntimeError("PG_DSN or POSTGRES_DSN env is required")
-
+    dsn = get_pg_dsn()
     pool = create_pool(dsn)
     storage = PostgreSQLStorage(pool=pool)
     log.info("PostgreSQL storage initialized")
 
     exchange_id = int(cfg.get("exchange_id", 1))
+
+    log.info(
+        "[BOOT] instance=%s exchange_id=%s environment=%s",
+        instance_name,
+        exchange_id,
+        environment,
+    )
+
+    log.info(
+        "[BOOT] sections: universe=%s candles=%s oi=%s funding=%s ticker_24h=%s liquidations=%s market_trades=%s market_trades_all=%s retention=%s market_state_5m=%s",
+        bool((cfg.get("universe") or {}).get("enabled", True)),
+        bool((cfg.get("market_data") or {}).get("enabled", True)),
+        bool((cfg.get("open_interest") or {}).get("enabled", False)),
+        bool((cfg.get("funding") or {}).get("enabled", False)),
+        bool((cfg.get("ticker_24h") or {}).get("enabled", False)),
+        bool((cfg.get("liquidations") or {}).get("enabled", False)),
+        bool((cfg.get("market_trades") or {}).get("enabled", False)),
+        bool((cfg.get("market_trades_all") or {}).get("enabled", False)),
+        bool((cfg.get("retention") or {}).get("enabled", True)),
+        bool((cfg.get("market_state_5m") or {}).get("enabled", True)),
+    )
 
     _apply_rest_limits_from_cfg(cfg)
     rest = _make_rest_public_no_keys()
@@ -738,19 +738,16 @@ def main() -> None:
     # helper snapshots
     # --------------------------------------------------------
     def _symbol_map_snapshot() -> Dict[str, int]:
-        """{SYMBOL: symbol_id}"""
         with shared_lock:
             smap = shared.get("symbol_map") or {}
             return dict(smap)
 
     def _symbol_ids_snapshot() -> list[int]:
-        """list[symbol_id]"""
         with shared_lock:
             sids = shared.get("symbol_ids") or []
             return [int(x) for x in sids]
 
     def _symbol_id_to_symbol_snapshot() -> Dict[int, str]:
-        """{symbol_id: SYMBOL}"""
         with shared_lock:
             m = shared.get("symbol_id_to_symbol") or {}
             return {int(k): str(v).upper() for k, v in m.items()}
@@ -769,7 +766,7 @@ def main() -> None:
                 rest=rest,
                 storage=storage,
                 exchange_id=exchange_id,
-                symbol_ids=_symbol_map_snapshot(),  # оставляем как было (у тебя уже работает)
+                symbol_ids=_symbol_map_snapshot(),
                 interval_sec=int(sf_cfg.get("refresh_sec", 3600)),
                 do_seed_on_start=bool(sf_cfg.get("seed_on_start", True)),
                 stop_event=stop_event,
@@ -811,7 +808,7 @@ def main() -> None:
                 storage=storage,
                 rest=rest,
                 exchange_id=int(exchange_id),
-                symbol_ids=_symbol_map_snapshot(),  # {SYMBOL: symbol_id}
+                symbol_ids=_symbol_map_snapshot(),
                 intervals=intervals,
                 update_open_candle=bool(md_cfg.get("update_open_candle", True)),
                 stop_event=stop_event,
@@ -830,8 +827,6 @@ def main() -> None:
                 ws_max_buffer=int(md_cfg.get("ws_max_buffer", 2000)),
                 ws_ping_interval=int(md_cfg.get("ws_ping_interval", 60)),
                 ws_ping_timeout=int(md_cfg.get("ws_ping_timeout", 30)),
-
-                # REST tail catchup on WS connect
                 rest_catchup_on_connect=bool(md_cfg.get("rest_catchup_on_connect", True)),
                 rest_catchup_first_worker_only=bool(md_cfg.get("rest_catchup_first_worker_only", True)),
                 rest_catchup_overlap_minutes=int(md_cfg.get("rest_catchup_overlap_minutes", 120)),
@@ -839,10 +834,7 @@ def main() -> None:
                 rest_catchup_max_pages=int(md_cfg.get("rest_catchup_max_pages", 2)),
                 catchup_seed_days=int(md_cfg.get("catchup_seed_days", 2)),
                 catchup_max_symbols=int(md_cfg.get("catchup_max_symbols", 0)),
-
-                # WS supervisor config (optional dict)
                 ws_supervisor=md_cfg.get("ws_supervisor"),
-
             )
     else:
         log.warning("Candles disabled by config")
@@ -944,7 +936,7 @@ def main() -> None:
     _stagger_wait(stop_event, cfg, "after_candles_active", 1.00)
 
     # --------------------------------------------------------
-    # Open Interest  ✅✅✅ FIX HERE
+    # Open Interest
     # --------------------------------------------------------
     oi_cfg = cfg.get("open_interest") or {}
     if oi_cfg.get("enabled", False):
@@ -959,17 +951,10 @@ def main() -> None:
                 rest=rest,
                 storage=storage,
                 exchange_id=exchange_id,
-
-                # ВАЖНО: list[int]
                 symbol_ids=_symbol_ids_snapshot(),
-
-                # ✅ reverse-map id -> symbol достаточно
                 symbol_id_to_symbol=_symbol_id_to_symbol_snapshot(),
-
                 cfg=oi_cfg,
                 stop_event=stop_event,
-
-                # ✅ watermarks поддерживаются
                 watermarks=watermarks,
             )
     else:
@@ -1052,7 +1037,7 @@ def main() -> None:
     _stagger_wait(stop_event, cfg, "after_liquidations", 0.50)
 
     # --------------------------------------------------------
-    # MarketState5mWorker (expects list[int])
+    # MarketState5mWorker
     # --------------------------------------------------------
     ms5_cfg = cfg.get("market_state_5m", {}) or {}
     if ms5_cfg.get("enabled", True):
@@ -1121,7 +1106,8 @@ def main() -> None:
                 smap = _symbol_map_snapshot()
                 sids = _symbol_ids_snapshot()
                 log.info(
-                    "[HEARTBEAT] alive threads=%d active_symbols=%d symbol_ids=%d",
+                    "[HEARTBEAT] instance=%s alive threads=%d active_symbols=%d symbol_ids=%d",
+                    instance_name,
                     threading.active_count(),
                     len(smap),
                     len(sids),

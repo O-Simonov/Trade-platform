@@ -1,7 +1,7 @@
+# src/platform/run_trade_liquidation.py
 from __future__ import annotations
 
 import logging
-import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -9,17 +9,54 @@ from typing import Any, Dict, Tuple
 
 import yaml
 
+from src.platform.config.env import (
+    get_environment,
+    get_log_level,
+    get_pg_dsn,
+    require,
+)
 from src.platform.data.storage.postgres.pool import create_pool
 from src.platform.data.storage.postgres.storage import PostgreSQLStorage
-from src.platform.traders.trade_liquidation import TradeLiquidation, TradeLiquidationParams
-from src.platform.traders import trade_liquidation_full_ready  # noqa: F401
 from src.platform.notifications.telegram import load_dotenv_file
+from src.platform.traders import trade_liquidation_full_ready  # noqa: F401
+from src.platform.traders.trade_liquidation import (
+    TradeLiquidation,
+    TradeLiquidationParams,
+)
 
 log = logging.getLogger("platform.run_trade_liquidation")
 
 
+def _setup_logging() -> None:
+    level_name = get_log_level()
+    level = getattr(logging, level_name, logging.INFO)
+
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    )
+
+
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _resolve_cfg_path() -> Path:
+    raw_path = require("TRADE_LIQUIDATION_CONFIG")
+    path = Path(raw_path).expanduser()
+
+    if not path.is_absolute():
+        path = (Path.cwd() / path).resolve()
+    else:
+        path = path.resolve()
+
+    if not path.exists():
+        raise SystemExit(f"Config not found: {path}")
+
+    if not path.is_file():
+        raise SystemExit(f"TRADE_LIQUIDATION_CONFIG is not a file: {path}")
+
+    return path
 
 
 def _load_yaml(path: Path) -> Dict[str, Any]:
@@ -88,7 +125,6 @@ def _extract_stats(res: Any) -> Tuple[int, int, int, int, int, float]:
 
         expired = _as_int(res.get("expired"), 0)
 
-        # совместимость со старыми/промежуточными версиями
         if "found" in res:
             found = _as_int(res.get("found"), found)
         if "created" in res:
@@ -98,7 +134,6 @@ def _extract_stats(res: Any) -> Tuple[int, int, int, int, int, float]:
         else:
             elapsed = _as_float(res.get("elapsed_sec"), 0.0)
 
-        # если кто-то пишет плоские поля closed/checked — поддержим
         if not isinstance(res.get("closed"), dict) and "closed" in res:
             closed = _as_int(res.get("closed"), closed)
         if not isinstance(res.get("checked"), dict) and "checked" in res:
@@ -121,27 +156,23 @@ def _extract_stats(res: Any) -> Tuple[int, int, int, int, int, float]:
 
 
 def main() -> None:
+    _setup_logging()
+
     log.info("=== RUN TRADE LIQUIDATION START ===")
 
-    # Keep behavior consistent with other runners:
-    # load .env if present (do NOT override explicit env vars).
-    # This is critical for LIVE mode, because API keys are expected to live in ENV.
+    environment = get_environment()
+
+    # Для live-режима оставляем совместимость:
+    # ключи могут лежать в .env, а стратегия ждёт их в ENV.
     try:
         loaded = int(load_dotenv_file(".env", override=False) or 0)
         if loaded:
             log.info("Loaded .env: %s", str(Path(".env").resolve()))
     except Exception:
-        # Never crash runner because of dotenv parsing.
         log.debug("Failed to load .env", exc_info=True)
 
-    cfg_path = os.environ.get("TRADE_LIQUIDATION_CONFIG", "").strip()
-    if not cfg_path:
-        raise SystemExit("TRADE_LIQUIDATION_CONFIG is not set")
-
-    cfg_file = Path(cfg_path)
-    if not cfg_file.exists():
-        raise SystemExit(f"Config not found: {cfg_file}")
-
+    cfg_file = _resolve_cfg_path()
+    log.info("Environment: %s", environment)
     log.info("TRADE_LIQUIDATION_CONFIG=%s", str(cfg_file))
 
     cfg = _load_yaml(cfg_file)
@@ -155,10 +186,7 @@ def main() -> None:
     log.info("Traders in config: %d (enabled=%d)", len(traders), len(enabled))
     log.info("------------------------------------------------------------")
 
-    dsn = os.environ.get("PG_DSN", "").strip()
-    if not dsn:
-        raise SystemExit("PG_DSN is not set")
-
+    dsn = get_pg_dsn()
     pool = create_pool(dsn)
     store = PostgreSQLStorage(pool)
 
@@ -168,13 +196,11 @@ def main() -> None:
     except Exception as e:
         log.exception("DB ping failed: %s", e)
 
-    # IMPORTANT:
-    # Keep trader instances across cycles.
-    # Otherwise in-memory caches (wallet balance cache, REST thread-pool, etc.)
-    # are lost every loop, forcing slow REST calls each time.
     traders_runtime: Dict[str, Tuple[str, TradeLiquidation]] = {}
 
     while True:
+        cycle_started = _utc_now()
+
         for t in enabled:
             name = str(t.get("name", "")).strip() or "trade_liquidation"
             version = str(t.get("version", "")).strip() or "unknown"
@@ -184,13 +210,12 @@ def main() -> None:
                 continue
 
             try:
-                # Create once, reuse afterwards.
                 rt = traders_runtime.get(name)
                 if rt is None:
                     params = TradeLiquidationParams.from_dict(params_dict)
                     traders_runtime[name] = (version, TradeLiquidation(store=store, params=params))
+                    log.info("Trader initialized: name=%s version=%s", name, version)
                 else:
-                    # version is for logs only; we keep existing instance.
                     traders_runtime[name] = (version, rt[1])
 
                 res = traders_runtime[name][1].run_once()
@@ -223,13 +248,14 @@ def main() -> None:
                 log.exception("Trader %s failed: %s", name, e)
 
         sleep_s = max(1.0, restart_interval_minutes * 60.0)
-        log.info("Sleep %.1fs (restart_interval_minutes=%s)", sleep_s, str(restart_interval_minutes))
+        log.info(
+            "Cycle done started_at=%s sleep=%.1fs restart_interval_minutes=%s",
+            cycle_started.isoformat(),
+            sleep_s,
+            str(restart_interval_minutes),
+        )
         time.sleep(sleep_s)
 
 
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=os.environ.get("LOG_LEVEL", "INFO"),
-        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    )
     main()

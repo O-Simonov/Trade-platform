@@ -2311,19 +2311,26 @@ class TradeLiquidationOrderBuilderMixin:
                 # If we don't find it in openOrders, try openAlgoOrders.
                 if not canceled_this:
                     try:
-                        algo_open = self._binance.open_algo_orders(symbol=symbol)
-                        for ao in algo_open:
-                            if str(ao.get("clientAlgoId") or "") == other_coid:
-                                self._binance.cancel_algo_order(symbol=symbol, clientAlgoId=other_coid)
-                                canceled += 1
-                                canceled_this = True
-                                log.info(
-                                    "[trade_liquidation][LIVE] cancel leftover(algo) %s (pos_uid=%s symbol=%s)",
-                                    other_suffix,
-                                    pos_uid,
-                                    symbol,
-                                )
-                                break
+                        # Production-clean guard: when we cannot resolve pos_uid ownership,
+                        # do not aggressively cancel algo leftovers. This prevents valid
+                        # closePosition hedge/main protection from being removed by orphan
+                        # cleanup races during reconcile/restart windows.
+                        if pos_uid is None:
+                            pass
+                        else:
+                            algo_open = self._binance.open_algo_orders(symbol=symbol)
+                            for ao in algo_open:
+                                if str(ao.get("clientAlgoId") or "") == other_coid:
+                                    self._binance.cancel_algo_order(symbol=symbol, clientAlgoId=other_coid)
+                                    canceled += 1
+                                    canceled_this = True
+                                    log.info(
+                                        "[trade_liquidation][LIVE] cancel leftover(algo) %s (pos_uid=%s symbol=%s)",
+                                        other_suffix,
+                                        pos_uid,
+                                        symbol,
+                                    )
+                                    break
                     except Exception:
                         pass
             except Exception:

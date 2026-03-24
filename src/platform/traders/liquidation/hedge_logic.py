@@ -27,6 +27,272 @@ from .params import *
 log = logging.getLogger("traders.trade_liquidation")
 
 class TradeLiquidationHedgeLogicMixin:
+    def _get_live_symbol_funding_rate_pct(self, symbol: str) -> float:
+        """Return current funding rate in PERCENT for a symbol, best-effort."""
+        try:
+            if getattr(self, '_binance', None) is None:
+                return 0.0
+            resp = self._binance.premium_index(symbol=str(symbol).upper())
+            row = None
+            if isinstance(resp, list):
+                for r in resp:
+                    if str((r or {}).get('symbol') or '').upper() == str(symbol).upper():
+                        row = r
+                        break
+            elif isinstance(resp, dict):
+                row = resp
+            if not isinstance(row, dict):
+                return 0.0
+            rate = row.get('lastFundingRate')
+            if rate is None:
+                rate = row.get('fundingRate')
+            return float(rate or 0.0) * 100.0
+        except Exception:
+            return 0.0
+
+    def _compute_adaptive_hedge_extra_koff(self, *, main_side: str, ref_price: float, mark_price: float) -> float:
+        """Best-effort adaptive hedge boost based on adverse move against MAIN.
+
+        Returns an *extra* koff (additive), capped by hedge_adaptive_max_extra_koff.
+        """
+        try:
+            if not bool(getattr(self.p, 'hedge_adaptive_enabled', True)):
+                return 0.0
+            ref_px = float(ref_price or 0.0)
+            mark_px = float(mark_price or 0.0)
+            if ref_px <= 0.0 or mark_px <= 0.0:
+                return 0.0
+            side_u = str(main_side).upper()
+            if side_u == 'LONG':
+                adverse_pct = max(0.0, (ref_px - mark_px) / ref_px * 100.0)
+            else:
+                adverse_pct = max(0.0, (mark_px - ref_px) / ref_px * 100.0)
+            trigger_pct = float(getattr(self.p, 'hedge_adaptive_trigger_pct', 0.8) or 0.8)
+            step_pct = max(float(getattr(self.p, 'hedge_adaptive_step_pct', 0.8) or 0.8), 1e-9)
+            boost_per_step = max(float(getattr(self.p, 'hedge_adaptive_boost_per_step', 0.08) or 0.08), 0.0)
+            max_extra = max(float(getattr(self.p, 'hedge_adaptive_max_extra_koff', 0.20) or 0.20), 0.0)
+            if adverse_pct < trigger_pct or boost_per_step <= 0.0 or max_extra <= 0.0:
+                return 0.0
+            steps = int(math.floor((adverse_pct - trigger_pct) / step_pct)) + 1
+            extra = min(max_extra, float(steps) * boost_per_step)
+            return max(0.0, float(extra))
+        except Exception:
+            return 0.0
+
+    def _compute_live_hedge_qty_with_funding(self, *, symbol: str, main_side: str, main_qty: float, ref_price: float | None = None, mark_price: float | None = None) -> tuple[float, float, float]:
+        """Compute hedge quantity with funding-aware boost and hard risk cap.
+
+        Returns: (hedge_qty, effective_koff, funding_pct)
+        """
+        base_qty = abs(float(main_qty or 0.0))
+        if base_qty <= 0.0:
+            return 0.0, 0.0, 0.0
+
+        try:
+            hedge_koff = float(getattr(self.p, 'hedge_koff', 1.0) or 1.0)
+        except Exception:
+            hedge_koff = 1.0
+        try:
+            hedge_max_ratio = float(getattr(self.p, 'hedge_max_ratio', 1.0) or 1.0)
+        except Exception:
+            hedge_max_ratio = 1.0
+        try:
+            funding_limit_pct = float(getattr(self.p, 'hedge_funding_kof_limit', 0.0) or 0.0)
+        except Exception:
+            funding_limit_pct = 0.0
+        try:
+            funding_boost = float(getattr(self.p, 'hedge_koff_funding_boost', 1.0) or 1.0)
+        except Exception:
+            funding_boost = 1.0
+
+        funding_pct = self._get_live_symbol_funding_rate_pct(str(symbol).upper())
+        hedge_side = 'SHORT' if str(main_side).upper() == 'LONG' else 'LONG'
+        favorable = False
+        try:
+            if funding_limit_pct > 0.0:
+                if hedge_side == 'SHORT' and funding_pct >= funding_limit_pct:
+                    favorable = True
+                elif hedge_side == 'LONG' and funding_pct <= -funding_limit_pct:
+                    favorable = True
+        except Exception:
+            favorable = False
+
+        eff_koff = float(hedge_koff)
+        if favorable and funding_boost > 0.0:
+            eff_koff *= float(funding_boost)
+
+        try:
+            extra_koff = self._compute_adaptive_hedge_extra_koff(
+                main_side=str(main_side).upper(),
+                ref_price=float(ref_price or 0.0),
+                mark_price=float(mark_price or 0.0),
+            )
+        except Exception:
+            extra_koff = 0.0
+        if extra_koff > 0.0:
+            eff_koff += float(extra_koff)
+
+        raw_qty = base_qty * eff_koff
+        max_allowed = base_qty * max(float(hedge_max_ratio), 0.0)
+        if max_allowed > 0.0:
+            raw_qty = min(raw_qty, max_allowed)
+            eff_koff = raw_qty / base_qty if base_qty > 0 else 0.0
+
+        return float(raw_qty), float(eff_koff), float(funding_pct)
+
+    def _live_reduce_hedge_market(self, *, symbol: str, hedge_ps: str, qty: float, reason: str = "UNWIND") -> bool:
+        """Best-effort partial/full reduce of an open hedge leg."""
+        try:
+            q = float(qty or 0.0)
+        except Exception:
+            q = 0.0
+        if q <= 0.0 or getattr(self, '_binance', None) is None:
+            return False
+        try:
+            step = float(self._qty_step_for_symbol(symbol) or 0.0)
+        except Exception:
+            step = 0.0
+        if step and step > 0.0:
+            q = float(_round_qty_to_step(q, step, mode='down'))
+        if q <= 0.0:
+            return False
+        close_side = 'BUY' if str(hedge_ps).upper() == 'SHORT' else 'SELL'
+        try:
+            params = dict(symbol=str(symbol).upper(), side=close_side, type='MARKET', quantity=float(q), positionSide=str(hedge_ps).upper())
+            try:
+                self._binance.new_order(**params)
+            except Exception as e1:
+                msg1 = str(e1)
+                if 'reduceonly' in msg1.lower() and '1106' in msg1:
+                    params.pop('reduceOnly', None)
+                    self._binance.new_order(**params)
+                else:
+                    raise
+            return True
+        except Exception:
+            log.exception('[TL][HEDGE_UNWIND] market reduce failed %s %s qty=%.8f reason=%s', symbol, hedge_ps, float(q), str(reason))
+            return False
+
+    def _live_manage_hedge_unwind(self, *, p: dict, symbol: str, main_side: str, hedge_ps: str, hedge_amt: float, hedge_entry_use: float, mark: float) -> bool:
+        """Balanced hedge profit optimization: partial unload and optional full exit when price moves back in favor of MAIN."""
+        if not bool(getattr(self.p, 'hedge_unwind_enabled', False)):
+            return False
+        try:
+            if float(hedge_amt or 0.0) <= 0.0 or float(hedge_entry_use or 0.0) <= 0.0 or float(mark or 0.0) <= 0.0:
+                return False
+            rm = p.get('raw_meta') if isinstance(p, dict) else None
+            if isinstance(rm, str):
+                rm = json.loads(rm) if rm.strip() else {}
+            if not isinstance(rm, dict):
+                rm = {}
+            hmeta = rm.get('hedge') if isinstance(rm.get('hedge'), dict) else {}
+
+            initial_qty = float(hmeta.get('hedge_qty_initial') or hmeta.get('base_qty') or hedge_amt or 0.0)
+            if initial_qty <= 0.0:
+                initial_qty = float(hedge_amt)
+            step1_done = bool(hmeta.get('unwind_step1_done'))
+            step2_done = bool(hmeta.get('unwind_step2_done'))
+            full_done = bool(hmeta.get('unwind_full_exit_done'))
+            last_action_ts = float(hmeta.get('unwind_last_action_ts') or 0.0)
+
+            cd_sec = float(getattr(self.p, 'hedge_unwind_cooldown_sec', 30) or 30)
+            if last_action_ts and (time.time() - last_action_ts) < max(cd_sec, 0.0):
+                return False
+
+            if str(main_side).upper() == 'LONG':
+                move_pct = (float(mark) - float(hedge_entry_use)) / max(float(hedge_entry_use), 1e-12) * 100.0
+            else:
+                move_pct = (float(hedge_entry_use) - float(mark)) / max(float(hedge_entry_use), 1e-12) * 100.0
+
+            step1_pct = float(getattr(self.p, 'hedge_unwind_step1_pct', 0.8) or 0.8)
+            step1_share = float(getattr(self.p, 'hedge_unwind_step1_share', 0.35) or 0.35)
+            step2_pct = float(getattr(self.p, 'hedge_unwind_step2_pct', 1.6) or 1.6)
+            step2_share = float(getattr(self.p, 'hedge_unwind_step2_share', 0.35) or 0.35)
+            full_exit_pct = float(getattr(self.p, 'hedge_unwind_full_exit_pct', 2.4) or 2.4)
+            min_ratio = max(float(getattr(self.p, 'hedge_unwind_min_qty_ratio', 0.15) or 0.15), 0.0)
+
+            try:
+                if bool(getattr(self.p, 'debug', False)):
+                    log.info('[TL][HEDGE_UNWIND_CHECK] %s %s move_pct=%.4f step1=%.4f step2=%.4f full=%.4f entry=%.8f mark=%.8f', symbol, str(hedge_ps).upper(), float(move_pct), float(step1_pct), float(step2_pct), float(full_exit_pct), float(hedge_entry_use), float(mark))
+            except Exception:
+                pass
+
+            action = None
+            target_close_qty = 0.0
+            cur_amt = float(hedge_amt)
+            min_left_qty = float(initial_qty) * float(min_ratio)
+
+            if (not full_done) and move_pct >= full_exit_pct:
+                action = 'FULL'
+                target_close_qty = cur_amt
+            elif (not step2_done) and move_pct >= step2_pct:
+                action = 'STEP2'
+                target_close_qty = float(initial_qty) * float(step2_share)
+            elif (not step1_done) and move_pct >= step1_pct:
+                action = 'STEP1'
+                target_close_qty = float(initial_qty) * float(step1_share)
+
+            if not action or target_close_qty <= 0.0:
+                return False
+
+            if action != 'FULL':
+                max_close = max(cur_amt - min_left_qty, 0.0)
+                target_close_qty = min(target_close_qty, max_close)
+                if target_close_qty <= 0.0:
+                    return False
+
+            if not self._live_reduce_hedge_market(symbol=str(symbol).upper(), hedge_ps=str(hedge_ps).upper(), qty=float(target_close_qty), reason=f'UNWIND_{action}'):
+                return False
+
+            remaining_qty = max(cur_amt - float(target_close_qty), 0.0)
+            try:
+                if getattr(self, '_pl_has_raw_meta', False):
+                    patch = {'hedge': {
+                        'hedge_qty_initial': float(initial_qty),
+                        'unwind_step1_done': bool(step1_done or action == 'STEP1' or action == 'STEP2' or action == 'FULL'),
+                        'unwind_step2_done': bool(step2_done or action == 'STEP2' or action == 'FULL'),
+                        'unwind_full_exit_done': bool(full_done or action == 'FULL'),
+                        'unwind_last_action_ts': float(time.time()),
+                        'last_action_ts': float(time.time()),
+                    }}
+                    if action == 'FULL':
+                        patch['hedge'].update({'last_close_reason': 'UNWIND_FULL', 'last_close_ts': float(time.time()), 'last_close_px': float(mark), 'reopen_anchor_px': float(mark)})
+                    self.store.execute(
+                        """
+                        UPDATE position_ledger
+                        SET raw_meta = COALESCE(raw_meta,'{}'::jsonb) || %(meta)s::jsonb,
+                            updated_at = now()
+                        WHERE exchange_id=%(ex)s AND account_id=%(acc)s AND pos_uid=%(pos_uid)s AND status='OPEN';
+                        """,
+                        {'meta': json.dumps(patch), 'ex': int(self.exchange_id), 'acc': int(self.account_id), 'pos_uid': str(p.get('pos_uid') or '')},
+                    )
+            except Exception:
+                pass
+
+            try:
+                self.store.execute(
+                    """
+                    UPDATE position_ledger pl
+                       SET qty_current=%(qty)s, updated_at=now()
+                     WHERE pl.exchange_id=%(ex)s AND pl.account_id=%(acc)s
+                       AND pl.status='OPEN' AND COALESCE(pl.source,'live')='live_hedge'
+                       AND pl.pos_uid IN (
+                           SELECT hl.hedge_pos_uid
+                             FROM hedge_links hl
+                            WHERE hl.exchange_id=%(ex)s AND hl.base_account_id=%(acc)s AND hl.base_pos_uid=%(base_pos_uid)s
+                       );
+                    """,
+                    {'qty': float(remaining_qty), 'ex': int(self.exchange_id), 'acc': int(self.account_id), 'base_pos_uid': str(p.get('pos_uid') or '')},
+                )
+            except Exception:
+                pass
+
+            log.info('[TL][HEDGE_UNWIND] %s %s action=%s close_qty=%.8f remain_est=%.8f move_pct=%.4f entry=%.8f mark=%.8f', symbol, str(hedge_ps).upper(), str(action), float(target_close_qty), float(remaining_qty), float(move_pct), float(hedge_entry_use), float(mark))
+            return True
+        except Exception:
+            log.exception('[TL][HEDGE_UNWIND] unexpected error for %s %s', symbol, hedge_ps)
+            return False
+
     def _live_ensure_hedge_after_last_add(
         self,
         *,
@@ -153,11 +419,24 @@ class TradeLiquidationHedgeLogicMixin:
         close_side = "SELL" if side_u == "LONG" else "BUY"
         hedge_ps = "SHORT" if side_u == "LONG" else "LONG"
 
-        # Trigger price from last add fill
+        # Trigger price from last add fill + configurable buffer.
+        # The extra buffer moves the pending hedge opener a bit farther from the
+        # raw last-add protection level so Binance does not activate it instantly
+        # on placement when mark price is already too close to the trigger.
+        try:
+            trigger_buf_pct = float(getattr(self.p, "hedge_trigger_buffer_pct", 0.0) or 0.0)
+        except Exception:
+            trigger_buf_pct = 0.0
+        trigger_buf_k = max(float(trigger_buf_pct), 0.0) / 100.0
+
         if side_u == "LONG":
             stop_price = last_fill * (1.0 - dist_pct / 100.0)
+            if trigger_buf_k > 0.0:
+                stop_price *= (1.0 - trigger_buf_k)
         else:
             stop_price = last_fill * (1.0 + dist_pct / 100.0)
+            if trigger_buf_k > 0.0:
+                stop_price *= (1.0 + trigger_buf_k)
 
         # Tick rounding
         tick = 0.0
@@ -184,10 +463,14 @@ class TradeLiquidationHedgeLogicMixin:
         except Exception:
             mark = 0.0
         if mark > 0 and tick and tick > 0:
-            if close_side == "BUY" and stop_price <= mark:
-                stop_price = float(_round_price_to_tick(mark + tick, tick, mode="up"))
-            if close_side == "SELL" and stop_price >= mark:
-                stop_price = float(_round_price_to_tick(mark - tick, tick, mode="down"))
+            try:
+                hedge_open_buf = float(getattr(self.p, "hedge_trigger_buffer_pct", 0.30) or 0.30)
+            except Exception:
+                hedge_open_buf = 0.20
+            if close_side == "BUY":
+                stop_price = float(self._safe_price_above_mark(stop_price, mark, tick, hedge_open_buf))
+            else:
+                stop_price = float(self._safe_price_below_mark(stop_price, mark, tick, hedge_open_buf))
 
         # Quantity: must be based on exchange position size
         qty_main = 0.0
@@ -210,8 +493,21 @@ class TradeLiquidationHedgeLogicMixin:
         if qty_main <= 0:
             return False
 
-        hedge_koff = float(getattr(self.p, "hedge_koff", 1.0) or 1.0)
-        hedge_qty = float(abs(float(qty_main)) * hedge_koff)
+        try:
+            ref_px_main = float(pos.get('avg_price') or pos.get('entry_price') or last_fill or 0.0)
+        except Exception:
+            ref_px_main = float(last_fill or 0.0)
+        try:
+            mark_px_main = float(self._get_mark_price_live(sym) or 0.0)
+        except Exception:
+            mark_px_main = 0.0
+        hedge_qty, hedge_koff, funding_pct = self._compute_live_hedge_qty_with_funding(
+            symbol=str(sym).upper(),
+            main_side=str(side_u).upper(),
+            main_qty=float(qty_main),
+            ref_price=float(ref_px_main),
+            mark_price=float(mark_px_main),
+        )
 
         # qty step rounding
         try:
@@ -375,7 +671,7 @@ class TradeLiquidationHedgeLogicMixin:
                 main_upnl = 0.0
 
             # If main is already in profit -> pending hedge opener is not needed (optional cancel)
-            cancel_when_profit = bool(getattr(self.p, "hedge_after_last_add_cancel_when_main_profit", True))
+            cancel_when_profit = False
             if cancel_when_profit and main_upnl > 0:
                 try:
                     resp_cancel = self._binance.cancel_algo_order(symbol=sym, clientAlgoId=cid_hedge)
@@ -404,21 +700,21 @@ class TradeLiquidationHedgeLogicMixin:
                 return True
 
             # Follow / reprice: if price moved away from current trigger too much, pull trigger closer to mark
-            follow_enabled = bool(getattr(self.p, "hedge_after_last_add_follow_enabled", False))
+            follow_enabled = False
             try:
-                follow_dist = float(getattr(self.p, "hedge_after_last_add_follow_distance_pct", 0.0) or 0.0)
+                follow_dist = 0.0
             except Exception:
                 follow_dist = 0.0
             try:
-                follow_pull = float(getattr(self.p, "hedge_after_last_add_follow_pullback_pct", 0.0) or 0.0)
+                follow_pull = 0.0
             except Exception:
                 follow_pull = 0.0
             try:
-                follow_min_move = float(getattr(self.p, "hedge_after_last_add_follow_min_trigger_move_pct", 0.0) or 0.0)
+                follow_min_move = 0.0
             except Exception:
                 follow_min_move = 0.0
             try:
-                follow_cd_sec = float(getattr(self.p, "hedge_after_last_add_follow_cooldown_sec", 0.0) or 0.0)
+                follow_cd_sec = 0.0
             except Exception:
                 follow_cd_sec = 0.0
 
@@ -683,7 +979,7 @@ class TradeLiquidationHedgeLogicMixin:
         if _dup_resp:
             return False
         self.log.info(
-            "[trade_liquidation][LIVE][HEDGE] placed after-last-add STOP_MARKET %s %s stop=%.8f (last_add=%.8f add_n=%s pct=%.4f qty=%.8f koff=%.4f)",
+            "[trade_liquidation][LIVE][HEDGE] placed after-last-add STOP_MARKET %s %s stop=%.8f (last_add=%.8f add_n=%s pct=%.4f qty=%.8f koff=%.4f funding_pct=%.4f)",
             str(sym).upper(),
             str(side_u),
             float(stop_price),
@@ -692,6 +988,7 @@ class TradeLiquidationHedgeLogicMixin:
             float(dist_pct),
             float(hedge_qty),
             float(hedge_koff),
+            float(funding_pct),
         )
         return True
 
@@ -699,12 +996,10 @@ class TradeLiquidationHedgeLogicMixin:
         """Manage hedge positions in LIVE mode when hedge_enabled is True.
 
         Rule:
-          - When SL condition would be met, open an opposite market position sized:
+          - When the final protection level is reached, open an opposite market hedge sized
                 hedge_qty = abs(main_qty) * hedge_koff
-            but only if EMA(hedge_ema_window) on hedge_ema_interval supports hedge direction.
-          - Close hedge when:
-                a) price reaches significant level (same as averaging level) OR
-                b) EMA flips against hedge (if enabled).
+            with funding-aware sizing if configured.
+          - After hedge opens, manage only hedge trailing, hedge stop-loss, break-even move and reopen logic.
         """
         if (not self._is_live) or self._binance is None:
             return {"checked": 0, "opened": 0, "closed": 0, "skipped": 0}
@@ -713,15 +1008,6 @@ class TradeLiquidationHedgeLogicMixin:
             return {"checked": 0, "opened": 0, "closed": 0, "skipped": 0}
 
         hedge_koff = float(getattr(self.p, "hedge_koff", 1.2) or 1.2)
-        ema_win = int(getattr(self.p, "hedge_ema_window", 20) or 20)
-        ema_tf = str(getattr(self.p, "hedge_ema_interval", "5m") or "5m")
-        ema_confirm = int(getattr(self.p, "hedge_ema_confirm_bars", 3) or 3)
-        ema_min_slope = float(getattr(self.p, "hedge_ema_min_slope_pct", 0.0) or 0.0)
-        ema_flip_mult = float(getattr(self.p, "hedge_ema_flip_slope_mult", 0.7) or 0.7)
-        hedge_cooldown_sec = float(getattr(self.p, "hedge_cooldown_sec", 180) or 180)
-        if ema_flip_mult <= 0:
-            ema_flip_mult = 0.7
-        ema_close_slope = float(ema_min_slope) * float(ema_flip_mult)
 
         # Exchange snapshot positions (positionRisk)
         pr = self._rest_snapshot_get("position_risk")
@@ -747,7 +1033,7 @@ class TradeLiquidationHedgeLogicMixin:
                     f"""
                     SELECT {sel}
                     FROM position_ledger
-                    WHERE exchange_id=%(ex)s AND account_id=%(acc)s AND strategy_id=%(sid)s AND status IN ('OPEN','CLOSED') AND COALESCE(source,'live') IN ('live','live_hedge')
+                    WHERE exchange_id=%(ex)s AND account_id=%(acc)s AND strategy_id=%(sid)s AND status = 'OPEN' AND COALESCE(source,'live') IN ('live','live_hedge')
                     ORDER BY opened_at DESC;
                     """,
                     {"ex": int(self.exchange_id), "acc": int(self.account_id), "sid": str(self.STRATEGY_ID)},
@@ -760,7 +1046,7 @@ class TradeLiquidationHedgeLogicMixin:
                     """
                     SELECT symbol_id, pos_uid, side, status, qty_current, avg_price, entry_price, COALESCE(source,'live') AS source
                     FROM position_ledger
-                    WHERE exchange_id=%(ex)s AND account_id=%(acc)s AND strategy_id=%(sid)s AND status IN ('OPEN','CLOSED') AND COALESCE(source,'live') IN ('live','live_hedge')
+                    WHERE exchange_id=%(ex)s AND account_id=%(acc)s AND strategy_id=%(sid)s AND status = 'OPEN' AND COALESCE(source,'live') IN ('live','live_hedge')
                     ORDER BY opened_at DESC;
                     """,
                     {"ex": int(self.exchange_id), "acc": int(self.account_id), "sid": str(self.STRATEGY_ID)},
@@ -769,6 +1055,7 @@ class TradeLiquidationHedgeLogicMixin:
 
         checked = opened = closed = skipped = 0
         sym_map = self._symbols_map()
+        _seen_main_rows = set()
 
         for p in led:
             checked += 1
@@ -783,6 +1070,12 @@ class TradeLiquidationHedgeLogicMixin:
                 skipped += 1
                 continue
             src_kind = str(p.get("source") or "live").lower().strip()
+            if src_kind == "live":
+                main_key = (int(symbol_id), str(main_side).upper())
+                if main_key in _seen_main_rows:
+                    skipped += 1
+                    continue
+                _seen_main_rows.add(main_key)
             # IMPORTANT: hedge manager must be driven only by the base/main strategy rows.
             # OPEN/CLOSED live_hedge rows are auxiliary mirror records for the opposite leg.
             # If we process them here as if they were independent main positions, the loop starts
@@ -840,35 +1133,13 @@ class TradeLiquidationHedgeLogicMixin:
                 skipped += 1
                 continue
 
-            # Determine hedge direction and required EMA direction
+            # Determine hedge direction. EMA validation and EMA-based exits are intentionally disabled
+            # to avoid conflicts with hedge stop-loss, trailing and reopen logic.
             hedge_side = "SHORT" if main_side == "LONG" else "LONG"
-            need_ema = "DOWN" if hedge_side == "SHORT" else "UP"
-            # EMA direction for OPEN must be stricter (min slope); for CLOSE we can use a softer threshold
-            ema_dir_open = self._ema_direction(
-                symbol_id,
-                window=ema_win,
-                interval=ema_tf,
-                confirm_bars=ema_confirm,
-                min_slope_pct=ema_min_slope,
-                log_ctx="open",
-            )
-            if need_ema and ema_dir_open is None:
-                self.log.info(
-                    f"[TL][ema] {symbol}: open EMA direction is not available (need_ema={need_ema}); check candles history / interval"
-                )
-            ema_dir_close = self._ema_direction(
-                symbol_id,
-                window=ema_win,
-                interval=ema_tf,
-                confirm_bars=ema_confirm,
-                min_slope_pct=ema_close_slope,
-                log_ctx="close",
-            )
-            if need_ema and ema_dir_close is None:
-                self.log.info(
-                    f"[TL][ema] {symbol}: close EMA direction is not available (need_ema={need_ema}); check candles history / interval"
-                )
-            hedge_ok = (ema_dir_open == need_ema)
+            need_ema = None
+            ema_dir_open = None
+            ema_dir_close = None
+            hedge_ok = True
 
             # Detect existing hedge position on exchange
             # In hedge mode we should have positionSide LONG/SHORT.
@@ -978,8 +1249,6 @@ class TradeLiquidationHedgeLogicMixin:
                                 hedge_reopen_anchor_px = float(hedge_last_close_px or 0.0)
                 except Exception:
                     hedge_base_qty = None
-
-            all_pl_limit = float(getattr(self.p, "all_P_L", 0.0) or 0.0)
 
             mark = 0.0
             try:
@@ -1511,8 +1780,9 @@ class TradeLiquidationHedgeLogicMixin:
                 except Exception:
                     log.exception("[TL][HEDGE_TRL] unexpected error for %s %s", symbol, hedge_ps)
 
-            # Side-specific cleanup: if hedge leg is flat or hedge trailing disabled, cancel any dangling HEDGE_TRL
-            if (hedge_amt <= 0) or (not bool(getattr(self.p, "hedge_trailing_enabled", False))):
+            # Side-specific cleanup: if hedge leg is truly flat or hedge trailing disabled, cancel dangling HEDGE_TRL.
+            # Do NOT cancel while there is still an OPEN hedge leg on exchange for this side.
+            if (not bool(getattr(self.p, "hedge_trailing_enabled", False))) or (hedge_amt <= 0 and (not self._has_open_position_live(symbol, str(hedge_ps)))):
                 try:
                     tok = _coid_token(str(p.get('pos_uid') or ''), n=20)
                     cid_htrl = f"TL_{tok}_HEDGE_TRL"
@@ -1531,225 +1801,363 @@ class TradeLiquidationHedgeLogicMixin:
                     hedge_sl_pct = 0.0
 
                 if hedge_sl_pct and hedge_sl_pct > 0:
-                    # Place stop-loss for the hedge position as an ALGO order (kept in algo_orders)
                     try:
-                        tok = _coid_token(str(p.get('pos_uid') or ''), n=20)
-                        cid_hsl = f"TL_{tok}_HEDGE_SL"
-                
-                        hedge_entry_use = float(hedge_entry or 0.0)
-                        # mark price is needed for fallback/BE logic; compute locally to avoid NameError
-                        mp0 = float(self._get_mark_price_live(symbol) or 0.0)
-                        if hedge_entry_use <= 0:
-                            hedge_entry_use = mp0
-                
-                        if str(hedge_ps).upper() == 'SHORT':
-                            stop_px = hedge_entry_use * (1.0 + hedge_sl_pct / 100.0)
-                            sl_side = 'BUY'
-                        else:
-                            stop_px = hedge_entry_use * (1.0 - hedge_sl_pct / 100.0)
-                            sl_side = 'SELL'
-
-                        # Optional: move hedge SL to break-even (profit-lock) after activation move
-                        try:
-                            be_pct = float(getattr(self.p, "hedge_stop_loss_be_pct", 0.0) or 0.0)
-                            be_act_pct = float(getattr(self.p, "hedge_stop_loss_be_activation_pct", 0.0) or 0.0)
-                        except Exception:
-                            be_pct, be_act_pct = 0.0, 0.0
-
-                        be_applied = False
-                        if be_pct > 0 and be_act_pct > 0 and hedge_entry_use > 0:
-                            try:
-                                be_pct_min = float(getattr(self.p, "hedge_stop_loss_be_pct_min", 0.0) or 0.0)
-                                be_pct_max = float(getattr(self.p, "hedge_stop_loss_be_pct_max", 100.0) or 100.0)
-                                be_act_min = float(getattr(self.p, "hedge_stop_loss_be_activation_pct_min", 0.0) or 0.0)
-                                be_act_max = float(getattr(self.p, "hedge_stop_loss_be_activation_pct_max", 100.0) or 100.0)
-                            except Exception:
-                                be_pct_min, be_pct_max, be_act_min, be_act_max = 0.0, 100.0, 0.0, 100.0
-
-                            # clamp (limits are configurable in YAML)
-                            be_pct = max(be_pct_min, min(be_pct, be_pct_max))
-                            be_act_pct = max(be_act_min, min(be_act_pct, be_act_max))
-
-                            mp = mp0
-                            if mp > 0:
-                                if str(hedge_ps).upper() == "SHORT":
-                                    # Activate when price moved down in favor; then set stop below entry (profit-lock)
-                                    act_px = hedge_entry_use * (1.0 - be_act_pct / 100.0)
-                                    if mp <= act_px:
-                                        be_stop = hedge_entry_use * (1.0 - be_pct / 100.0)
-                                        stop_px = min(stop_px, be_stop)
-                                        be_applied = True
-                                else:
-                                    # LONG hedge: activate when price moved up in favor; set stop above entry
-                                    act_px = hedge_entry_use * (1.0 + be_act_pct / 100.0)
-                                    if mp >= act_px:
-                                        be_stop = hedge_entry_use * (1.0 + be_pct / 100.0)
-                                        stop_px = max(stop_px, be_stop)
-                                        be_applied = True
-                                        
-                        # Quantity tolerance for deciding whether to reissue HEDGE_SL.
-                        # Use max(config_tol, 0.5*step) to avoid endless cancel/recreate due to rounding.
-                        try:
-                            step = self._qty_step_for_symbol(symbol)
-                            step = float(step) if step is not None else 0.0
-                        except Exception:
-                            step = 0.0
-                        cfg_tol = float(getattr(self.p, 'hedge_trailing_qty_tolerance', 1e-8) or 1e-8)
-                        qty_tol = max(cfg_tol, step * 0.5 if step > 0 else cfg_tol)
-                        reissue_on_qty = bool(getattr(self.p, 'hedge_trailing_reissue_on_qty_change', True))
-                        reissue_cd = float(getattr(self.p, 'hedge_trailing_reissue_cooldown_sec', 30) or 30)
-                        # Prefer exchange/local snapshot state for recovery after restart.
-                        ex_hsl = self._find_known_algo_order_by_client_id(symbol, cid_hsl)
-                        if ex_hsl is None:
-                            ex_hsl = self._find_semantic_open_algo(
-                                symbol,
-                                client_suffix="_HEDGE_SL",
-                                position_side=str(hedge_ps).upper(),
-                                order_type="STOP_MARKET",
-                                side=sl_side,
-                            )
-                        ex_open = bool(ex_hsl is not None)
-                        try:
-                            ex_qty = float((ex_hsl or {}).get("quantity") or (ex_hsl or {}).get("origQty") or 0.0)
-                        except Exception:
-                            ex_qty = 0.0
-                        try:
-                            ex_trig = float((ex_hsl or {}).get("triggerPrice") or (ex_hsl or {}).get("stopPrice") or 0.0)
-                        except Exception:
-                            ex_trig = 0.0
-
-                        db_hsl = self.store.get_algo_order(exchange_id=self.exchange_id, account_id=self.account_id, client_algo_id=cid_hsl)
-                        db_open = bool(db_hsl and str(db_hsl.get('status') or '').upper() == 'OPEN')
-
-                        # Treat as open if either DB or exchange says it's open.
-                        is_open_now = bool(ex_open or db_open)
-
-                        db_qty = None
-                        try:
-                            if db_hsl is not None:
-                                db_qty = float(db_hsl.get('quantity') or 0)
-                        except Exception:
-                            db_qty = None
-
-                        db_trig = None
-                        try:
-                            if db_hsl is not None:
-                                db_trig = float(db_hsl.get('trigger_price') or 0.0)
-                        except Exception:
-                            db_trig = None
-
-                        # If exchange snapshot has the order, use its live values for comparisons (recovery-safe)
-                        if ex_open:
-                            if ex_qty and ex_qty > 0:
-                                db_qty = ex_qty
-                            if ex_trig and ex_trig > 0:
-                                db_trig = ex_trig
-
-                        # Reissue if trigger price changed (e.g. moved to break-even).
-                        # IMPORTANT: when SL has already been moved to BE/profit-lock, do NOT keep reissuing
-                        # due to tiny rounding differences after restart.
-                        try:
-                            tick = self._price_tick_for_symbol(symbol)
-                            tol_px = float(tick) * 0.5 if tick is not None and float(tick) > 0 else 1e-8
-                        except Exception:
-                            tol_px = 1e-8
-
-                        # Compare using the same rounding as order placement
-                        try:
-                            desired_trig = float(self._fmt_price(symbol, stop_px))
-                        except Exception:
-                            desired_trig = float(stop_px)
-
-                        trig_mismatch = bool(is_open_now and db_trig is not None and abs(db_trig - float(desired_trig)) > tol_px)
-
-                        # If BE is already on exchange (trigger crossed to the BE side), don't reissue again.
-                        # SHORT hedge: BE stop is below entry => trigger < entry
-                        # LONG  hedge: BE stop is above entry => trigger > entry
-                        be_already = False
-                        try:
-                            if is_open_now and db_trig is not None and hedge_entry_use > 0:
-                                if str(hedge_ps).upper() == 'SHORT' and float(db_trig) < float(hedge_entry_use):
-                                    be_already = True
-                                elif str(hedge_ps).upper() != 'SHORT' and float(db_trig) > float(hedge_entry_use):
-                                    be_already = True
-                        except Exception:
-                            be_already = False
-
-                        if be_applied and be_already:
-                            trig_mismatch = False
-
-                        # Sticky BE: if SL was already moved to BE on exchange, never revert it back to the original SL
-                        # even if the activation condition is no longer true (price can whipsaw around the threshold).
-                        # We only allow reissue in this case if quantity changed.
-                        if be_already and (db_trig is not None) and float(db_trig) > 0:
-                            desired_trig = float(db_trig)
-                            trig_mismatch = False
-
-                        qty_mismatch = False
-                        if is_open_now and reissue_on_qty and db_qty is not None:
-                            try:
-                                # Compare in exchange step precision
-                                db_qty_f = float(self._fmt_qty(symbol, float(db_qty)))
-                                want_qty_f = float(self._fmt_qty(symbol, float(hedge_amt)))
-                                qty_mismatch = bool(abs(db_qty_f - want_qty_f) > qty_tol)
-                            except Exception:
-                                qty_mismatch = bool(abs(float(db_qty) - float(hedge_amt)) > qty_tol)
-                        need_reissue = bool(qty_mismatch or trig_mismatch)
-                
-                        if (not is_open_now) or need_reissue:
-                            now_ts = time.time()
-                            if not hasattr(self, '_hsl_last_ts'):
-                                self._hsl_last_ts = {}
-                            last_ts = float(self._hsl_last_ts.get(cid_hsl, 0.0))
-                            if (now_ts - last_ts) >= reissue_cd:
-                                try:
-                                    self._cancel_algo_by_client_id_safe(symbol, cid_hsl)
-                                except Exception:
-                                    pass
-                
-                                sl_working_type = str(
-                
-                                    getattr(self.p, 'hedge_stop_loss_working_type', None)
-                
-                                    or getattr(self.p, 'hedge_trailing_working_type', None)
-                
-                                    or getattr(self.p, 'working_type', 'MARK_PRICE')
-                
-                                    or 'MARK_PRICE'
-                
-                                ).upper()
-
-                
-                                resp_sl = self._binance.new_algo_order(
-                                    symbol=symbol,
-                                    side=sl_side,
-                                    type='STOP_MARKET',
-                                    quantity=self._fmt_qty(symbol, hedge_amt),
-                                    workingType=sl_working_type,
-                                    positionSide=hedge_ps,
-                                    algoType='CONDITIONAL',
-                                    clientAlgoId=cid_hsl,
-                                    triggerPrice=self._fmt_price(symbol, desired_trig),
-                                )
-                                self._upsert_algo_order_shadow(resp_sl, pos_uid=str(p.get('pos_uid') or ''), strategy_id='trade_liquidation')
-                                try:
-                                    self._mark_local_algo_open(
-                                        cid_hsl,
-                                        symbol=symbol,
-                                        position_side=str(hedge_ps).upper(),
-                                        order_type='STOP_MARKET',
-                                        side=sl_side,
-                                        quantity=float(hedge_amt),
-                                        trigger_price=float(desired_trig),
-                                        close_position=False,
-                                        pos_uid=str(p.get('pos_uid') or ''),
-                                    )
-                                except Exception:
-                                    pass
-                                self._hsl_last_ts[cid_hsl] = now_ts
-                                log.info('[TL][HEDGE_SL] placed %s %s qty=%.8f stop=%.8f entry=%.8f pct=%.4f be=%s be_pct=%.4f act_pct=%.4f cid=%s', symbol, str(hedge_ps).upper(), float(hedge_amt), float(stop_px), float(hedge_entry_use), float(hedge_sl_pct), bool(be_applied), float(be_pct or 0.0), float(be_act_pct or 0.0), cid_hsl)
+                        # Strict ownership guard: only the current OPEN base row linked to a real OPEN
+                        # live_hedge row may manage HEDGE_SL. This prevents duplicate HEDGE_SL orders
+                        # from historical/stale rows of the same symbol.
+                        row_hsl = self.store.fetch_one(
+                            """
+                            SELECT 1 AS ok
+                            FROM position_ledger pl
+                            JOIN hedge_links hl
+                              ON hl.exchange_id = pl.exchange_id
+                             AND hl.symbol_id = pl.symbol_id
+                             AND hl.base_account_id = pl.account_id
+                             AND hl.hedge_account_id = pl.account_id
+                             AND hl.hedge_pos_uid = pl.pos_uid
+                            WHERE pl.exchange_id = %s
+                              AND pl.account_id = %s
+                              AND pl.symbol_id = %s
+                              AND pl.side = %s
+                              AND pl.status = 'OPEN'
+                              AND COALESCE(pl.source, 'live') = 'live_hedge'
+                              AND hl.base_pos_uid = %s
+                            LIMIT 1
+                            """,
+                            (
+                                int(self.exchange_id),
+                                int(self.account_id),
+                                int(symbol_id),
+                                str(hedge_ps),
+                                str(p.get('pos_uid') or ''),
+                            ),
+                        )
+                        hsl_owned = bool(row_hsl)
                     except Exception:
-                        log.exception('[TL][HEDGE_SL] unexpected error for %s %s', symbol, hedge_ps)
+                        hsl_owned = False
+
+                    tok = _coid_token(str(p.get('pos_uid') or ''), n=20)
+                    cid_hsl = f"TL_{tok}_HEDGE_SL"
+
+                    if (not hsl_owned) or (not self._has_open_position_live(symbol, str(hedge_ps))):
+                        try:
+                            self._dlog("skip HEDGE_SL: no linked live hedge sym=%s side=%s base_pos_uid=%s", symbol, hedge_ps, str(p.get('pos_uid') or ''))
+                        except Exception:
+                            pass
+                        try:
+                            self._cancel_algo_by_client_id_safe(symbol, cid_hsl)
+                        except Exception:
+                            pass
+                    else:
+                        try:
+                            hedge_entry_use = float(hedge_entry or 0.0)
+                            mp0 = float(self._get_mark_price_live(symbol) or 0.0)
+                            if hedge_entry_use <= 0:
+                                hedge_entry_use = mp0
+
+                            if str(hedge_ps).upper() == 'SHORT':
+                                stop_px = hedge_entry_use * (1.0 + hedge_sl_pct / 100.0)
+                                sl_side = 'BUY'
+                            else:
+                                stop_px = hedge_entry_use * (1.0 - hedge_sl_pct / 100.0)
+                                sl_side = 'SELL'
+
+                            try:
+                                be_pct = float(getattr(self.p, "hedge_stop_loss_be_pct", 0.0) or 0.0)
+                                be_act_pct = float(getattr(self.p, "hedge_stop_loss_be_activation_pct", 0.0) or 0.0)
+                            except Exception:
+                                be_pct, be_act_pct = 0.0, 0.0
+
+                            be_applied = False
+                            if be_pct > 0 and be_act_pct > 0 and hedge_entry_use > 0:
+                                try:
+                                    be_pct_min = float(getattr(self.p, "hedge_stop_loss_be_pct_min", 0.0) or 0.0)
+                                    be_pct_max = float(getattr(self.p, "hedge_stop_loss_be_pct_max", 100.0) or 100.0)
+                                    be_act_min = float(getattr(self.p, "hedge_stop_loss_be_activation_pct_min", 0.0) or 0.0)
+                                    be_act_max = float(getattr(self.p, "hedge_stop_loss_be_activation_pct_max", 100.0) or 100.0)
+                                except Exception:
+                                    be_pct_min, be_pct_max, be_act_min, be_act_max = 0.0, 100.0, 0.0, 100.0
+
+                                be_pct = max(be_pct_min, min(be_pct, be_pct_max))
+                                be_act_pct = max(be_act_min, min(be_act_pct, be_act_max))
+
+                                mp = mp0
+                                if mp > 0:
+                                    if str(hedge_ps).upper() == "SHORT":
+                                        act_px = hedge_entry_use * (1.0 - be_act_pct / 100.0)
+                                        if mp <= act_px:
+                                            be_stop = hedge_entry_use * (1.0 - be_pct / 100.0)
+                                            stop_px = min(stop_px, be_stop)
+                                            be_applied = True
+                                    else:
+                                        act_px = hedge_entry_use * (1.0 + be_act_pct / 100.0)
+                                        if mp >= act_px:
+                                            be_stop = hedge_entry_use * (1.0 + be_pct / 100.0)
+                                            stop_px = max(stop_px, be_stop)
+                                            be_applied = True
+
+                            try:
+                                step = float(self._qty_step_for_symbol(symbol) or 0.0)
+                            except Exception:
+                                step = 0.0
+                            cfg_tol = float(getattr(self.p, 'hedge_trailing_qty_tolerance', 1e-8) or 1e-8)
+                            qty_tol = max(cfg_tol, step * 0.5 if step > 0 else cfg_tol)
+                            reissue_on_qty = bool(getattr(self.p, 'hedge_trailing_reissue_on_qty_change', True))
+                            reissue_cd = float(getattr(self.p, 'hedge_trailing_reissue_cooldown_sec', 30) or 30)
+
+                            ex_hsl = self._find_known_algo_order_by_client_id(symbol, cid_hsl)
+                            if ex_hsl is None:
+                                ex_hsl = self._find_semantic_open_algo(
+                                    symbol,
+                                    client_suffix="_HEDGE_SL",
+                                    position_side=str(hedge_ps).upper(),
+                                    order_type="STOP_MARKET",
+                                    side=sl_side,
+                                    close_position=True,
+                                )
+                            ex_open = bool(ex_hsl is not None)
+                            ex_close_position = False
+                            try:
+                                ex_close_position = bool(ex_hsl is not None and str(ex_hsl.get("closePosition") or "").strip().lower() in {"true", "1", "yes", "y", "on"})
+                            except Exception:
+                                ex_close_position = False
+                            try:
+                                ex_qty = float((ex_hsl or {}).get("quantity") or (ex_hsl or {}).get("origQty") or 0.0)
+                            except Exception:
+                                ex_qty = 0.0
+                            try:
+                                ex_trig = float((ex_hsl or {}).get("triggerPrice") or (ex_hsl or {}).get("stopPrice") or 0.0)
+                            except Exception:
+                                ex_trig = 0.0
+
+                            db_hsl = self.store.get_algo_order(exchange_id=self.exchange_id, account_id=self.account_id, client_algo_id=cid_hsl)
+                            db_open = bool(db_hsl and str(db_hsl.get('status') or '').upper() == 'OPEN')
+                            is_open_now = bool(ex_open or db_open)
+
+                            db_close_position = False
+                            try:
+                                if db_hsl is not None:
+                                    db_close_position = bool(db_hsl.get('close_position'))
+                            except Exception:
+                                db_close_position = False
+
+                            db_qty = None
+                            try:
+                                if db_hsl is not None:
+                                    db_qty = float(db_hsl.get('quantity') or 0.0)
+                            except Exception:
+                                db_qty = None
+                            db_trig = None
+                            try:
+                                if db_hsl is not None:
+                                    db_trig = float(db_hsl.get('trigger_price') or 0.0)
+                            except Exception:
+                                db_trig = None
+                            if ex_open:
+                                if ex_qty > 0:
+                                    db_qty = ex_qty
+                                if ex_trig > 0:
+                                    db_trig = ex_trig
+
+                            try:
+                                tick = self._price_tick_for_symbol(symbol)
+                                tol_px = float(tick) * 0.5 if tick is not None and float(tick) > 0 else 1e-8
+                            except Exception:
+                                tick = 0.0
+                                tol_px = 1e-8
+                            try:
+                                desired_trig = float(self._fmt_price(symbol, stop_px))
+                            except Exception:
+                                desired_trig = float(stop_px)
+
+                            # Compare against the *safe* trigger that would actually be sent to Binance,
+                            # otherwise tiny mark-buffer adjustments can cause endless reissue loops (e.g. REZUSDT).
+                            try:
+                                live_mark_cmp = float(mp0 or self._get_mark_price_live(symbol) or 0.0)
+                            except Exception:
+                                live_mark_cmp = float(mp0 or 0.0)
+                            try:
+                                sl_buf_cmp = float(getattr(self.p, 'hedge_stop_loss_trigger_buffer_pct', 0.35) or 0.35)
+                            except Exception:
+                                sl_buf_cmp = 0.35
+                            if live_mark_cmp > 0 and tick and float(tick) > 0:
+                                if str(hedge_ps).upper() == 'SHORT':
+                                    desired_trig = float(self._safe_price_above_mark(desired_trig, live_mark_cmp, float(tick), sl_buf_cmp))
+                                else:
+                                    desired_trig = float(self._safe_price_below_mark(desired_trig, live_mark_cmp, float(tick), sl_buf_cmp))
+
+                            try:
+                                trig_tol_pct = float(getattr(self.p, 'hedge_stop_loss_compare_tolerance_pct', 0.08) or 0.08)
+                            except Exception:
+                                trig_tol_pct = 0.08
+                            trig_tol_abs = max(float(tol_px), abs(float(desired_trig)) * (float(trig_tol_pct) / 100.0), 1e-8)
+                            trig_mismatch = bool(is_open_now and db_trig is not None and abs(float(db_trig) - float(desired_trig)) > trig_tol_abs)
+                            be_already = False
+                            try:
+                                if is_open_now and db_trig is not None and hedge_entry_use > 0:
+                                    if str(hedge_ps).upper() == 'SHORT' and float(db_trig) < float(hedge_entry_use):
+                                        be_already = True
+                                    elif str(hedge_ps).upper() != 'SHORT' and float(db_trig) > float(hedge_entry_use):
+                                        be_already = True
+                            except Exception:
+                                be_already = False
+                            if be_applied and be_already:
+                                trig_mismatch = False
+                            if be_already and (db_trig is not None) and float(db_trig) > 0:
+                                desired_trig = float(db_trig)
+                                trig_mismatch = False
+
+                            qty_mismatch = False
+                            if is_open_now and (not (ex_close_position or db_close_position)) and reissue_on_qty and db_qty is not None:
+                                try:
+                                    db_qty_f = float(self._fmt_qty(symbol, float(db_qty)))
+                                    want_qty_f = float(self._fmt_qty(symbol, float(hedge_amt)))
+                                    qty_mismatch = bool(abs(db_qty_f - want_qty_f) > qty_tol)
+                                except Exception:
+                                    qty_mismatch = bool(abs(float(db_qty) - float(hedge_amt)) > qty_tol)
+                            need_reissue = bool((not is_open_now) or qty_mismatch or trig_mismatch)
+
+                            # Strong anti-duplicate guard for HEDGE_SL.
+                            # Exchange openAlgoOrders snapshots can lag for several seconds; during that window
+                            # DB/local shadow may still say OPEN and the desired trigger may already match.
+                            # In that case we must keep the current hedge SL and never cancel/recreate it.
+                            sig_key = f"{symbol}|{str(hedge_ps).upper()}|HEDGE_SL"
+                            sig_val = (round(float(desired_trig), 12), round(float(hedge_amt), 12))
+                            cache = getattr(self, '_hedge_sl_sig_cache', None)
+                            if not isinstance(cache, dict):
+                                cache = {}
+                                self._hedge_sl_sig_cache = cache
+                            last_sig = cache.get(sig_key)
+
+                            recently_placed_same = False
+                            try:
+                                place_cache = getattr(self, '_hedge_sl_place_guard', None)
+                                if not isinstance(place_cache, dict):
+                                    place_cache = {}
+                                    self._hedge_sl_place_guard = place_cache
+                                prev = place_cache.get(sig_key) or {}
+                                prev_sig = prev.get('sig')
+                                prev_ts = float(prev.get('ts') or 0.0)
+                                guard_sec = float(getattr(self.p, 'hedge_stop_loss_reissue_cooldown_sec', 30) or 30)
+                                if prev_sig == sig_val and prev_ts and (time.time() - prev_ts) < max(guard_sec, 30.0):
+                                    recently_placed_same = True
+                            except Exception:
+                                recently_placed_same = False
+
+                            if ex_open and ex_close_position and not trig_mismatch:
+                                need_reissue = False
+                            elif db_open and db_close_position and not trig_mismatch:
+                                need_reissue = False
+                            elif last_sig == sig_val and (is_open_now or recently_placed_same):
+                                need_reissue = False
+                            elif ex_open and ex_close_position and ex_trig > 0 and abs(float(ex_trig) - float(desired_trig)) <= trig_tol_abs:
+                                need_reissue = False
+
+                            if (not need_reissue) and is_open_now:
+                                try:
+                                    self._hedge_sl_sig_cache[sig_key] = (round(float(desired_trig), 12), round(float(hedge_amt), 12))
+                                except Exception:
+                                    pass
+
+                            if need_reissue:
+                                now_ts = time.time()
+                                if not hasattr(self, '_hsl_last_ts'):
+                                    self._hsl_last_ts = {}
+                                last_ts = float(self._hsl_last_ts.get(cid_hsl, 0.0))
+                                if (now_ts - last_ts) >= reissue_cd:
+                                    try:
+                                        self._cancel_algo_by_client_id_safe(symbol, cid_hsl)
+                                    except Exception:
+                                        pass
+
+                                    sl_working_type = str(
+                                        getattr(self.p, 'hedge_stop_loss_working_type', None)
+                                        or getattr(self.p, 'hedge_trailing_working_type', None)
+                                        or getattr(self.p, 'working_type', 'MARK_PRICE')
+                                        or 'MARK_PRICE'
+                                    ).upper()
+
+                                    try:
+                                        live_mark = float(mp0 or self._get_mark_price_live(symbol) or 0.0)
+                                    except Exception:
+                                        live_mark = float(mp0 or 0.0)
+                                    safe_trig = float(desired_trig)
+                                    try:
+                                        tick_safe = float(self._price_tick_for_symbol(symbol) or 0.0)
+                                    except Exception:
+                                        tick_safe = 0.0
+                                    try:
+                                        sl_buf = float(getattr(self.p, 'hedge_stop_loss_trigger_buffer_pct', 0.35) or 0.35)
+                                    except Exception:
+                                        sl_buf = 0.35
+                                    if live_mark > 0 and tick_safe > 0:
+                                        if str(hedge_ps).upper() == 'SHORT':
+                                            safe_trig = float(self._safe_price_above_mark(safe_trig, live_mark, tick_safe, sl_buf))
+                                        else:
+                                            safe_trig = float(self._safe_price_below_mark(safe_trig, live_mark, tick_safe, sl_buf))
+                                    try:
+                                        resp_sl = self._binance.new_algo_order(
+                                            symbol=symbol,
+                                            side=sl_side,
+                                            type='STOP_MARKET',
+                                            closePosition=True,
+                                            workingType=sl_working_type,
+                                            positionSide=hedge_ps,
+                                            algoType='CONDITIONAL',
+                                            clientAlgoId=cid_hsl,
+                                            triggerPrice=self._fmt_price(symbol, safe_trig),
+                                        )
+                                    except Exception as e:
+                                        msg = str(e)
+                                        if '-2021' in msg or 'immediately trigger' in msg.lower():
+                                            if live_mark > 0 and tick_safe > 0:
+                                                widen_buf = max(sl_buf, 0.8)
+                                                if str(hedge_ps).upper() == 'SHORT':
+                                                    safe_trig = float(self._safe_price_above_mark(safe_trig, live_mark, tick_safe, widen_buf))
+                                                else:
+                                                    safe_trig = float(self._safe_price_below_mark(safe_trig, live_mark, tick_safe, widen_buf))
+                                            resp_sl = self._binance.new_algo_order(
+                                                symbol=symbol,
+                                                side=sl_side,
+                                                type='STOP_MARKET',
+                                                closePosition=True,
+                                                workingType=sl_working_type,
+                                                positionSide=hedge_ps,
+                                                algoType='CONDITIONAL',
+                                                clientAlgoId=cid_hsl,
+                                                triggerPrice=self._fmt_price(symbol, safe_trig),
+                                            )
+                                        else:
+                                            raise
+                                    desired_trig = float(safe_trig)
+                                    self._upsert_algo_order_shadow(resp_sl, pos_uid=str(p.get('pos_uid') or ''), strategy_id='trade_liquidation')
+                                    try:
+                                        self._mark_local_algo_open(
+                                            cid_hsl,
+                                            symbol=symbol,
+                                            position_side=str(hedge_ps).upper(),
+                                            order_type='STOP_MARKET',
+                                            side=sl_side,
+                                            quantity=float(hedge_amt),
+                                            trigger_price=float(desired_trig),
+                                            close_position=True,
+                                            pos_uid=str(p.get('pos_uid') or ''),
+                                        )
+                                    except Exception:
+                                        pass
+                                    self._hsl_last_ts[cid_hsl] = now_ts
+                                    self._hedge_sl_sig_cache[sig_key] = (round(float(desired_trig), 12), round(float(hedge_amt), 12))
+                                    try:
+                                        place_cache = getattr(self, '_hedge_sl_place_guard', None)
+                                        if not isinstance(place_cache, dict):
+                                            place_cache = {}
+                                            self._hedge_sl_place_guard = place_cache
+                                        place_cache[sig_key] = {'sig': sig_val, 'ts': float(now_ts), 'cid': str(cid_hsl)}
+                                    except Exception:
+                                        pass
+                                    log.info('[TL][HEDGE_SL] placed %s %s qty=%.8f stop=%.8f entry=%.8f pct=%.4f be=%s be_pct=%.4f act_pct=%.4f cid=%s', symbol, str(hedge_ps).upper(), float(hedge_amt), float(stop_px), float(hedge_entry_use), float(hedge_sl_pct), bool(be_applied), float(be_pct or 0.0), float(be_act_pct or 0.0), cid_hsl)
+                        except Exception:
+                            log.exception('[TL][HEDGE_SL] unexpected error for %s %s', symbol, hedge_ps)
 
             # Side-specific cleanup: if hedge leg is flat now, cancel any dangling HEDGE_SL
             if hedge_amt <= 0:
@@ -1759,35 +2167,39 @@ class TradeLiquidationHedgeLogicMixin:
                     self._cancel_algo_by_client_id_safe(symbol, cid_hsl)
                 except Exception:
                     pass
-            if all_pl_limit and all_pl_limit > 0 and combined_upnl >= float(all_pl_limit):
+
+            # Balanced profit optimization: unload hedge when price moves back in favor of MAIN.
+            if hedge_amt > 0:
                 try:
-                    # close hedge first (if exists), then main
-                    if hedge_amt > 0:
-                        close_side = "BUY" if hedge_side == "SHORT" else "SELL"
-                        self._binance.new_order(
-                            symbol=symbol,
-                            side=close_side,
-                            type="MARKET",
-                            quantity=float(hedge_amt),
-                            positionSide=hedge_ps,
-                        )
-                        closed += 1
-                    if main_amt > 0:
-                        close_side = "BUY" if main_side == "SHORT" else "SELL"
-                        self._binance.new_order(
-                            symbol=symbol,
-                            side=close_side,
-                            type="MARKET",
-                            quantity=float(main_amt),
-                            positionSide=main_ps,
-                        )
-                        closed += 1
-                    log.info("[TL][HEDGE] closed ALL %s combined_upnl=%.4f >= %.4f (main=%.4f hedge=%.4f)",
-                             symbol, float(combined_upnl), float(all_pl_limit), float(main_upnl), float(hedge_upnl))
+                    hedge_entry_use_unwind = float(hedge_entry or 0.0)
+                    if hedge_entry_use_unwind <= 0.0 and hedge_pos:
+                        hedge_entry_use_unwind = abs(float(hedge_pos.get('entryPrice') or hedge_pos.get('avgEntryPrice') or 0.0))
                 except Exception:
-                    log.exception("[TL][HEDGE] failed to close ALL for %s", symbol)
-                    skipped += 1
-                continue
+                    hedge_entry_use_unwind = 0.0
+                try:
+                    if self._live_manage_hedge_unwind(
+                        p=p,
+                        symbol=symbol,
+                        main_side=main_side,
+                        hedge_ps=hedge_ps,
+                        hedge_amt=float(hedge_amt),
+                        hedge_entry_use=float(hedge_entry_use_unwind),
+                        mark=float(mark),
+                    ):
+                        try:
+                            refreshed = self._rest_snapshot_get('position_risk') or []
+                            for rr in refreshed if isinstance(refreshed, list) else []:
+                                if str(rr.get('symbol') or '').upper() != str(symbol).upper():
+                                    continue
+                                if str(rr.get('positionSide') or '').upper() != str(hedge_ps).upper():
+                                    continue
+                                hedge_amt = abs(float(rr.get('positionAmt') or 0.0))
+                                hedge_pos = rr
+                                break
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
 
             # Close hedge if main position is already positive unrealized PnL
             main_positive = (float(main_upnl) > 0.0)
@@ -1802,29 +2214,21 @@ class TradeLiquidationHedgeLogicMixin:
 
             # 1) Open hedge instead of SL
             # Open hedge instead of SL (or reopen after prior close) when conditions met
+            try:
+                hedge_cooldown_sec = float(getattr(self.p, "hedge_cooldown_sec", 0.0) or 0.0)
+            except Exception:
+                hedge_cooldown_sec = 0.0
             open_trigger = bool(sl_hit) if pl_status == "OPEN" else False
             if pl_status == "OPEN" and (not open_trigger) and bool(getattr(self.p, "hedge_reopen_enabled", True)):
-                # reopen hedge if main is in loss and drawdown beyond configured threshold
-                try:
-                    dd_thr = float(getattr(self.p, "hedge_reopen_drawdown_pct", 0.0) or 0.0)
-                except Exception:
-                    dd_thr = 0.0
-                dd = 0.0
-                if main_entry_use > 0:
-                    if main_side == "LONG" and mark < main_entry_use:
-                        dd = (main_entry_use - mark) / main_entry_use * 100.0
-                    if main_side == "SHORT" and mark > main_entry_use:
-                        dd = (mark - main_entry_use) / main_entry_use * 100.0
-                if float(main_upnl) < 0.0 and (dd_thr <= 0.0 or dd >= dd_thr):
+                if float(main_upnl) < 0.0:
                     open_trigger = True
 
             
             # Optional extra filter for hedge re-entry after a hedge close (SL/TRL/ALGO).
             # Re-entry direction is defined relative to the MAIN leg:
-            #   - main LONG  -> re-enter hedge only if price moved ABOVE the last hedge exit anchor
-            #   - main SHORT -> re-enter hedge only if price moved BELOW the last hedge exit anchor
-            # In addition, when price moves far in the opposite direction of the hedge (towards the MAIN),
-            # the anchor is shifted towards the MAIN to gradually reduce the distance for the next hedge entry.
+            #   - main LONG  -> re-enter hedge only if price moved BELOW the last hedge exit anchor
+            #   - main SHORT -> re-enter hedge only if price moved ABOVE the last hedge exit anchor
+            # When price moves in favor of the MAIN leg, the anchor is shifted toward the MAIN.
             try:
                 if (not bool(sl_hit)) and bool(getattr(self.p, "hedge_reopen_price_filter_enabled", False)):
                     anchor_px = float(hedge_reopen_anchor_px or hedge_last_close_px or 0.0)
@@ -1835,11 +2239,11 @@ class TradeLiquidationHedgeLogicMixin:
                         new_anchor_px = float(anchor_px)
                         if shift_trigger_pct > 0.0 and shift_step_pct > 0.0:
                             if str(main_side).upper() == "LONG":
-                                while float(mark) <= new_anchor_px * (1.0 - shift_trigger_pct):
-                                    new_anchor_px = new_anchor_px * (1.0 - shift_step_pct)
-                            else:
                                 while float(mark) >= new_anchor_px * (1.0 + shift_trigger_pct):
                                     new_anchor_px = new_anchor_px * (1.0 + shift_step_pct)
+                            else:
+                                while float(mark) <= new_anchor_px * (1.0 - shift_trigger_pct):
+                                    new_anchor_px = new_anchor_px * (1.0 - shift_step_pct)
                         if abs(new_anchor_px - anchor_px) > 1e-12:
                             try:
                                 if getattr(self, "_pl_has_raw_meta", False):
@@ -1865,12 +2269,12 @@ class TradeLiquidationHedgeLogicMixin:
                             hedge_reopen_anchor_px = float(new_anchor_px)
                             anchor_px = float(new_anchor_px)
                         if str(main_side).upper() == "LONG":
-                            target_px = anchor_px * (1.0 + max(move_pct, 0.0))
-                            if not (float(mark) >= target_px):
-                                open_trigger = False
-                        else:
                             target_px = anchor_px * (1.0 - max(move_pct, 0.0))
                             if not (float(mark) <= target_px):
+                                open_trigger = False
+                        else:
+                            target_px = anchor_px * (1.0 + max(move_pct, 0.0))
+                            if not (float(mark) >= target_px):
                                 open_trigger = False
             except Exception:
                 pass
@@ -1880,14 +2284,24 @@ class TradeLiquidationHedgeLogicMixin:
                 if hedge_cooldown_sec and hedge_last_action_ts and (time.time() - float(hedge_last_action_ts)) < float(hedge_cooldown_sec):
                     skipped += 1
                     continue
-                if not hedge_ok:
-                    skipped += 1
-                    continue
 
                 # qty and rounding
                 qty_step = float(self._qty_step_for_symbol(symbol) or 0.0) or 0.0
                 # hedge qty: use stored base qty if available (same as first open), otherwise compute from current main qty
-                hedge_qty = float(hedge_base_qty) if (hedge_base_qty is not None and float(hedge_base_qty) > 0) else (qty * float(hedge_koff))
+                if hedge_base_qty is not None and float(hedge_base_qty) > 0:
+                    hedge_qty = float(hedge_base_qty)
+                else:
+                    try:
+                        ref_px_open = float(avg_entry or entry_price or 0.0)
+                    except Exception:
+                        ref_px_open = 0.0
+                    hedge_qty, _eff_koff, _funding_pct = self._compute_live_hedge_qty_with_funding(
+                        symbol=str(symbol).upper(),
+                        main_side=str(main_side).upper(),
+                        main_qty=float(qty),
+                        ref_price=float(ref_px_open),
+                        mark_price=float(mark),
+                    )
                 if qty_step and qty_step > 0:
                     hedge_qty = _round_qty_to_step(hedge_qty, qty_step, mode="down")
                 if hedge_qty <= 0 or (qty_step and hedge_qty < qty_step):
@@ -1943,7 +2357,7 @@ class TradeLiquidationHedgeLogicMixin:
                     close_reason = "MAIN_POSITIVE"
 
                 # a) close hedge at/near entry after it has first moved into profit enough
-                if close_reason is None and bool(getattr(self.p, "hedge_close_on_entry_enabled", False)):
+                if False and close_reason is None and bool(getattr(self.p, "hedge_close_on_entry_enabled", False)):
                     try:
                         be_act_pct = float(getattr(self.p, "hedge_close_on_entry_profit_activation_pct", 0.0) or 0.0) / 100.0
                     except Exception:
@@ -2006,7 +2420,7 @@ class TradeLiquidationHedgeLogicMixin:
                             hedge_be_armed = bool(armed_now)
 
                 # b) close on significant level
-                if bool(getattr(self.p, "hedge_close_on_level", True)):
+                if False and bool(getattr(self.p, "hedge_close_on_level", True)):
                     tf_main = str(p.get("timeframe") or "15m")
                     level = self._compute_significant_level(symbol_id, side=main_side, entry_ref=float(entry), timeframe=tf_main)
                     tol = float(getattr(self.p, "hedge_level_tolerance_pct", 0.10) or 0.10) / 100.0
@@ -2021,7 +2435,7 @@ class TradeLiquidationHedgeLogicMixin:
                                 close_reason = "LEVEL"
 
                 # b) close on EMA flip against hedge
-                if close_reason is None and bool(getattr(self.p, "hedge_close_on_ema_flip", True)):
+                if False and close_reason is None and bool(getattr(self.p, "hedge_close_on_ema_flip", True)):
                     # Close hedge when EMA direction flips against hedge direction.
                     # NOTE: we only close the hedge if it's currently profitable (hedge_upnl > 0),
                     # to avoid "locking in" a loss on fast whipsaws.
@@ -2127,8 +2541,8 @@ class TradeLiquidationHedgeLogicMixin:
                         # currently open main volume. This effectively doubles the main exposure
                         # from its live size at the moment of hedge close.
                         try:
-                            add_enabled = bool(getattr(self.p, "hedge_close_add_enabled", False))
-                            add_max_count = int(getattr(self.p, "hedge_close_add_max_count", 0) or 0)
+                            add_enabled = False
+                            add_max_count = 0
                         except Exception:
                             add_enabled = False
                             add_max_count = 0

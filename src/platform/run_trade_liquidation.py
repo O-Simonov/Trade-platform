@@ -18,7 +18,6 @@ from src.platform.config.env import (
 from src.platform.data.storage.postgres.pool import create_pool
 from src.platform.data.storage.postgres.storage import PostgreSQLStorage
 from src.platform.notifications.telegram import load_dotenv_file
-from src.platform.traders import trade_liquidation_full_ready  # noqa: F401
 from src.platform.traders.trade_liquidation import (
     TradeLiquidation,
     TradeLiquidationParams,

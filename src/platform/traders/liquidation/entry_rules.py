@@ -584,8 +584,11 @@ class TradeLiquidationEntryRulesMixin:
                 try:
                     price_tick = float(tick_size or 0)
                     stop_px = float(_round_price_to_tick(sl_price, price_tick, mode="down" if ledger_side == "LONG" else "up"))
-                    hedge_koff = float(getattr(self.p, "hedge_koff", 1.0) or 1.0)
-                    hedge_qty = float(abs(float(qty)) * hedge_koff)
+                    hedge_qty, _hedge_koff_eff, _funding_pct = self._compute_live_hedge_qty_with_funding(
+                        symbol=str(symbol).upper(),
+                        main_side=str(ledger_side).upper(),
+                        main_qty=float(qty),
+                    )
                     if hedge_qty <= 0:
                         return None
                     hedge_ps = "SHORT" if ledger_side == "LONG" else "LONG"

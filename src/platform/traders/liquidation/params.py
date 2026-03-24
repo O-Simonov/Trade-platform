@@ -305,22 +305,16 @@ class TradeLiquidationParams:
 
     # Hedge (strategy): if enabled, SL is replaced by opening an opposite hedge position (market),
     # validated by EMA(20) trend on 5m candles.
-    hedge_koff: float = 1.2  # hedge qty = abs(main_qty) * hedge_koff
-    hedge_ema_window: int = 20
-    hedge_ema_interval: str = "5m"
-    hedge_ema_confirm_bars: int = 3  # require N consecutive EMA moves
-    hedge_ema_min_slope_pct: float = 0.0  # minimal EMA slope (% per bar) to validate direction
-    hedge_ema_flip_slope_mult: float = 0.7  # close-on-flip uses min_slope * mult
+    hedge_koff: float = 1.2  # base hedge qty multiplier relative to main qty
+    hedge_max_ratio: float = 1.0  # hard cap for hedge qty relative to main qty
+    hedge_funding_kof_limit: float = 0.0  # funding threshold in percent to allow boost
+    hedge_koff_funding_boost: float = 1.0  # boost multiplier for hedge_koff when funding is favorable
+    hedge_trigger_buffer_pct: float = 0.3  # extra buffer (%) for after-last-add hedge trigger placement
     hedge_cooldown_sec: int = 180  # cooldown between hedge open/close actions
     hedge_close_on_main_positive: bool = True  # close hedge if MAIN unrealized PnL becomes positive
-    hedge_close_on_level: bool = True  # close hedge near averaging significant level
-    hedge_close_on_ema_flip: bool = True  # close hedge if EMA trend flips against hedge
     hedge_level_tolerance_pct: float = 0.10  # tolerance around computed level for closing hedge
     hedge_stop_loss_pct: float = 0.0  # 0=OFF. % from hedge entry (SHORT: entry*(1+pct), LONG: entry*(1-pct))
     hedge_stop_loss_working_type: Optional[str] = None  # override workingType for hedge SL (defaults to hedge_trailing_working_type/working_type)
-    hedge_take_profit_enabled: bool = True
-    hedge_take_profit_pct: float = 0.0  # 0=OFF. % from hedge entry (SHORT: entry*(1-pct), LONG: entry*(1+pct))
-    hedge_take_profit_working_type: Optional[str] = None
     hedge_trailing_reissue_on_avg_entry_change: bool = True
 
     # Move hedge stop-loss to break-even (profit-lock) after activation move
@@ -331,25 +325,31 @@ class TradeLiquidationParams:
     hedge_stop_loss_be_activation_pct_min: float = 0.0
     hedge_stop_loss_be_activation_pct_max: float = 100.0
 
-
     hedge_reopen_enabled: bool = True
-    hedge_reopen_drawdown_pct: float = 0.0
     hedge_reopen_price_filter_enabled: bool = False
     hedge_reopen_price_move_pct: float = 0.0
     hedge_reopen_anchor_shift_trigger_pct: float = 0.0
     hedge_reopen_anchor_shift_step_pct: float = 0.0
 
+    # Balanced hedge / profit optimization
+    hedge_unwind_enabled: bool = False
+    hedge_unwind_step1_pct: float = 0.8
+    hedge_unwind_step1_share: float = 0.35
+    hedge_unwind_step2_pct: float = 1.6
+    hedge_unwind_step2_share: float = 0.35
+    hedge_unwind_full_exit_pct: float = 2.4
+    hedge_unwind_cooldown_sec: int = 30
+    hedge_unwind_min_qty_ratio: float = 0.15
+    hedge_adaptive_enabled: bool = True
+    hedge_adaptive_trigger_pct: float = 0.8
+    hedge_adaptive_step_pct: float = 0.8
+    hedge_adaptive_boost_per_step: float = 0.08
+    hedge_adaptive_max_extra_koff: float = 0.20
+
     # Close hedge at/near entry after it has first moved into profit by a configured amount.
-    hedge_close_on_entry_enabled: bool = False
-    hedge_close_on_entry_profit_activation_pct: float = 0.0
-    hedge_close_on_entry_buffer_pct: float = 0.0
 
     # After hedge close, optionally add to the main leg by the currently open main volume.
     # Example: main LONG 0.5 + hedge SHORT 0.5 -> hedge closes -> buy extra 0.5 LONG.
-    hedge_close_add_enabled: bool = False
-    hedge_close_add_max_count: int = 0
-
-    all_P_L: float = 0.0  # close both positions when combined unrealized PnL >= this USDT
 
     # live cleanup (after closure by FILLED SL/TP via order-events/fills)
     client_order_id_prefix: str = "TL"
@@ -430,7 +430,6 @@ class TradeLiquidationParams:
         if isinstance(ex, dict) and name in ex:
             return ex[name]
         raise AttributeError(name)
-
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "TradeLiquidationParams":
@@ -521,31 +520,33 @@ class TradeLiquidationParams:
         params["averaging_enabled"] = _as_bool(params.get("averaging_enabled", cls().averaging_enabled), cls().averaging_enabled)
         params["hedge_enabled"] = _as_bool(params.get("hedge_enabled", cls().hedge_enabled), cls().hedge_enabled)
         params["hedge_koff"] = float(_as_float(params.get("hedge_koff", cls().hedge_koff), cls().hedge_koff) or cls().hedge_koff)
-        params["hedge_ema_window"] = int(_as_int(params.get("hedge_ema_window", cls().hedge_ema_window), cls().hedge_ema_window) or cls().hedge_ema_window)
-        params["hedge_ema_interval"] = str(params.get("hedge_ema_interval", cls().hedge_ema_interval) or cls().hedge_ema_interval)
-        params["hedge_ema_confirm_bars"] = int(_as_int(params.get("hedge_ema_confirm_bars", cls().hedge_ema_confirm_bars), cls().hedge_ema_confirm_bars) or cls().hedge_ema_confirm_bars)
-        params["hedge_ema_min_slope_pct"] = float(_as_float(params.get("hedge_ema_min_slope_pct", cls().hedge_ema_min_slope_pct), cls().hedge_ema_min_slope_pct) or cls().hedge_ema_min_slope_pct)
-        params["hedge_ema_flip_slope_mult"] = float(_as_float(params.get("hedge_ema_flip_slope_mult", cls().hedge_ema_flip_slope_mult), cls().hedge_ema_flip_slope_mult) or cls().hedge_ema_flip_slope_mult)
+        params["hedge_max_ratio"] = float(_as_float(params.get("hedge_max_ratio", cls().hedge_max_ratio), cls().hedge_max_ratio) or cls().hedge_max_ratio)
+        params["hedge_funding_kof_limit"] = float(_as_float(params.get("hedge_funding_kof_limit", cls().hedge_funding_kof_limit), cls().hedge_funding_kof_limit) or cls().hedge_funding_kof_limit)
+        params["hedge_koff_funding_boost"] = float(_as_float(params.get("hedge_koff_funding_boost", cls().hedge_koff_funding_boost), cls().hedge_koff_funding_boost) or cls().hedge_koff_funding_boost)
         params["hedge_cooldown_sec"] = int(_as_int(params.get("hedge_cooldown_sec", cls().hedge_cooldown_sec), cls().hedge_cooldown_sec) or cls().hedge_cooldown_sec)
         params["hedge_close_on_main_positive"] = _as_bool(
             params.get("hedge_close_on_main_positive", cls().hedge_close_on_main_positive),
             cls().hedge_close_on_main_positive,
         )
-        params["hedge_close_on_level"] = _as_bool(params.get("hedge_close_on_level", cls().hedge_close_on_level), cls().hedge_close_on_level)
-        params["hedge_close_on_ema_flip"] = _as_bool(params.get("hedge_close_on_ema_flip", cls().hedge_close_on_ema_flip), cls().hedge_close_on_ema_flip)
         params["hedge_level_tolerance_pct"] = float(_as_float(params.get("hedge_level_tolerance_pct", cls().hedge_level_tolerance_pct), cls().hedge_level_tolerance_pct) or cls().hedge_level_tolerance_pct)
         params["hedge_reopen_enabled"] = _as_bool(params.get("hedge_reopen_enabled", cls().hedge_reopen_enabled), cls().hedge_reopen_enabled)
-        params["hedge_reopen_drawdown_pct"] = float(_as_float(params.get("hedge_reopen_drawdown_pct", cls().hedge_reopen_drawdown_pct), cls().hedge_reopen_drawdown_pct) or cls().hedge_reopen_drawdown_pct)
         params["hedge_reopen_price_filter_enabled"] = _as_bool(params.get("hedge_reopen_price_filter_enabled", cls().hedge_reopen_price_filter_enabled), cls().hedge_reopen_price_filter_enabled)
         params["hedge_reopen_price_move_pct"] = float(_as_float(params.get("hedge_reopen_price_move_pct", cls().hedge_reopen_price_move_pct), cls().hedge_reopen_price_move_pct) or cls().hedge_reopen_price_move_pct)
         params["hedge_reopen_anchor_shift_trigger_pct"] = float(_as_float(params.get("hedge_reopen_anchor_shift_trigger_pct", cls().hedge_reopen_anchor_shift_trigger_pct), cls().hedge_reopen_anchor_shift_trigger_pct) or cls().hedge_reopen_anchor_shift_trigger_pct)
         params["hedge_reopen_anchor_shift_step_pct"] = float(_as_float(params.get("hedge_reopen_anchor_shift_step_pct", cls().hedge_reopen_anchor_shift_step_pct), cls().hedge_reopen_anchor_shift_step_pct) or cls().hedge_reopen_anchor_shift_step_pct)
-        params["hedge_close_on_entry_enabled"] = _as_bool(params.get("hedge_close_on_entry_enabled", cls().hedge_close_on_entry_enabled), cls().hedge_close_on_entry_enabled)
-        params["hedge_close_on_entry_profit_activation_pct"] = float(_as_float(params.get("hedge_close_on_entry_profit_activation_pct", cls().hedge_close_on_entry_profit_activation_pct), cls().hedge_close_on_entry_profit_activation_pct) or cls().hedge_close_on_entry_profit_activation_pct)
-        params["hedge_close_on_entry_buffer_pct"] = float(_as_float(params.get("hedge_close_on_entry_buffer_pct", cls().hedge_close_on_entry_buffer_pct), cls().hedge_close_on_entry_buffer_pct) or cls().hedge_close_on_entry_buffer_pct)
-        params["hedge_close_add_enabled"] = _as_bool(params.get("hedge_close_add_enabled", cls().hedge_close_add_enabled), cls().hedge_close_add_enabled)
-        params["hedge_close_add_max_count"] = int(_as_int(params.get("hedge_close_add_max_count", cls().hedge_close_add_max_count), cls().hedge_close_add_max_count) or 0)
-        params["all_P_L"] = float(_as_float(params.get("all_P_L", cls().all_P_L), cls().all_P_L) or cls().all_P_L)
+        params["hedge_unwind_enabled"] = _as_bool(params.get("hedge_unwind_enabled", cls().hedge_unwind_enabled), cls().hedge_unwind_enabled)
+        params["hedge_unwind_step1_pct"] = float(_as_float(params.get("hedge_unwind_step1_pct", cls().hedge_unwind_step1_pct), cls().hedge_unwind_step1_pct) or cls().hedge_unwind_step1_pct)
+        params["hedge_unwind_step1_share"] = float(_as_float(params.get("hedge_unwind_step1_share", cls().hedge_unwind_step1_share), cls().hedge_unwind_step1_share) or cls().hedge_unwind_step1_share)
+        params["hedge_unwind_step2_pct"] = float(_as_float(params.get("hedge_unwind_step2_pct", cls().hedge_unwind_step2_pct), cls().hedge_unwind_step2_pct) or cls().hedge_unwind_step2_pct)
+        params["hedge_unwind_step2_share"] = float(_as_float(params.get("hedge_unwind_step2_share", cls().hedge_unwind_step2_share), cls().hedge_unwind_step2_share) or cls().hedge_unwind_step2_share)
+        params["hedge_unwind_full_exit_pct"] = float(_as_float(params.get("hedge_unwind_full_exit_pct", cls().hedge_unwind_full_exit_pct), cls().hedge_unwind_full_exit_pct) or cls().hedge_unwind_full_exit_pct)
+        params["hedge_unwind_cooldown_sec"] = int(_as_int(params.get("hedge_unwind_cooldown_sec", cls().hedge_unwind_cooldown_sec), cls().hedge_unwind_cooldown_sec) or cls().hedge_unwind_cooldown_sec)
+        params["hedge_unwind_min_qty_ratio"] = float(_as_float(params.get("hedge_unwind_min_qty_ratio", cls().hedge_unwind_min_qty_ratio), cls().hedge_unwind_min_qty_ratio) or cls().hedge_unwind_min_qty_ratio)
+        params["hedge_adaptive_enabled"] = _as_bool(params.get("hedge_adaptive_enabled", cls().hedge_adaptive_enabled), cls().hedge_adaptive_enabled)
+        params["hedge_adaptive_trigger_pct"] = float(_as_float(params.get("hedge_adaptive_trigger_pct", cls().hedge_adaptive_trigger_pct), cls().hedge_adaptive_trigger_pct) or cls().hedge_adaptive_trigger_pct)
+        params["hedge_adaptive_step_pct"] = float(_as_float(params.get("hedge_adaptive_step_pct", cls().hedge_adaptive_step_pct), cls().hedge_adaptive_step_pct) or cls().hedge_adaptive_step_pct)
+        params["hedge_adaptive_boost_per_step"] = float(_as_float(params.get("hedge_adaptive_boost_per_step", cls().hedge_adaptive_boost_per_step), cls().hedge_adaptive_boost_per_step) or cls().hedge_adaptive_boost_per_step)
+        params["hedge_adaptive_max_extra_koff"] = float(_as_float(params.get("hedge_adaptive_max_extra_koff", cls().hedge_adaptive_max_extra_koff), cls().hedge_adaptive_max_extra_koff) or cls().hedge_adaptive_max_extra_koff)
         # accept hedge_mode too
         if "hedge_mode" in d and "hedge_enabled" not in d:
             params["hedge_enabled"] = _as_bool(d.get("hedge_mode"), cls().hedge_enabled)
@@ -642,8 +643,6 @@ def _tl_norm_list(v):
         return [str(x).strip() for x in v if str(x).strip()]
     s = str(v).strip()
     return [s] if s else []
-
-
 
 __all__ = [
     "TradeLiquidationParams",

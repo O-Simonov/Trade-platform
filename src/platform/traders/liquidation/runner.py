@@ -983,7 +983,7 @@ class TradeLiquidation(
             led_qty = abs(_safe_float(p.get("qty_current"), 0.0))
             ex_qty = abs(_safe_float(ex_pos.get((sym, side)), 0.0))
 
-            if self._is_flat_qty(sym, ex_qty):
+            if self._is_flat_qty(ex_qty, sym):
                 missing_on_exchange += 1
                 if auto_close:
                     try:
@@ -1005,9 +1005,9 @@ class TradeLiquidation(
                               AND pos_uid=%(pos_uid)s
                             """,
                             {
-                                "exchange_id": ex_id,
-                                "account_id": acc_id,
-                                "pos_uid": pos_uid,
+                                "exchange_id": int(self.exchange_id),
+                                "account_id": int(self.account_id),
+                                "pos_uid": str(p.get("pos_uid") or ""),
                                 "reason": "reconcile_missing_on_exchange",
                             },
                         )
@@ -1725,6 +1725,12 @@ class TradeLiquidation(
             if side not in {"LONG", "SHORT"}:
                 continue
 
+            src_kind = str(p.get("source") or "live").lower().strip()
+            if src_kind == "live_hedge":
+                # Hedge legs are managed by hedge_logic only.
+                # Skipping them here prevents accidental hedge TP/main protective orders on the hedge side.
+                continue
+
             is_hedge_managed_side = (sym, side) in hedge_managed_sides
 
             # If exchange says no position - skip recovery (reconcile will handle ledger close)
@@ -2046,8 +2052,11 @@ class TradeLiquidation(
                         else:
                             # In hedge mode, SL is implemented as a conditional market order that OPENS the opposite hedge leg.
                             if hedge_mode and bool(getattr(self.p, "hedge_enabled", False)):
-                                hedge_koff = float(getattr(self.p, "hedge_koff", 1.0) or 1.0)
-                                hedge_qty = float(abs(float(qty_use)) * hedge_koff)
+                                hedge_qty, _hedge_koff_eff, _funding_pct = self._compute_live_hedge_qty_with_funding(
+                                    symbol=str(sym).upper(),
+                                    main_side=str(position_side).upper(),
+                                    main_qty=float(qty_use),
+                                )
                                 hedge_ps = "SHORT" if position_side == "LONG" else "LONG"
                                 params = dict(
                                     symbol=sym,
@@ -2687,11 +2696,3 @@ class TradeLiquidation(
 
 
 
-try:
-    from src.platform.traders.trade_liquidation_full_ready import apply_trade_liquidation_full_ready
-    apply_trade_liquidation_full_ready(TradeLiquidation)
-except Exception:
-    try:
-        log.exception("[TL] failed to connect trade_liquidation_full_ready patch")
-    except Exception:
-        pass

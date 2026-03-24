@@ -133,6 +133,20 @@ class TradeLiquidationHedgeLogicMixin:
             eff_koff += float(extra_koff)
 
         raw_qty = base_qty * eff_koff
+        try:
+            funding_guard = bool(getattr(self.p, 'hedge_funding_guard_enabled', False))
+            funding_soft_cap_ratio = float(getattr(self.p, 'hedge_funding_soft_cap_ratio', 0.25) or 0.25)
+        except Exception:
+            funding_guard = False
+            funding_soft_cap_ratio = 0.25
+        if funding_guard:
+            try:
+                bad_limit = float(getattr(self.p, 'hedge_funding_bad_limit_pct', 0.8) or 0.8)
+            except Exception:
+                bad_limit = 0.8
+            unfavorable = (hedge_side == 'SHORT' and funding_pct <= -abs(bad_limit)) or (hedge_side == 'LONG' and funding_pct >= abs(bad_limit))
+            if unfavorable and funding_soft_cap_ratio > 0.0:
+                hedge_max_ratio = min(float(hedge_max_ratio), float(funding_soft_cap_ratio))
         max_allowed = base_qty * max(float(hedge_max_ratio), 0.0)
         if max_allowed > 0.0:
             raw_qty = min(raw_qty, max_allowed)
@@ -171,6 +185,160 @@ class TradeLiquidationHedgeLogicMixin:
             return True
         except Exception:
             log.exception('[TL][HEDGE_UNWIND] market reduce failed %s %s qty=%.8f reason=%s', symbol, hedge_ps, float(q), str(reason))
+            return False
+
+    def _live_reduce_main_market(self, *, symbol: str, main_ps: str, qty: float, reason: str = "MAIN_PARTIAL_TP") -> bool:
+        try:
+            q = float(qty or 0.0)
+        except Exception:
+            q = 0.0
+        if q <= 0.0 or getattr(self, '_binance', None) is None:
+            return False
+        try:
+            step = float(self._qty_step_for_symbol(symbol) or 0.0)
+        except Exception:
+            step = 0.0
+        if step and step > 0.0:
+            q = float(_round_qty_to_step(q, step, mode='down'))
+        if q <= 0.0:
+            return False
+        close_side = 'SELL' if str(main_ps).upper() == 'LONG' else 'BUY'
+        try:
+            self._binance.new_order(symbol=str(symbol).upper(), side=close_side, type='MARKET', quantity=float(q), positionSide=str(main_ps).upper())
+            return True
+        except Exception:
+            log.exception('[TL][MAIN_PARTIAL_TP] market reduce failed %s %s qty=%.8f reason=%s', symbol, main_ps, float(q), str(reason))
+            return False
+
+    def _live_manage_main_partial_tp(self, *, p: dict, symbol: str, main_side: str, main_amt: float, entry_px: float, mark: float) -> bool:
+        if not bool(getattr(self.p, 'main_partial_tp_enabled', False)):
+            return False
+        try:
+            if float(main_amt or 0.0) <= 0.0 or float(entry_px or 0.0) <= 0.0 or float(mark or 0.0) <= 0.0:
+                return False
+            rm = p.get('raw_meta') if isinstance(p, dict) else None
+            if isinstance(rm, str):
+                rm = json.loads(rm) if rm.strip() else {}
+            if not isinstance(rm, dict):
+                rm = {}
+            pm = rm.get('profit') if isinstance(rm.get('profit'), dict) else {}
+            initial_qty = float(pm.get('main_qty_initial') or p.get('qty_current') or main_amt or 0.0)
+            if initial_qty <= 0.0:
+                initial_qty = float(main_amt)
+            tp1_done = bool(pm.get('main_tp1_done'))
+            tp2_done = bool(pm.get('main_tp2_done'))
+            last_ts = float(pm.get('main_last_partial_tp_ts') or 0.0)
+            cd = float(getattr(self.p, 'main_partial_tp_cooldown_sec', 30) or 30)
+            if last_ts and (time.time() - last_ts) < max(cd, 0.0):
+                return False
+            if str(main_side).upper() == 'LONG':
+                move_pct = (float(mark) - float(entry_px)) / max(float(entry_px), 1e-12) * 100.0
+            else:
+                move_pct = (float(entry_px) - float(mark)) / max(float(entry_px), 1e-12) * 100.0
+            tp1_pct = float(getattr(self.p, 'main_partial_tp1_pct', 2.5) or 2.5)
+            tp1_share = float(getattr(self.p, 'main_partial_tp1_share', 0.30) or 0.30)
+            tp2_pct = float(getattr(self.p, 'main_partial_tp2_pct', 4.5) or 4.5)
+            tp2_share = float(getattr(self.p, 'main_partial_tp2_share', 0.30) or 0.30)
+            min_ratio = max(float(getattr(self.p, 'main_partial_tp_min_qty_ratio', 0.15) or 0.15), 0.0)
+            action = None
+            target_close_qty = 0.0
+            if (not tp2_done) and move_pct >= tp2_pct:
+                action = 'TP2'
+                target_close_qty = float(initial_qty) * float(tp2_share)
+            elif (not tp1_done) and move_pct >= tp1_pct:
+                action = 'TP1'
+                target_close_qty = float(initial_qty) * float(tp1_share)
+            if not action or target_close_qty <= 0.0:
+                return False
+            min_left_qty = float(initial_qty) * float(min_ratio)
+            max_close = max(float(main_amt) - min_left_qty, 0.0)
+            target_close_qty = min(target_close_qty, max_close)
+            if target_close_qty <= 0.0:
+                return False
+            if not self._live_reduce_main_market(symbol=str(symbol).upper(), main_ps=str(main_side).upper(), qty=float(target_close_qty), reason=action):
+                return False
+            remaining_qty = max(float(main_amt) - float(target_close_qty), 0.0)
+            try:
+                if getattr(self, '_pl_has_raw_meta', False):
+                    patch = {'profit': {
+                        'main_qty_initial': float(initial_qty),
+                        'main_tp1_done': bool(tp1_done or action == 'TP1' or action == 'TP2'),
+                        'main_tp2_done': bool(tp2_done or action == 'TP2'),
+                        'main_last_partial_tp_ts': float(time.time()),
+                    }}
+                    self.store.execute(
+                        """
+                        UPDATE position_ledger
+                        SET raw_meta = COALESCE(raw_meta,'{}'::jsonb) || %(meta)s::jsonb,
+                            qty_current=%(qty)s, updated_at = now()
+                        WHERE exchange_id=%(ex)s AND account_id=%(acc)s AND pos_uid=%(pos_uid)s AND status='OPEN';
+                        """,
+                        {'meta': json.dumps(patch), 'qty': float(remaining_qty), 'ex': int(self.exchange_id), 'acc': int(self.account_id), 'pos_uid': str(p.get('pos_uid') or '')},
+                    )
+            except Exception:
+                pass
+            log.info('[TL][MAIN_PARTIAL_TP] %s %s action=%s close_qty=%.8f remain_est=%.8f move_pct=%.4f entry=%.8f mark=%.8f', symbol, str(main_side).upper(), str(action), float(target_close_qty), float(remaining_qty), float(move_pct), float(entry_px), float(mark))
+            return True
+        except Exception:
+            log.exception('[TL][MAIN_PARTIAL_TP] unexpected error for %s %s', symbol, main_side)
+            return False
+
+    def _live_manage_hedge_funding_guard(self, *, p: dict, symbol: str, main_side: str, hedge_ps: str, hedge_amt: float, mark: float) -> bool:
+        if not bool(getattr(self.p, 'hedge_funding_guard_enabled', False)):
+            return False
+        try:
+            if float(hedge_amt or 0.0) <= 0.0:
+                return False
+            funding_pct = self._get_live_symbol_funding_rate_pct(str(symbol).upper())
+            rm = p.get('raw_meta') if isinstance(p, dict) else None
+            if isinstance(rm, str):
+                rm = json.loads(rm) if rm.strip() else {}
+            if not isinstance(rm, dict):
+                rm = {}
+            hmeta = rm.get('hedge') if isinstance(rm.get('hedge'), dict) else {}
+            last_ts = float(hmeta.get('funding_last_action_ts') or 0.0)
+            cd = float(getattr(self.p, 'hedge_funding_cooldown_sec', 300) or 300)
+            if last_ts and (time.time() - last_ts) < max(cd, 0.0):
+                return False
+            bad_limit = abs(float(getattr(self.p, 'hedge_funding_bad_limit_pct', 0.8) or 0.8))
+            full_limit = abs(float(getattr(self.p, 'hedge_funding_full_exit_limit_pct', 1.2) or 1.2))
+            reduce_share = float(getattr(self.p, 'hedge_funding_reduce_share', 0.25) or 0.25)
+            adverse = (str(hedge_ps).upper() == 'SHORT' and funding_pct <= -bad_limit) or (str(hedge_ps).upper() == 'LONG' and funding_pct >= bad_limit)
+            toxic = (str(hedge_ps).upper() == 'SHORT' and funding_pct <= -full_limit) or (str(hedge_ps).upper() == 'LONG' and funding_pct >= full_limit)
+            if not (adverse or toxic):
+                return False
+            close_qty = float(hedge_amt) if toxic else float(hedge_amt) * max(min(reduce_share, 1.0), 0.0)
+            if close_qty <= 0.0:
+                return False
+            action = 'FUNDING_FULL_EXIT' if toxic else 'FUNDING_REDUCE'
+            if not self._live_reduce_hedge_market(symbol=str(symbol).upper(), hedge_ps=str(hedge_ps).upper(), qty=float(close_qty), reason=action):
+                return False
+            remain = max(float(hedge_amt) - float(close_qty), 0.0)
+            try:
+                if getattr(self, '_pl_has_raw_meta', False):
+                    patch = {'hedge': {'funding_last_action_ts': float(time.time()), 'last_action_ts': float(time.time())}}
+                    self.store.execute(
+                        """
+                        UPDATE position_ledger
+                        SET raw_meta = COALESCE(raw_meta,'{}'::jsonb) || %(meta)s::jsonb, updated_at=now()
+                        WHERE exchange_id=%(ex)s AND account_id=%(acc)s AND pos_uid=%(pos_uid)s AND status='OPEN';
+                        """,
+                        {'meta': json.dumps(patch), 'ex': int(self.exchange_id), 'acc': int(self.account_id), 'pos_uid': str(p.get('pos_uid') or '')},
+                    )
+                self.store.execute(
+                    """
+                    UPDATE position_ledger pl SET qty_current=%(qty)s, updated_at=now()
+                    WHERE pl.exchange_id=%(ex)s AND pl.account_id=%(acc)s AND pl.status='OPEN' AND COALESCE(pl.source,'live')='live_hedge'
+                      AND pl.pos_uid IN (SELECT hl.hedge_pos_uid FROM hedge_links hl WHERE hl.exchange_id=%(ex)s AND hl.base_account_id=%(acc)s AND hl.base_pos_uid=%(base_pos_uid)s);
+                    """,
+                    {'qty': float(remain), 'ex': int(self.exchange_id), 'acc': int(self.account_id), 'base_pos_uid': str(p.get('pos_uid') or '')},
+                )
+            except Exception:
+                pass
+            log.info('[TL][HEDGE_FUNDING_%s] %s %s close_qty=%.8f remain_est=%.8f funding_pct=%.4f mark=%.8f', 'FULL_EXIT' if toxic else 'REDUCE', symbol, str(hedge_ps).upper(), float(close_qty), float(remain), float(funding_pct), float(mark))
+            return True
+        except Exception:
+            log.exception('[TL][HEDGE_FUNDING] unexpected error for %s %s', symbol, hedge_ps)
             return False
 
     def _live_manage_hedge_unwind(self, *, p: dict, symbol: str, main_side: str, hedge_ps: str, hedge_amt: float, hedge_entry_use: float, mark: float) -> bool:
@@ -222,7 +390,7 @@ class TradeLiquidationHedgeLogicMixin:
             cur_amt = float(hedge_amt)
             min_left_qty = float(initial_qty) * float(min_ratio)
 
-            if (not full_done) and move_pct >= full_exit_pct:
+            if bool(getattr(self.p, 'hedge_unwind_full_exit_enabled', True)) and (not full_done) and move_pct >= full_exit_pct:
                 action = 'FULL'
                 target_close_qty = cur_amt
             elif (not step2_done) and move_pct >= step2_pct:
@@ -1311,6 +1479,19 @@ class TradeLiquidationHedgeLogicMixin:
 
             combined_upnl = float(main_upnl) + float(hedge_upnl)
 
+            # Profit optimizer for MAIN: partial TP before managing hedge exits/trl.
+            try:
+                if pl_status == 'OPEN' and float(main_amt or qty or 0.0) > 0.0:
+                    self._live_manage_main_partial_tp(
+                        p=p,
+                        symbol=symbol,
+                        main_side=main_side,
+                        main_amt=float(main_amt or qty or 0.0),
+                        entry_px=float(main_entry_use or entry or 0.0),
+                        mark=float(mark),
+                    )
+            except Exception:
+                pass
 
             # ------------------------------------------------------------------
             # Hedge trailing stop (reduce-only) after hedge position is OPEN
@@ -2185,6 +2366,27 @@ class TradeLiquidationHedgeLogicMixin:
                         hedge_amt=float(hedge_amt),
                         hedge_entry_use=float(hedge_entry_use_unwind),
                         mark=float(mark),
+                    ):
+                        try:
+                            refreshed = self._rest_snapshot_get('position_risk') or []
+                            for rr in refreshed if isinstance(refreshed, list) else []:
+                                if str(rr.get('symbol') or '').upper() != str(symbol).upper():
+                                    continue
+                                if str(rr.get('positionSide') or '').upper() != str(hedge_ps).upper():
+                                    continue
+                                hedge_amt = abs(float(rr.get('positionAmt') or 0.0))
+                                hedge_pos = rr
+                                break
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+            # Funding drag guard for an already open hedge
+            if hedge_amt > 0:
+                try:
+                    if self._live_manage_hedge_funding_guard(
+                        p=p, symbol=symbol, main_side=main_side, hedge_ps=hedge_ps, hedge_amt=float(hedge_amt), mark=float(mark)
                     ):
                         try:
                             refreshed = self._rest_snapshot_get('position_risk') or []

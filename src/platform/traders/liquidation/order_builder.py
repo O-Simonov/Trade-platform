@@ -17,6 +17,18 @@ from .params import *
 from .params import _utc_now
 from .params import _sanitize_coid_prefix
 
+
+def _activation_close_enough(a: float, b: float, tick: float = 0.0) -> bool:
+    try:
+        a = float(a or 0.0)
+        b = float(b or 0.0)
+        t = float(tick or 0.0)
+        eps_abs = max(t * 5.0, max(abs(a), abs(b)) * 0.002, 1e-9)
+        return abs(a - b) <= eps_abs
+    except Exception:
+        return False
+
+
 log = logging.getLogger("traders.trade_liquidation")
 
 class BinanceUMFuturesRest:
@@ -1228,7 +1240,7 @@ class TradeLiquidationOrderBuilderMixin:
             except Exception:
                 ex_cb = 0.0
             eps = float(tick or 0.0) * 2.0 if tick and tick > 0 else 1e-9
-            if abs(ex_act - float(activation)) <= max(eps, 1e-9) and abs(ex_cb - float(trail_pct)) <= 1e-9:
+            if _activation_close_enough(ex_act, float(activation), float(tick or 0.0)) and abs(ex_cb - float(trail_pct)) <= 1e-9:
                 return False
 
         if existing is not None and not must_refresh:
@@ -1278,7 +1290,7 @@ class TradeLiquidationOrderBuilderMixin:
             "symbol": str(sym).upper(),
             "position_side": side_u,
             "side": close_side,
-            "activation": round(float(activation), 12),
+            "activation": round(float(activation), 6),
             "trail_pct": round(float(trail_pct), 8),
             "qty": round(float(qty_main), 12),
             "mode": "after_last_add",

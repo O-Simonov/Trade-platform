@@ -887,6 +887,12 @@ class TradeLiquidation(
         self._dlog("cycle end: closed=%s opened=%s elapsed=%.2fs", str(close_stats), str(open_stats), float(elapsed))
         return out
 
+    def _qty_close(self, a: float, b: float, tol: float = 0.002) -> bool:
+        try:
+            return abs(float(a) - float(b)) <= float(tol)
+        except Exception:
+            return False
+
     def _reconcile_ledger_vs_exchange(self) -> Dict[str, int]:
         """Compare OPEN ledger positions with Binance positions and fix obvious drift.
 
@@ -1029,9 +1035,15 @@ class TradeLiquidation(
 
             qty_diff = abs(ex_qty - led_qty)
             usdt_diff = abs(ex_val - led_val) if (ex_val > 0 and led_val > 0) else 0.0
+            try:
+                qty_step = float(self._qty_step_for_symbol(sym) or 0.0)
+            except Exception:
+                qty_step = 0.0
+            qty_tol_eff = max(float(tol), (qty_step / 2.0) if qty_step > 0 else 0.0, 0.002)
+            qty_close = self._qty_close(led_qty, ex_qty, qty_tol_eff)
 
-            if qty_diff > tol or usdt_diff > usdt_tol:
-                if qty_diff > tol:
+            if (not qty_close) or usdt_diff > usdt_tol:
+                if not qty_close:
                     qty_mismatch += 1
                     if bool(getattr(self.p, "reconcile_log_diffs", True)):
                         log.warning(

@@ -114,7 +114,7 @@ traders:
       hedge_funding_kof_limit: 0.6                  # Порог funding в процентах, после которого разрешается корректировка размера hedge
       hedge_koff_funding_boost: 1.5                 # Усиление hedge_koff при выгодном funding
       hedge_koff: 0.35                              # Базовый множитель размера hedge относительно main
-      hedge_max_ratio: 0.40                         # Жесткий потолок размера hedge относительно main
+      hedge_max_ratio: 0.35                         # Жесткий потолок размера hedge относительно main
 
       hedge_trigger_buffer_pct: 0.3
       hedge_cooldown_sec: 180                       # Кулдаун между действиями по hedge
@@ -126,12 +126,13 @@ traders:
       hedge_reopen_anchor_shift_step_pct: 1.0       # На сколько сдвигать anchor при срабатывании триггера
 
       # --- Profit optimization / balanced hedge unwind
-      hedge_unwind_enabled: true                   # Частично разгружать hedge, когда цена пошла обратно в сторону main
+      hedge_unwind_enabled: true                  # Частично разгружать hedge, когда цена пошла обратно в сторону main
       hedge_unwind_step1_pct: 0.8                 # Первый шаг unwind после движения в сторону main на 0.8% от цены входа hedge
       hedge_unwind_step1_share: 0.35              # Закрыть 35% исходного hedge объема
       hedge_unwind_step2_pct: 1.6                 # Второй шаг unwind после движения на 1.6%
       hedge_unwind_step2_share: 0.35              # Закрыть еще 35% исходного hedge объема
-      hedge_unwind_full_exit_pct: 2.4             # Полностью закрыть остаток hedge при сильном возврате цены
+      hedge_unwind_full_exit_enabled: true        # Разрешить полностью закрывать hedge при сильном возврате цены
+      hedge_unwind_full_exit_pct: 1.8             # Полностью закрыть остаток hedge при сильном возврате цены
       hedge_unwind_cooldown_sec: 30               # Кулдаун между unwind-действиями
       hedge_unwind_min_qty_ratio: 0.15            # Не делать частичный unwind, если остаток hedge станет меньше 15% от исходного
 
@@ -141,6 +142,15 @@ traders:
       hedge_adaptive_step_pct: 0.8               # Шаг adverse move (%) для дополнительного усиления
       hedge_adaptive_boost_per_step: 0.08        # Дополнительный koff за каждый шаг adverse move
       hedge_adaptive_max_extra_koff: 0.20        # Максимальная добавка к hedge_koff от adaptive логики
+
+      # --- Защита от плохого funding по hedge, чтобы не попасть на дойку
+      hedge_funding_guard_enabled: true          # Разрешить динамически сокращать hedge при токсичном funding
+      hedge_funding_bad_limit_pct: 0.8           # Плохой funding (%), после которого сокращаем hedge
+      hedge_funding_reduce_step_pct: 0.5         # Резервный шаг для логики funding guard
+      hedge_funding_reduce_share: 0.25           # Сократить hedge на 25% при плохом funding
+      hedge_funding_full_exit_limit_pct: 1.2     # Полностью выйти из hedge при очень токсичном funding
+      hedge_funding_cooldown_sec: 300            # Кулдаун между funding-действиями
+      hedge_funding_soft_cap_ratio: 0.25         # Мягкий cap размера hedge при плохом funding
 
       # ======================================================
       # Hedge trailing
@@ -188,7 +198,7 @@ traders:
       # Лимиты по позициям
       # ======================================================
 
-      max_open_positions: 6                        # Максимум одновременно открытых позиций
+      max_open_positions: 8                        # Максимум одновременно открытых позиций
       max_position_notional_pct_wallet: 12.0       # Ограничение notional одной позиции как % от кошелька
       risk_wallet_pct: 1.5                         # Риск на сделку от кошелька
 
@@ -202,6 +212,21 @@ traders:
 
       stop_loss_pct: 2.0                           # Базовый SL (%)
       take_profit_pct: 6.0                         # Базовый TP (%)
+
+      # --- Частичная фиксация прибыли по main
+      main_partial_tp_enabled: true               # Разрешить частично фиксировать прибыль по main
+      main_partial_tp1_pct: 2.0                   # Первый частичный TP при +2.5%
+      main_partial_tp1_share: 0.30                # Закрыть 30% позиции
+      main_partial_tp2_pct: 4.0                   # Второй частичный TP при +4.5%
+      main_partial_tp2_share: 0.30                # Закрыть еще 30% позиции
+      main_partial_tp_cooldown_sec: 30            # Кулдаун между partial TP
+      main_partial_tp_min_qty_ratio: 0.15         # Не резать позицию, если остаток станет меньше 15% от исходного
+      main_trailing_after_tp1_enabled: true       # После TP1 сделать trailing агрессивнее
+      main_trailing_after_tp1_cb_pct: 0.50        # Callback trailing после TP1
+      main_trailing_after_tp2_enabled: true       # После TP2 сделать trailing еще агрессивнее
+      main_trailing_after_tp2_cb_pct: 0.40        # Callback trailing после TP2
+      main_exit_small_remainder_enabled: true     # Быстрее закрывать слишком маленький остаток main
+      main_exit_small_remainder_qty_ratio: 0.20   # Остаток <20% исходного размера считаем маленьким
       recalc_sl_tp: true                           # Пересчитывать SL/TP после усреднений
 
       # ======================================================

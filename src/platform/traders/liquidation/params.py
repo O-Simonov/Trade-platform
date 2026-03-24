@@ -346,6 +346,30 @@ class TradeLiquidationParams:
     hedge_adaptive_boost_per_step: float = 0.08
     hedge_adaptive_max_extra_koff: float = 0.20
 
+    # v14 profit optimizer
+    main_partial_tp_enabled: bool = True
+    main_partial_tp1_pct: float = 2.5
+    main_partial_tp1_share: float = 0.30
+    main_partial_tp2_pct: float = 4.5
+    main_partial_tp2_share: float = 0.30
+    main_partial_tp_cooldown_sec: int = 30
+    main_partial_tp_min_qty_ratio: float = 0.15
+    main_trailing_after_tp1_enabled: bool = True
+    main_trailing_after_tp1_cb_pct: float = 0.50
+    main_trailing_after_tp2_enabled: bool = True
+    main_trailing_after_tp2_cb_pct: float = 0.40
+    main_exit_small_remainder_enabled: bool = True
+    main_exit_small_remainder_qty_ratio: float = 0.20
+
+    hedge_unwind_full_exit_enabled: bool = True
+    hedge_funding_guard_enabled: bool = True
+    hedge_funding_bad_limit_pct: float = 0.8
+    hedge_funding_reduce_step_pct: float = 0.5
+    hedge_funding_reduce_share: float = 0.25
+    hedge_funding_full_exit_limit_pct: float = 1.2
+    hedge_funding_cooldown_sec: int = 300
+    hedge_funding_soft_cap_ratio: float = 0.25
+
     # Close hedge at/near entry after it has first moved into profit by a configured amount.
 
     # After hedge close, optionally add to the main leg by the currently open main volume.
@@ -542,6 +566,27 @@ class TradeLiquidationParams:
         params["hedge_unwind_full_exit_pct"] = float(_as_float(params.get("hedge_unwind_full_exit_pct", cls().hedge_unwind_full_exit_pct), cls().hedge_unwind_full_exit_pct) or cls().hedge_unwind_full_exit_pct)
         params["hedge_unwind_cooldown_sec"] = int(_as_int(params.get("hedge_unwind_cooldown_sec", cls().hedge_unwind_cooldown_sec), cls().hedge_unwind_cooldown_sec) or cls().hedge_unwind_cooldown_sec)
         params["hedge_unwind_min_qty_ratio"] = float(_as_float(params.get("hedge_unwind_min_qty_ratio", cls().hedge_unwind_min_qty_ratio), cls().hedge_unwind_min_qty_ratio) or cls().hedge_unwind_min_qty_ratio)
+        params["main_partial_tp_enabled"] = _as_bool(params.get("main_partial_tp_enabled", cls().main_partial_tp_enabled), cls().main_partial_tp_enabled)
+        params["main_partial_tp1_pct"] = float(_as_float(params.get("main_partial_tp1_pct", cls().main_partial_tp1_pct), cls().main_partial_tp1_pct) or cls().main_partial_tp1_pct)
+        params["main_partial_tp1_share"] = float(_as_float(params.get("main_partial_tp1_share", cls().main_partial_tp1_share), cls().main_partial_tp1_share) or cls().main_partial_tp1_share)
+        params["main_partial_tp2_pct"] = float(_as_float(params.get("main_partial_tp2_pct", cls().main_partial_tp2_pct), cls().main_partial_tp2_pct) or cls().main_partial_tp2_pct)
+        params["main_partial_tp2_share"] = float(_as_float(params.get("main_partial_tp2_share", cls().main_partial_tp2_share), cls().main_partial_tp2_share) or cls().main_partial_tp2_share)
+        params["main_partial_tp_cooldown_sec"] = int(_as_int(params.get("main_partial_tp_cooldown_sec", cls().main_partial_tp_cooldown_sec), cls().main_partial_tp_cooldown_sec) or cls().main_partial_tp_cooldown_sec)
+        params["main_partial_tp_min_qty_ratio"] = float(_as_float(params.get("main_partial_tp_min_qty_ratio", cls().main_partial_tp_min_qty_ratio), cls().main_partial_tp_min_qty_ratio) or cls().main_partial_tp_min_qty_ratio)
+        params["main_trailing_after_tp1_enabled"] = _as_bool(params.get("main_trailing_after_tp1_enabled", cls().main_trailing_after_tp1_enabled), cls().main_trailing_after_tp1_enabled)
+        params["main_trailing_after_tp1_cb_pct"] = float(_as_float(params.get("main_trailing_after_tp1_cb_pct", cls().main_trailing_after_tp1_cb_pct), cls().main_trailing_after_tp1_cb_pct) or cls().main_trailing_after_tp1_cb_pct)
+        params["main_trailing_after_tp2_enabled"] = _as_bool(params.get("main_trailing_after_tp2_enabled", cls().main_trailing_after_tp2_enabled), cls().main_trailing_after_tp2_enabled)
+        params["main_trailing_after_tp2_cb_pct"] = float(_as_float(params.get("main_trailing_after_tp2_cb_pct", cls().main_trailing_after_tp2_cb_pct), cls().main_trailing_after_tp2_cb_pct) or cls().main_trailing_after_tp2_cb_pct)
+        params["main_exit_small_remainder_enabled"] = _as_bool(params.get("main_exit_small_remainder_enabled", cls().main_exit_small_remainder_enabled), cls().main_exit_small_remainder_enabled)
+        params["main_exit_small_remainder_qty_ratio"] = float(_as_float(params.get("main_exit_small_remainder_qty_ratio", cls().main_exit_small_remainder_qty_ratio), cls().main_exit_small_remainder_qty_ratio) or cls().main_exit_small_remainder_qty_ratio)
+        params["hedge_unwind_full_exit_enabled"] = _as_bool(params.get("hedge_unwind_full_exit_enabled", cls().hedge_unwind_full_exit_enabled), cls().hedge_unwind_full_exit_enabled)
+        params["hedge_funding_guard_enabled"] = _as_bool(params.get("hedge_funding_guard_enabled", cls().hedge_funding_guard_enabled), cls().hedge_funding_guard_enabled)
+        params["hedge_funding_bad_limit_pct"] = float(_as_float(params.get("hedge_funding_bad_limit_pct", cls().hedge_funding_bad_limit_pct), cls().hedge_funding_bad_limit_pct) or cls().hedge_funding_bad_limit_pct)
+        params["hedge_funding_reduce_step_pct"] = float(_as_float(params.get("hedge_funding_reduce_step_pct", cls().hedge_funding_reduce_step_pct), cls().hedge_funding_reduce_step_pct) or cls().hedge_funding_reduce_step_pct)
+        params["hedge_funding_reduce_share"] = float(_as_float(params.get("hedge_funding_reduce_share", cls().hedge_funding_reduce_share), cls().hedge_funding_reduce_share) or cls().hedge_funding_reduce_share)
+        params["hedge_funding_full_exit_limit_pct"] = float(_as_float(params.get("hedge_funding_full_exit_limit_pct", cls().hedge_funding_full_exit_limit_pct), cls().hedge_funding_full_exit_limit_pct) or cls().hedge_funding_full_exit_limit_pct)
+        params["hedge_funding_cooldown_sec"] = int(_as_int(params.get("hedge_funding_cooldown_sec", cls().hedge_funding_cooldown_sec), cls().hedge_funding_cooldown_sec) or cls().hedge_funding_cooldown_sec)
+        params["hedge_funding_soft_cap_ratio"] = float(_as_float(params.get("hedge_funding_soft_cap_ratio", cls().hedge_funding_soft_cap_ratio), cls().hedge_funding_soft_cap_ratio) or cls().hedge_funding_soft_cap_ratio)
         params["hedge_adaptive_enabled"] = _as_bool(params.get("hedge_adaptive_enabled", cls().hedge_adaptive_enabled), cls().hedge_adaptive_enabled)
         params["hedge_adaptive_trigger_pct"] = float(_as_float(params.get("hedge_adaptive_trigger_pct", cls().hedge_adaptive_trigger_pct), cls().hedge_adaptive_trigger_pct) or cls().hedge_adaptive_trigger_pct)
         params["hedge_adaptive_step_pct"] = float(_as_float(params.get("hedge_adaptive_step_pct", cls().hedge_adaptive_step_pct), cls().hedge_adaptive_step_pct) or cls().hedge_adaptive_step_pct)

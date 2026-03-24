@@ -17,19 +17,19 @@ from .params import *
 from .params import _utc_now
 from .params import _sanitize_coid_prefix
 
+log = logging.getLogger("traders.trade_liquidation")
+
 
 def _activation_close_enough(a: float, b: float, tick: float = 0.0) -> bool:
     try:
         a = float(a or 0.0)
         b = float(b or 0.0)
         t = float(tick or 0.0)
-        eps_abs = max(t * 5.0, max(abs(a), abs(b)) * 0.002, 1e-9)
+        eps_abs = max(t * 8.0, max(abs(a), abs(b)) * 0.005, 1e-9)
         return abs(a - b) <= eps_abs
     except Exception:
         return False
 
-
-log = logging.getLogger("traders.trade_liquidation")
 
 class BinanceUMFuturesRest:
     """Minimal Binance USD-M Futures REST client with HMAC signature.
@@ -197,48 +197,6 @@ class BinanceUMFuturesRest:
 
         raise RuntimeError(f"binance request failed: {method} {path}: {last_exc}")
 
-
-        # Forced debug: show the actual REST call once we are about to send it.
-        # IMPORTANT: do not print signature/api secret.
-        if self.debug:
-            safe_p = dict(p)
-            if "signature" in safe_p:
-                safe_p["signature"] = "<redacted>"
-            log.info(
-                "[TL][binance_rest] %s %s signed=%s params=%s",
-                str(method).upper(),
-                str(path),
-                "Y" if signed else "N",
-                json.dumps(safe_p, ensure_ascii=False, default=str)[:1200],
-            )
-
-        try:
-            m = method.upper()
-            if m == "GET":
-                r = requests.get(url, params=p, headers=headers, timeout=self.timeout_sec)
-            elif m == "POST":
-                r = requests.post(url, params=p, headers=headers, timeout=self.timeout_sec)
-            elif m == "DELETE":
-                r = requests.delete(url, params=p, headers=headers, timeout=self.timeout_sec)
-            else:
-                raise ValueError(f"Unsupported HTTP method: {method}")
-        except Exception as e:
-            raise RuntimeError(f"binance request failed: {method} {path}: {e}")
-
-        if self.debug:
-            try:
-                log.info("[TL][binance_rest] HTTP %s for %s", str(r.status_code), str(path))
-            except Exception:
-                pass
-
-        if r.status_code >= 400:
-            try:
-                j = r.json()
-            except Exception:
-                j = {"status": r.status_code, "text": r.text}
-            raise RuntimeError(f"binance error {r.status_code}: {j}")
-
-        return r.json()
 
     # ---- wrappers
     def change_leverage(self, symbol: str, leverage: int) -> Any:
@@ -486,9 +444,46 @@ class TradeLiquidationOrderBuilderMixin:
                         merged.append(row)
                 merged.extend(fresh)
                 self._rest_snapshot["open_algo_orders_all"] = merged
+            try:
+                self._rebuild_rest_snapshot_indexes("open_algo_orders_all")
+            except Exception:
+                pass
         except Exception:
             pass
+
         return fresh
+
+    def _trl_cache_key(self, symbol: str, side: str, client_id: str) -> str:
+        return f"{str(symbol or '').upper().strip()}|{str(side or '').upper().strip()}|{str(client_id or '').strip()}"
+
+    def _get_cached_trl_activation(self, symbol: str, side: str, client_id: str) -> Optional[float]:
+        try:
+            cache = getattr(self, "_last_trl_activation", None)
+            if not isinstance(cache, dict):
+                cache = {}
+                setattr(self, "_last_trl_activation", cache)
+            v = cache.get(self._trl_cache_key(symbol, side, client_id))
+            return float(v) if v is not None else None
+        except Exception:
+            return None
+
+    def _set_cached_trl_activation(self, symbol: str, side: str, client_id: str, activation: float) -> None:
+        try:
+            cache = getattr(self, "_last_trl_activation", None)
+            if not isinstance(cache, dict):
+                cache = {}
+                setattr(self, "_last_trl_activation", cache)
+            cache[self._trl_cache_key(symbol, side, client_id)] = float(activation)
+        except Exception:
+            pass
+
+    def _clear_cached_trl_activation(self, symbol: str, side: str, client_id: str) -> None:
+        try:
+            cache = getattr(self, "_last_trl_activation", None)
+            if isinstance(cache, dict):
+                cache.pop(self._trl_cache_key(symbol, side, client_id), None)
+        except Exception:
+            pass
 
     def _cancel_algo_by_client_id_safe(
         self,
@@ -519,21 +514,11 @@ class TradeLiquidationOrderBuilderMixin:
 
         found_in_snapshot = False
         try:
-            snap = self._rest_snapshot_get("open_algo_orders_all")
-            if isinstance(snap, list) and snap:
-                for o in snap:
-                    if not isinstance(o, dict):
-                        continue
-                    if str(o.get("symbol") or "").upper().strip() != sym:
-                        continue
-                    if cid and str(o.get("clientAlgoId") or "").strip() == cid:
-                        found_in_snapshot = True
-                        if not aid:
-                            aid = str(o.get("algoId") or "").strip()
-                        break
-                    if aid and str(o.get("algoId") or "").strip() == aid:
-                        found_in_snapshot = True
-                        break
+            row = self._snapshot_find_open_order(sym, cid, algo=True, algo_id=aid)
+            if isinstance(row, dict):
+                found_in_snapshot = True
+                if not aid:
+                    aid = str(row.get("algoId") or "").strip()
         except Exception:
             pass
 
@@ -630,9 +615,13 @@ class TradeLiquidationOrderBuilderMixin:
         except Exception:
             pass
         try:
-            snap = self._rest_snapshot_get("open_algo_orders_all")
-            if isinstance(snap, list):
-                rows.extend([r for r in snap if isinstance(r, dict)])
+            snap_rows = self._snapshot_orders_for_symbol(sym, algo=True)
+            if snap_rows:
+                rows.extend([r for r in snap_rows if isinstance(r, dict)])
+            else:
+                snap = self._rest_snapshot_get("open_algo_orders_all")
+                if isinstance(snap, list):
+                    rows.extend([r for r in snap if isinstance(r, dict)])
         except Exception:
             pass
 
@@ -672,6 +661,12 @@ class TradeLiquidationOrderBuilderMixin:
         cid = (client_algo_id or "").strip()
         if not sym or not cid:
             return None
+        try:
+            row = self._snapshot_find_open_order(sym, cid, algo=True)
+            if isinstance(row, dict):
+                return row
+        except Exception:
+            pass
         try:
             snap = self._rest_snapshot_get("open_algo_orders_all")
         except Exception:
@@ -956,29 +951,42 @@ class TradeLiquidationOrderBuilderMixin:
 
         For close_side=SELL (closing LONG): trigger/activation must be ABOVE current mark.
         For close_side=BUY  (closing SHORT): trigger/activation must be BELOW current mark.
+
+        Notes:
+          - Binance can still reject a trigger that is technically on the correct side but too close
+            to current mark with -2021 ("Order would immediately trigger.").
+          - We therefore enforce a stronger minimum gap (0.20%) and, when tick is known, push the
+            trigger one extra tick away from the current mark.
         """
         p = float(desired or 0.0)
         m = float(mark or 0.0)
-        buf = float(buffer_pct or 0.0) / 100.0
+        t = float(tick or 0.0)
+        # buffer_pct comes in percent units; keep at least 0.20% away from mark.
+        buf = max(float(buffer_pct or 0.0) / 100.0, 0.0020)
+
         if m > 0:
-            if str(close_side).upper() == "SELL":
-                floor = m * (1.0 + max(buf, 0.0005))
+            close_side_u = str(close_side).upper()
+            if close_side_u == "SELL":
+                floor = m * (1.0 + buf)
                 p = max(p, floor)
-                if tick and tick > 0:
-                    p = _round_price_to_tick(p, tick, mode="up")
+                if t > 0:
+                    p = max(p, floor + t)
+                    p = _round_price_to_tick(p, t, mode="up")
             else:
-                ceil = m * (1.0 - max(buf, 0.0005))
+                ceil = m * (1.0 - buf)
                 p = min(p if p > 0 else ceil, ceil)
-                if tick and tick > 0:
-                    p = _round_price_to_tick(p, tick, mode="down")
+                if t > 0:
+                    p = min(p, ceil - t)
+                    p = _round_price_to_tick(p, t, mode="down")
         else:
-            if tick and tick > 0:
-                p = _round_price_to_tick(p, tick, mode="up" if str(close_side).upper() == "SELL" else "down")
+            if t > 0:
+                p = _round_price_to_tick(p, t, mode="up" if str(close_side).upper() == "SELL" else "down")
         return float(p)
 
     def _live_ensure_tp_trailing_after_last_add(
         self,
         *,
+        pos: dict | None = None,
         sym: str,
         pos_side: str,
         prefix: str,
@@ -1000,6 +1008,12 @@ class TradeLiquidationOrderBuilderMixin:
         if not bool(getattr(self.p, "trailing_enabled", False)):
             return False
         if int(adds_done) < int(max_adds) or int(max_adds) <= 0:
+            return False
+        if self._startup_orchestration_should_defer(
+            kind="main_tp_trailing_after_last_add",
+            symbol=str(sym).upper(),
+            pos_uid=str((pos or {}).get("pos_uid") or ""),
+        ):
             return False
 
         # last add fill (used only as a "freshness" anchor + debug)
@@ -1032,8 +1046,23 @@ class TradeLiquidationOrderBuilderMixin:
         if entry_price <= 0:
             entry_price = float(last_fill)
 
-        act_pct = float(getattr(self.p, "trailing_activation_pct", 0.0) or 0.0)
-        trail_pct = float(getattr(self.p, "trailing_trail_pct", 0.0) or 0.0)
+        mark_for_profile = 0.0
+        try:
+            pr = self._rest_snapshot_get("position_risk") or []
+            for r in pr if isinstance(pr, list) else []:
+                if str(r.get("symbol") or "").upper() != str(sym).upper():
+                    continue
+                ps = str(r.get("positionSide") or "").upper()
+                if ps and ps in {"LONG", "SHORT"} and ps != side_u:
+                    continue
+                mark_for_profile = float(r.get("markPrice") or 0.0)
+                if mark_for_profile > 0:
+                    break
+        except Exception:
+            mark_for_profile = 0.0
+        profile = self._get_effective_main_trailing_profile(p=pos, main_side=side_u, entry_px=float(entry_price), mark=float(mark_for_profile or entry_price))
+        act_pct = float(profile.get("activation_pct") or 0.0)
+        trail_pct = float(profile.get("callback_pct") or 0.0)
         buf_pct = float(getattr(self.p, "trailing_activation_buffer_pct", 0.0) or 0.0)
         if act_pct <= 0 or trail_pct <= 0:
             return False
@@ -1239,9 +1268,21 @@ class TradeLiquidationOrderBuilderMixin:
                 ex_cb = float(existing.get("callbackRate") or 0.0)
             except Exception:
                 ex_cb = 0.0
-            eps = float(tick or 0.0) * 2.0 if tick and tick > 0 else 1e-9
             if _activation_close_enough(ex_act, float(activation), float(tick or 0.0)) and abs(ex_cb - float(trail_pct)) <= 1e-9:
+                try:
+                    self._set_cached_trl_activation(sym, side_u, cid_trl, float(ex_act or activation))
+                except Exception:
+                    pass
                 return False
+
+        # Local cache dedupe: Binance can round/echo activatePrice with tiny drift, which can still
+        # make semantic comparisons look different across cycles. Prefer what we most recently placed.
+        try:
+            cached_act = self._get_cached_trl_activation(sym, side_u, cid_trl)
+        except Exception:
+            cached_act = None
+        if cached_act is not None and _activation_close_enough(float(cached_act), float(activation), float(tick or 0.0)):
+            return False
 
         if existing is not None and not must_refresh:
             # already fresh by DB/open order semantics
@@ -1290,13 +1331,18 @@ class TradeLiquidationOrderBuilderMixin:
             "symbol": str(sym).upper(),
             "position_side": side_u,
             "side": close_side,
-            "activation": round(float(activation), 6),
+            "activation": round(float(activation), 12),
             "trail_pct": round(float(trail_pct), 8),
             "qty": round(float(qty_main), 12),
             "mode": "after_last_add",
         }
         if self._memo_recent_desired_order("_recent_trl_desired", cid_trl, _trl_payload, trl_guard_sec):
             return False
+        try:
+            if self._cycle_guard_hit("ensure_trl_after_last_add", f"{cid_trl}|{sym}|{side_u}"):
+                return False
+        except Exception:
+            pass
 
         # Cancel existing TRL (best-effort)
         try:
@@ -1333,6 +1379,10 @@ class TradeLiquidationOrderBuilderMixin:
                 newClientOrderId=cid_trl,
                 positionSide=position_side if hedge_mode else None,
             )
+            try:
+                self._set_cached_trl_activation(sym, side_u, cid_trl, float(activation))
+            except Exception:
+                pass
         except Exception:
             return False
 
@@ -1411,6 +1461,12 @@ class TradeLiquidationOrderBuilderMixin:
                 return False
             if int(max_adds or 0) <= 0 or int(adds_done or 0) >= int(max_adds or 0):
                 return False
+            if self._startup_orchestration_should_defer(
+                kind="main_tp_trailing_pre_last_add",
+                symbol=str(sym).upper(),
+                pos_uid=str(pos_uid),
+            ):
+                return False
 
             side_u = str(pos_side or "").upper()
             if side_u not in {"LONG", "SHORT"}:
@@ -1430,8 +1486,9 @@ class TradeLiquidationOrderBuilderMixin:
             close_side = "SELL" if side_u == "LONG" else "BUY"
             hedge_mode = bool(getattr(self.p, "hedge_enabled", False))
             position_side = side_u if hedge_mode else None
-            act_pct = float(getattr(self.p, "trailing_activation_pct", 0.0) or 0.0)
-            trail_pct = float(getattr(self.p, "trailing_trail_pct", 0.0) or 0.0)
+            profile = self._get_effective_main_trailing_profile(p=pos, main_side=side_u, entry_px=float(entry_price), mark=float(self._get_mark_price_live(sym_u, side_u) or entry_price))
+            act_pct = float(profile.get("activation_pct") or 0.0)
+            trail_pct = float(profile.get("callback_pct") or 0.0)
             buf_pct = float(getattr(self.p, "trailing_activation_buffer_pct", 0.20) or 0.20)
             tick_dec = self._price_tick_for_symbol(sym_u)
             tick = float(tick_dec) if tick_dec is not None else 0.0
@@ -1500,6 +1557,11 @@ class TradeLiquidationOrderBuilderMixin:
             }
             if self._memo_recent_desired_order("_recent_trl_desired", cid_trl, _trl_payload, trl_guard_sec):
                 return False
+            try:
+                if self._cycle_guard_hit("ensure_trl_pre_last_add", f"{cid_trl}|{sym_u}|{position_side or 'BOTH'}"):
+                    return False
+            except Exception:
+                pass
 
             resp = self._binance.new_order(
                 symbol=sym_u,
@@ -1719,6 +1781,7 @@ class TradeLiquidationOrderBuilderMixin:
                     max_adds=int(max_adds),
                 )
                 self._live_ensure_tp_trailing_after_last_add(
+                    pos=pos,
                     sym=sym,
                     pos_side=side,
                     prefix=prefix,
@@ -1767,6 +1830,11 @@ class TradeLiquidationOrderBuilderMixin:
         }
         if self._memo_recent_desired_order("_recent_add_desired", want_cid, _add_payload, add_reissue_guard):
             return False
+        try:
+            if self._cycle_guard_hit("ensure_add_order", f"{want_cid}|{sym}|{pos_uid}"):
+                return False
+        except Exception:
+            pass
 
         def _db_add_already_executed(cid: str) -> bool:
             cid = str(cid or "")
@@ -2247,15 +2315,11 @@ class TradeLiquidationOrderBuilderMixin:
         if not rows:
             return 0
 
-        sym_rows = list(
-            self.store.query_dict(
-                "SELECT symbol_id, symbol FROM symbols WHERE exchange_id=%(ex)s",
-                {"ex": int(self.exchange_id)},
-            )
-        )
-        sym_map = {int(r["symbol_id"]): str(r["symbol"]) for r in sym_rows if r.get("symbol_id") is not None}
+        sym_map = self._symbols_map()
 
         canceled = 0
+        pos_uid_cache: Dict[str, Optional[str]] = {}
+        last_fill_cache: Dict[str, Optional[Dict[str, Any]]] = {}
 
         for r in rows:
             coid = str(r.get("client_order_id") or "")
@@ -2268,26 +2332,28 @@ class TradeLiquidationOrderBuilderMixin:
             tok = coid[len(prefix) + 1: -3]
 
             # Resolve real pos_uid via shadow orders table (because clientOrderId stores only token)
-            pos_uid = None
-            try:
-                rr = list(
-                    self.store.query_dict(
-                        """
-                        SELECT pos_uid
-                        FROM orders
-                        WHERE exchange_id=%(ex)s
-                          AND account_id=%(acc)s
-                          AND client_order_id=%(coid)s
-                        ORDER BY updated_at DESC
-                        LIMIT 1
-                        """,
-                        {"ex": int(self.exchange_id), "acc": int(self.account_id), "coid": coid},
+            pos_uid = pos_uid_cache.get(coid) if coid in pos_uid_cache else None
+            if coid not in pos_uid_cache:
+                try:
+                    rr = list(
+                        self.store.query_dict(
+                            """
+                            SELECT pos_uid
+                            FROM orders
+                            WHERE exchange_id=%(ex)s
+                              AND account_id=%(acc)s
+                              AND client_order_id=%(coid)s
+                            ORDER BY updated_at DESC
+                            LIMIT 1
+                            """,
+                            {"ex": int(self.exchange_id), "acc": int(self.account_id), "coid": coid},
+                        )
                     )
-                )
-                if rr and rr[0].get("pos_uid"):
-                    pos_uid = str(rr[0]["pos_uid"])
-            except Exception:
-                pos_uid = None
+                    if rr and rr[0].get("pos_uid"):
+                        pos_uid = str(rr[0]["pos_uid"])
+                except Exception:
+                    pos_uid = None
+                pos_uid_cache[coid] = pos_uid
 
             symbol_id = int(r.get("symbol_id") or 0)
             symbol = sym_map.get(symbol_id)
@@ -2301,11 +2367,13 @@ class TradeLiquidationOrderBuilderMixin:
             try:
                 canceled_this = False
                 # If we already fetched openOrders (async snapshot), reuse it.
-                open_all = self._rest_snapshot_get("open_orders_all")
-                if isinstance(open_all, list):
-                    open_orders = [oo for oo in open_all if str(oo.get("symbol") or "") == symbol]
-                else:
-                    open_orders = self._binance.open_orders(symbol=symbol)
+                open_orders = self._snapshot_orders_for_symbol(symbol, algo=False)
+                if not open_orders:
+                    open_all = self._rest_snapshot_get("open_orders_all")
+                    if isinstance(open_all, list):
+                        open_orders = [oo for oo in open_all if str(oo.get("symbol") or "") == symbol]
+                    else:
+                        open_orders = self._binance.open_orders(symbol=symbol)
                 for oo in open_orders:
                     if str(oo.get("clientOrderId") or "") == other_coid:
                         self._binance.cancel_order(symbol=symbol, origClientOrderId=other_coid)
@@ -2330,7 +2398,13 @@ class TradeLiquidationOrderBuilderMixin:
                         if pos_uid is None:
                             pass
                         else:
-                            algo_open = self._binance.open_algo_orders(symbol=symbol)
+                            algo_open = self._snapshot_orders_for_symbol(symbol, algo=True)
+                            if not algo_open:
+                                snap_algo_all = self._rest_snapshot_get("open_algo_orders_all")
+                                if isinstance(snap_algo_all, list):
+                                    algo_open = [ao for ao in snap_algo_all if str(ao.get("symbol") or "") == symbol]
+                                else:
+                                    algo_open = self._binance.open_algo_orders(symbol=symbol)
                             for ao in algo_open:
                                 if str(ao.get("clientAlgoId") or "") == other_coid:
                                     self._binance.cancel_algo_order(symbol=symbol, clientAlgoId=other_coid)

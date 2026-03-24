@@ -1002,6 +1002,18 @@ class TradeLiquidationRecoveryMixin:
             # Hard guarantee: TP must be on the correct side of entry.
             # (Some safety/rounding logic can otherwise push it across.)
             tp_price = _ensure_tp_trail_side(tp_price, entry, tick, side, kind="tp")
+            # Compare/place TP using the same safe trigger price that survives exchange validation.
+            tp_side = "SELL" if side == "LONG" else "BUY"
+            tp_buffer_pct = float(getattr(self.p, "tp_trigger_buffer_pct", 0.25) or 0.25)
+            tp_mark = _safe_float(ex_mark_map.get((sym, side)), 0.0)
+            desired_tp_trigger = _tl_safe_trigger_price(
+                symbol=sym,
+                close_side=tp_side,
+                desired=float(tp_price),
+                mark=tp_mark,
+                tick=float(tick or 0.0),
+                buffer_pct=tp_buffer_pct,
+            )
             # If our TP exists but trigger price no longer matches (e.g. after averaging fill),
             # cancel it so we can recreate at the new correct level.
             try:
@@ -1017,26 +1029,33 @@ class TradeLiquidationRecoveryMixin:
                         tp_trg = 0.0
                     tol = max(
                         float(tick or 0.0) * float(PRICE_EPS_TICKS),
-                        abs(float(tp_price)) * (float(AVG_EPS_PCT) / 100.0),
+                        abs(float(desired_tp_trigger)) * (float(AVG_EPS_PCT) / 100.0),
                         1e-12,
                     )
-                    if tp_trg > 0.0 and abs(tp_trg - float(tp_price)) > tol:
-                        # cancel stale TP (throttle to avoid churn)
-                        _last = float(self._bracket_replace_last_ts.get((pos_uid, "tp"), 0.0) or 0.0)
-                        if (now_ts - _last) >= float(REPLACE_COOLDOWN_SEC):
-                            try:
-                                self._cancel_algo_by_client_id_safe(sym, cid_tp)
-                            except Exception:
-                                pass
-                            has_tp = False
-                            self._bracket_replace_last_ts[(pos_uid, "tp")] = now_ts
+                    if tp_trg > 0.0 and self._should_replace_tp_order(
+                        pos_side=side,
+                        current_trigger=float(tp_trg),
+                        desired_trigger=float(desired_tp_trigger),
+                        tick=float(tick or 0.0),
+                    ):
+                        if self._cycle_guard_hit("tp_replace", f"{pos_uid}|{sym}|{cid_tp}"):
+                            pass
+                        else:
+                            # cancel stale TP (throttle to avoid churn)
+                            _last = float(self._bracket_replace_last_ts.get((pos_uid, "tp"), 0.0) or 0.0)
+                            if (now_ts - _last) >= float(REPLACE_COOLDOWN_SEC):
+                                try:
+                                    self._cancel_algo_by_client_id_safe(sym, cid_tp)
+                                except Exception:
+                                    pass
+                                has_tp = False
+                                self._bracket_replace_last_ts[(pos_uid, "tp")] = now_ts
             except Exception:
                 pass
 
             # Ensure TP exists (and matches current avg/entry-based level)
             if not has_tp:
                 try:
-                    tp_side = "SELL" if side == "LONG" else "BUY"
                     resp_tp = self._binance.new_algo_order(
                         symbol=sym,
                         side=tp_side,
@@ -1046,7 +1065,7 @@ class TradeLiquidationRecoveryMixin:
                         positionSide=side,
                         algoType="CONDITIONAL",
                         clientAlgoId=cid_tp,
-                        triggerPrice=str(tp_price),
+                        triggerPrice=str(desired_tp_trigger),
                     )
                     try:
                         self._upsert_algo_order_shadow(resp_tp, pos_uid=pos_uid, strategy_id=self.STRATEGY_ID)
@@ -1060,7 +1079,7 @@ class TradeLiquidationRecoveryMixin:
                             order_type="TAKE_PROFIT_MARKET",
                             side=tp_side,
                             quantity=float(qty_use),
-                            trigger_price=float(tp_price),
+                            trigger_price=float(desired_tp_trigger),
                             close_position=True,
                             pos_uid=pos_uid,
                         )
@@ -1500,7 +1519,8 @@ class TradeLiquidationRecoveryMixin:
                         if tick <= 0:
                             # fallback: reuse ticks from sym meta if present
                             tick = float((raw_meta or {}).get("tick_size") or 0) or 0.0
-                        act_pct = float(getattr(self.p, "trailing_activation_pct", 0.5) or 0.5)
+                        profile = self._get_effective_main_trailing_profile(p=p, main_side=side, entry_px=float(ref_price), mark=float(mark or ref_price))
+                        act_pct = float(profile.get("activation_pct") or (getattr(self.p, "trailing_activation_pct", 0.5) or 0.5))
                         act_des = ref_price * (1 + act_pct / 100.0) if side == "LONG" else ref_price * (1 - act_pct / 100.0)
                         act = _round_to_tick(act_des, tick=tick, mode="nearest") if tick > 0 else act_des
                         buf = float(getattr(self.p, "trailing_activation_buffer_pct", 0.15) or 0.15)
@@ -1508,11 +1528,7 @@ class TradeLiquidationRecoveryMixin:
                             act = self._safe_price_above_mark(act, mark, tick, buf)
                         else:
                             act = self._safe_price_below_mark(act, mark, tick, buf)
-                        cb = float(
-                            getattr(self.p, "trailing_callback_rate", None)
-                            or getattr(self.p, "trailing_trail_pct", None)
-                            or 0.5
-                        )
+                        cb = float(profile.get("callback_pct") or getattr(self.p, "trailing_callback_rate", None) or getattr(self.p, "trailing_trail_pct", None) or 0.5)
                         def _place_trl(i_try: int):
                             p_trl = dict(
                                 symbol=sym,

@@ -79,6 +79,156 @@ class TradeLiquidationHedgeLogicMixin:
         except Exception:
             return 0.0
 
+    def _calc_main_profit_pct(self, *, main_side: str, entry_px: float, mark: float) -> float:
+        try:
+            entry_px = float(entry_px or 0.0)
+            mark = float(mark or 0.0)
+            if entry_px <= 0.0 or mark <= 0.0:
+                return 0.0
+            if str(main_side).upper() == 'LONG':
+                return (mark - entry_px) / max(entry_px, 1e-12) * 100.0
+            return (entry_px - mark) / max(entry_px, 1e-12) * 100.0
+        except Exception:
+            return 0.0
+
+    def _load_main_profit_meta(self, p: dict | None) -> tuple[dict, dict, dict]:
+        try:
+            rm = p.get('raw_meta') if isinstance(p, dict) else None
+            if isinstance(rm, str):
+                rm = json.loads(rm) if rm.strip() else {}
+            if not isinstance(rm, dict):
+                rm = {}
+            pm = rm.get('profit') if isinstance(rm.get('profit'), dict) else {}
+            return rm, pm, dict(pm)
+        except Exception:
+            return {}, {}, {}
+
+    def _get_effective_main_trailing_profile(self, *, p: dict | None, main_side: str, entry_px: float, mark: float) -> dict:
+        move_pct = float(self._calc_main_profit_pct(main_side=str(main_side).upper(), entry_px=float(entry_px or 0.0), mark=float(mark or 0.0)) or 0.0)
+        act_pct = float(getattr(self.p, 'trailing_activation_pct', 0.0) or 0.0)
+        cb_pct = float(getattr(self.p, 'trailing_trail_pct', 0.0) or 0.0)
+        rm, pm, _ = self._load_main_profit_meta(p)
+        tp1_done = bool(pm.get('main_tp1_done'))
+        tp2_done = bool(pm.get('main_tp2_done'))
+        tags = []
+
+        if tp1_done and bool(getattr(self.p, 'main_trailing_after_tp1_enabled', False)):
+            cb1 = float(getattr(self.p, 'main_trailing_after_tp1_cb_pct', cb_pct) or cb_pct)
+            if cb1 > 0:
+                cb_pct = min(cb_pct, cb1)
+                tags.append('tp1')
+        if tp2_done and bool(getattr(self.p, 'main_trailing_after_tp2_enabled', False)):
+            cb2 = float(getattr(self.p, 'main_trailing_after_tp2_cb_pct', cb_pct) or cb_pct)
+            if cb2 > 0:
+                cb_pct = min(cb_pct, cb2)
+                tags.append('tp2')
+
+        if bool(getattr(self.p, 'adaptive_tp_trailing_enabled', True)):
+            levels = [
+                (float(getattr(self.p, 'adaptive_tp_trailing_level1_profit_pct', 1.2) or 1.2), float(getattr(self.p, 'adaptive_tp_trailing_level1_cb_pct', cb_pct) or cb_pct), 'lvl1'),
+                (float(getattr(self.p, 'adaptive_tp_trailing_level2_profit_pct', 2.4) or 2.4), float(getattr(self.p, 'adaptive_tp_trailing_level2_cb_pct', cb_pct) or cb_pct), 'lvl2'),
+                (float(getattr(self.p, 'adaptive_tp_trailing_level3_profit_pct', 4.0) or 4.0), float(getattr(self.p, 'adaptive_tp_trailing_level3_cb_pct', cb_pct) or cb_pct), 'lvl3'),
+            ]
+            for need_profit, level_cb, label in levels:
+                if move_pct >= need_profit and level_cb > 0:
+                    cb_pct = min(cb_pct, level_cb)
+                    tags.append(label)
+
+        if bool(getattr(self.p, 'main_trend_bonus_enabled', True)):
+            activate_profit = float(getattr(self.p, 'main_trend_bonus_activate_profit_pct', 1.4) or 1.4)
+            profit_step = max(float(getattr(self.p, 'main_trend_bonus_profit_step_pct', 1.0) or 1.0), 1e-9)
+            shift_step = max(float(getattr(self.p, 'main_trend_bonus_activation_shift_step_pct', 0.15) or 0.15), 0.0)
+            shift_max = max(float(getattr(self.p, 'main_trend_bonus_activation_shift_max_pct', 0.45) or 0.45), 0.0)
+            if move_pct >= activate_profit and shift_step > 0 and shift_max > 0:
+                steps = int(math.floor((move_pct - activate_profit) / profit_step)) + 1
+                shift = min(shift_max, float(steps) * shift_step)
+                act_pct = max(0.0, float(act_pct) + float(shift))
+                tags.append(f'trend+{shift:.2f}')
+
+        return {
+            'move_pct': float(move_pct),
+            'activation_pct': max(0.0, float(act_pct)),
+            'callback_pct': max(0.1, float(cb_pct)),
+            'tp1_done': bool(tp1_done),
+            'tp2_done': bool(tp2_done),
+            'mode': '+'.join(tags) if tags else 'base',
+            'raw_meta': rm,
+            'profit_meta': pm,
+        }
+
+    def _should_replace_main_trailing(self, *, main_side: str, current_activation: float | None, current_callback: float | None, desired_activation: float, desired_callback: float, tick: float) -> bool:
+        try:
+            desired_activation = float(desired_activation or 0.0)
+            desired_callback = float(desired_callback or 0.0)
+            cur_act = float(current_activation) if current_activation is not None else 0.0
+            cur_cb = float(current_callback) if current_callback is not None else 0.0
+            tick = float(tick or 0.0)
+            min_act_ticks = max(int(getattr(self.p, 'main_trailing_min_activation_improve_ticks', 2) or 2), 0)
+            min_act_delta = max(tick * float(min_act_ticks), 1e-12)
+            min_cb_delta = max(float(getattr(self.p, 'main_trailing_min_callback_improve_pct', 0.05) or 0.05), 1e-12)
+            side_u = str(main_side).upper()
+            never_worsen = bool(getattr(self.p, 'main_trailing_never_worsen', True))
+
+            if cur_act > 0.0 and cur_cb > 0.0 and never_worsen:
+                if side_u == 'LONG':
+                    act_not_worse = cur_act <= (desired_activation + min_act_delta)
+                else:
+                    act_not_worse = cur_act >= (desired_activation - min_act_delta)
+                cb_not_worse = cur_cb <= (desired_callback + min_cb_delta)
+                if act_not_worse and cb_not_worse:
+                    return False
+
+            act_changed = False
+            if cur_act <= 0.0:
+                act_changed = True
+            elif side_u == 'LONG':
+                act_changed = abs(cur_act - desired_activation) > min_act_delta and desired_activation < (cur_act - min_act_delta)
+                if not never_worsen:
+                    act_changed = abs(cur_act - desired_activation) > min_act_delta
+            else:
+                act_changed = abs(cur_act - desired_activation) > min_act_delta and desired_activation > (cur_act + min_act_delta)
+                if not never_worsen:
+                    act_changed = abs(cur_act - desired_activation) > min_act_delta
+
+            cb_changed = (cur_cb <= 0.0) or ((cur_cb - desired_callback) > min_cb_delta)
+            return bool(act_changed or cb_changed)
+        except Exception:
+            return True
+
+
+    def _is_material_qty_change(self, *, current_qty: float, desired_qty: float, min_abs: float, min_ratio_pct: float) -> bool:
+        try:
+            cur = abs(float(current_qty or 0.0))
+            des = abs(float(desired_qty or 0.0))
+            diff = abs(cur - des)
+            ratio = (diff / max(cur, des, 1e-12)) * 100.0
+            return bool(diff > max(float(min_abs or 0.0), 0.0) and ratio > max(float(min_ratio_pct or 0.0), 0.0))
+        except Exception:
+            return True
+
+    def _live_maybe_exit_small_main_remainder(self, *, p: dict, symbol: str, main_side: str, main_amt: float) -> bool:
+        if not bool(getattr(self.p, 'main_exit_small_remainder_enabled', False)):
+            return False
+        try:
+            rm, pm, _ = self._load_main_profit_meta(p)
+            initial_qty = float(pm.get('main_qty_initial') or p.get('qty_current') or main_amt or 0.0)
+            if initial_qty <= 0.0:
+                return False
+            cur_amt = float(main_amt or 0.0)
+            if cur_amt <= 0.0:
+                return False
+            ratio = cur_amt / max(initial_qty, 1e-12)
+            max_ratio = max(float(getattr(self.p, 'main_exit_small_remainder_qty_ratio', 0.20) or 0.20), 0.0)
+            if ratio > max_ratio:
+                return False
+            if not self._live_reduce_main_market(symbol=str(symbol).upper(), main_ps=str(main_side).upper(), qty=float(cur_amt), reason='MAIN_SMALL_REMAINDER_EXIT'):
+                return False
+            log.info('[TL][MAIN_SMALL_REMAINDER_EXIT] %s %s close_qty=%.8f remain_ratio=%.4f initial_qty=%.8f', symbol, str(main_side).upper(), float(cur_amt), float(ratio), float(initial_qty))
+            return True
+        except Exception:
+            log.exception('[TL][MAIN_SMALL_REMAINDER_EXIT] unexpected error for %s %s', symbol, main_side)
+            return False
+
     def _compute_live_hedge_qty_with_funding(self, *, symbol: str, main_side: str, main_qty: float, ref_price: float | None = None, mark_price: float | None = None) -> tuple[float, float, float]:
         """Compute hedge quantity with funding-aware boost and hard risk cap.
 
@@ -278,6 +428,10 @@ class TradeLiquidationHedgeLogicMixin:
             except Exception:
                 pass
             log.info('[TL][MAIN_PARTIAL_TP] %s %s action=%s close_qty=%.8f remain_est=%.8f move_pct=%.4f entry=%.8f mark=%.8f', symbol, str(main_side).upper(), str(action), float(target_close_qty), float(remaining_qty), float(move_pct), float(entry_px), float(mark))
+            try:
+                self._live_maybe_exit_small_main_remainder(p=p, symbol=str(symbol).upper(), main_side=str(main_side).upper(), main_amt=float(remaining_qty))
+            except Exception:
+                pass
             return True
         except Exception:
             log.exception('[TL][MAIN_PARTIAL_TP] unexpected error for %s %s', symbol, main_side)
@@ -1582,6 +1736,13 @@ class TradeLiquidationHedgeLogicMixin:
                         self._cancel_algo_by_client_id_safe(symbol, cid_htrl)
                         raise StopIteration()
 
+                    if self._startup_orchestration_should_defer(
+                        kind="hedge_trailing",
+                        symbol=str(symbol).upper(),
+                        pos_uid=str(p.get('pos_uid') or ''),
+                    ):
+                        raise StopIteration()
+
                     act_pct = float(getattr(self.p, "hedge_trailing_activation_pct", 1.5) or 1.5)
                     trail_pct = float(getattr(self.p, "hedge_trailing_trail_pct", 0.5) or 0.5)
                     buf_pct = float(getattr(self.p, "hedge_trailing_activation_buffer_pct", 0.25) or 0.25)
@@ -1740,7 +1901,8 @@ class TradeLiquidationHedgeLogicMixin:
                                 ex_q = float((src or {}).get("origQty") or (src or {}).get("quantity") or 0.0)
                             except Exception:
                                 ex_q = 0.0
-                            if abs(ex_q - q) > max(qty_tol, 0.0):
+                            min_ratio_pct = float(getattr(self.p, "hedge_trailing_reissue_min_qty_change_pct", 2.5) or 2.5)
+                            if self._is_material_qty_change(current_qty=ex_q, desired_qty=q, min_abs=max(qty_tol, 0.0), min_ratio_pct=min_ratio_pct):
                                 need_reissue = True
 
                         # Cooldown tracking for reissue to avoid churn
@@ -1751,6 +1913,11 @@ class TradeLiquidationHedgeLogicMixin:
 
                         if need_reissue and (now_ts - last_ts) < reissue_cd:
                             need_reissue = False
+                        try:
+                            if need_reissue and self._cycle_guard_hit("hedge_trl_reissue", f"{symbol}|{hedge_ps}|{cid_htrl}"):
+                                need_reissue = False
+                        except Exception:
+                            pass
 
                         if need_reissue:
                             # cancel existing before reissue
@@ -1798,6 +1965,12 @@ class TradeLiquidationHedgeLogicMixin:
                             # cycle / shortly after a successful placement when exchange snapshots lag behind.
                             if recent_place_ts and (now_ts - recent_place_ts) < place_guard_sec:
                                 need_place = False
+                            else:
+                                try:
+                                    if self._cycle_guard_hit("hedge_trl_place", f"{symbol}|{hedge_ps}|{cid_htrl}"):
+                                        need_place = False
+                                except Exception:
+                                    pass
 
                         if need_place:
                             # Activation must be computed from the hedge average entry price:
@@ -2193,7 +2366,8 @@ class TradeLiquidationHedgeLogicMixin:
                                 try:
                                     db_qty_f = float(self._fmt_qty(symbol, float(db_qty)))
                                     want_qty_f = float(self._fmt_qty(symbol, float(hedge_amt)))
-                                    qty_mismatch = bool(abs(db_qty_f - want_qty_f) > qty_tol)
+                                    min_ratio_pct = float(getattr(self.p, 'hedge_stop_loss_reissue_min_qty_change_pct', 2.5) or 2.5)
+                                    qty_mismatch = self._is_material_qty_change(current_qty=db_qty_f, desired_qty=want_qty_f, min_abs=qty_tol, min_ratio_pct=min_ratio_pct)
                                 except Exception:
                                     qty_mismatch = bool(abs(float(db_qty) - float(hedge_amt)) > qty_tol)
                             need_reissue = bool((not is_open_now) or qty_mismatch or trig_mismatch)
@@ -2245,7 +2419,12 @@ class TradeLiquidationHedgeLogicMixin:
                                 if not hasattr(self, '_hsl_last_ts'):
                                     self._hsl_last_ts = {}
                                 last_ts = float(self._hsl_last_ts.get(cid_hsl, 0.0))
-                                if (now_ts - last_ts) >= reissue_cd:
+                                try:
+                                    if self._cycle_guard_hit("hedge_sl_reissue", f"{symbol}|{hedge_ps}|{cid_hsl}"):
+                                        need_reissue = False
+                                except Exception:
+                                    pass
+                                if need_reissue and (now_ts - last_ts) >= reissue_cd:
                                     try:
                                         self._cancel_algo_by_client_id_safe(symbol, cid_hsl)
                                     except Exception:

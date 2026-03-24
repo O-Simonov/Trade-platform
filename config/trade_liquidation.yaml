@@ -132,7 +132,7 @@ traders:
       hedge_unwind_step2_pct: 1.6                 # Второй шаг unwind после движения на 1.6%
       hedge_unwind_step2_share: 0.35              # Закрыть еще 35% исходного hedge объема
       hedge_unwind_full_exit_enabled: true        # Разрешить полностью закрывать hedge при сильном возврате цены
-      hedge_unwind_full_exit_pct: 1.8             # Полностью закрыть остаток hedge при сильном возврате цены
+      hedge_unwind_full_exit_pct: 1.6             # Полностью закрыть остаток hedge при сильном возврате цены
       hedge_unwind_cooldown_sec: 30               # Кулдаун между unwind-действиями
       hedge_unwind_min_qty_ratio: 0.15            # Не делать частичный unwind, если остаток hedge станет меньше 15% от исходного
 
@@ -215,9 +215,9 @@ traders:
 
       # --- Частичная фиксация прибыли по main
       main_partial_tp_enabled: true               # Разрешить частично фиксировать прибыль по main
-      main_partial_tp1_pct: 2.0                   # Первый частичный TP при +2.5%
+      main_partial_tp1_pct: 1.8                   # Первый частичный TP при +2.5%
       main_partial_tp1_share: 0.30                # Закрыть 30% позиции
-      main_partial_tp2_pct: 4.0                   # Второй частичный TP при +4.5%
+      main_partial_tp2_pct: 3.8                   # Второй частичный TP при +4.5%
       main_partial_tp2_share: 0.30                # Закрыть еще 30% позиции
       main_partial_tp_cooldown_sec: 30            # Кулдаун между partial TP
       main_partial_tp_min_qty_ratio: 0.15         # Не резать позицию, если остаток станет меньше 15% от исходного

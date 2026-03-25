@@ -429,60 +429,33 @@ class TradeLiquidationCandidateFinderMixin:
         return "FLAT"
 
     def _compute_significant_level(self, symbol_id: int, *, side: str, entry_ref: float, timeframe: str) -> float:
-        """Compute a significant support/resistance level using pivot highs/lows (same logic as live ADD1).
+        """Compute a significant support/resistance level for averaging.
+
+        Uses the configured averaging method:
+          - pivot: nearest qualifying pivot level
+          - combined: nearest pivot with nearby volume-profile confirmation
 
         Returns 0.0 if cannot compute.
         """
         try:
-            lv_tf = str(getattr(self.p, "averaging_levels_tf", timeframe) or timeframe)
-            lookback_h = int(getattr(self.p, "averaging_levels_lookback_hours", 168) or 168)
-            left = int(getattr(self.p, "averaging_pivot_left", 3) or 3)
-            right = int(getattr(self.p, "averaging_pivot_right", 3) or 3)
-            min_dist_pct = float(self._cfg_averaging_min_level_distance_pct())
-            dist_limit_pct = max(5.0, float(min_dist_pct))
-
             if entry_ref <= 0:
                 return 0.0
-
-            q = """
-            SELECT high, low
-            FROM candles
-            WHERE exchange_id=%(ex)s AND symbol_id=%(sym)s AND interval=%(tf)s
-              AND open_time >= (NOW() AT TIME ZONE 'UTC') - (%(h)s || ' hours')::interval
-            ORDER BY open_time ASC;
-            """
-            rows = list(self.store.query_dict(q, {"ex": int(self.exchange_id), "sym": int(symbol_id), "tf": lv_tf, "h": int(lookback_h)}))
-            lows = [float(r.get("low") or 0.0) for r in rows]
-            highs = [float(r.get("high") or 0.0) for r in rows]
-            if len(lows) < (left + right + 5):
-                return 0.0
-
-            piv_lows = []
-            piv_highs = []
-            for i in range(left, len(lows) - right):
-                w = lows[i-left:i+right+1]
-                if lows[i] > 0 and lows[i] == min(w):
-                    piv_lows.append(lows[i])
-                w2 = highs[i-left:i+right+1]
-                if highs[i] > 0 and highs[i] == max(w2):
-                    piv_highs.append(highs[i])
+            min_dist_pct = float(self._cfg_averaging_min_level_distance_pct())
+            dist_limit_pct = max(0.01, float(min_dist_pct))
+            level = self._pick_averaging_level(
+                symbol_id=int(symbol_id),
+                side=str(side or ""),
+                ref_price=float(entry_ref),
+                timeframe=str(timeframe or getattr(self.p, "averaging_levels_tf", "4h") or "4h"),
+                level_index=1,
+            )
+            if level and level > 0:
+                return float(level)
 
             side_u = str(side or "").upper()
-            level = 0.0
             if side_u == "LONG":
-                below = [x for x in piv_lows if x > 0 and x < entry_ref * (1.0 - dist_limit_pct/100.0)]
-                if below:
-                    level = max(below)
-                else:
-                    level = entry_ref * (1.0 - (dist_limit_pct / 100.0))
-            else:
-                above = [x for x in piv_highs if x > entry_ref * (1.0 + dist_limit_pct/100.0)]
-                if above:
-                    level = min(above)
-                else:
-                    level = entry_ref * (1.0 + (dist_limit_pct / 100.0))
-
-            return float(level) if level and level > 0 else 0.0
+                return float(entry_ref) * (1.0 - (dist_limit_pct / 100.0))
+            return float(entry_ref) * (1.0 + (dist_limit_pct / 100.0))
         except Exception:
             return 0.0
 

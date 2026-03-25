@@ -2088,12 +2088,12 @@ class TradeLiquidationOrderBuilderMixin:
         try:
             sid = int(pos.get("symbol_id") or 0)
             if sid > 0:
-                picked = self._pick_averaging_price_from_candles(
+                picked = self._pick_averaging_level(
                     symbol_id=sid,
-                    side=side,
+                    side=str(side or ""),
                     ref_price=float(ref_price),
-                    min_dist_pct=min_dist_pct,
-                    level_index=next_n,
+                    timeframe=str(getattr(self.p, "averaging_levels_tf", pos.get("timeframe") or "4h") or pos.get("timeframe") or "4h"),
+                    level_index=int(next_n),
                 )
         except Exception:
             picked = None

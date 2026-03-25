@@ -293,6 +293,183 @@ class TradeLiquidationFiltersMixin:
         except Exception:
             return DEFAULT
 
+
+    def _cfg_averaging_levels_method(self) -> str:
+        """Read averaging levels method with backward-compatible keys.
+
+        Supported values:
+          - pivot
+          - combined (pivot + volume confirmation)
+        Unknown values fall back to ``pivot``.
+        """
+        try:
+            raw = None
+            for key in ("averaging_levels_method", "levels_method"):
+                try:
+                    raw = getattr(self.p, key, None)
+                except Exception:
+                    raw = None
+                if raw not in (None, ""):
+                    break
+            method = str(raw or "pivot").strip().lower()
+            if method not in {"pivot", "combined"}:
+                return "pivot"
+            return method
+        except Exception:
+            return "pivot"
+
+    def _load_averaging_candles(self, symbol_id: int, timeframe: str) -> list[dict]:
+        try:
+            lv_tf = str(getattr(self.p, "averaging_levels_tf", timeframe) or timeframe)
+            lookback_h = int(getattr(self.p, "averaging_levels_lookback_hours", 168) or 168)
+            q = """
+            SELECT open_time, high, low, close, volume
+            FROM candles
+            WHERE exchange_id=%(ex)s AND symbol_id=%(sym)s AND interval=%(tf)s
+              AND open_time >= (NOW() AT TIME ZONE 'UTC') - (%(h)s || ' hours')::interval
+            ORDER BY open_time ASC;
+            """
+            return list(self.store.query_dict(q, {"ex": int(self.exchange_id), "sym": int(symbol_id), "tf": lv_tf, "h": int(lookback_h)}))
+        except Exception:
+            return []
+
+    def _extract_pivot_levels(self, rows: list[dict]) -> tuple[list[float], list[float]]:
+        try:
+            left = int(getattr(self.p, "averaging_pivot_left", 3) or 3)
+            right = int(getattr(self.p, "averaging_pivot_right", 3) or 3)
+            lows = [float((r or {}).get("low") or 0.0) for r in rows]
+            highs = [float((r or {}).get("high") or 0.0) for r in rows]
+            if len(lows) < (left + right + 5):
+                return [], []
+            piv_lows: list[float] = []
+            piv_highs: list[float] = []
+            for i in range(left, len(lows) - right):
+                w_low = lows[i-left:i+right+1]
+                cur_low = lows[i]
+                if cur_low > 0 and cur_low == min(w_low):
+                    piv_lows.append(cur_low)
+                w_high = highs[i-left:i+right+1]
+                cur_high = highs[i]
+                if cur_high > 0 and cur_high == max(w_high):
+                    piv_highs.append(cur_high)
+            return piv_lows, piv_highs
+        except Exception:
+            return [], []
+
+    def _extract_volume_profile_nodes(self, rows: list[dict]) -> list[float]:
+        """Build simple volume-profile nodes from candles.
+
+        We use candle HLC3 as the price proxy and candle volume as the weight.
+        This is intentionally simple and stable enough for averaging levels.
+        """
+        try:
+            bins = max(8, int(getattr(self.p, "averaging_vp_bins", 48) or 48))
+            top_nodes = max(1, int(getattr(self.p, "averaging_vp_top_nodes", 10) or 10))
+            min_sep_pct = float(getattr(self.p, "averaging_cluster_tolerance_pct", 0.25) or 0.25)
+            prices: list[float] = []
+            vols: list[float] = []
+            lows: list[float] = []
+            highs: list[float] = []
+            for r in rows:
+                hi = float((r or {}).get("high") or 0.0)
+                lo = float((r or {}).get("low") or 0.0)
+                cl = float((r or {}).get("close") or 0.0)
+                vol = float((r or {}).get("volume") or 0.0)
+                if hi <= 0 or lo <= 0 or cl <= 0 or vol <= 0:
+                    continue
+                lows.append(lo)
+                highs.append(hi)
+                prices.append((hi + lo + cl) / 3.0)
+                vols.append(vol)
+            if not prices:
+                return []
+            lo_all = min(lows)
+            hi_all = max(highs)
+            if hi_all <= lo_all:
+                return []
+            step = (hi_all - lo_all) / float(bins)
+            if step <= 0:
+                return []
+            hist = [0.0] * bins
+            centers = [lo_all + (i + 0.5) * step for i in range(bins)]
+            for px, vol in zip(prices, vols):
+                idx = int((px - lo_all) / step)
+                if idx < 0:
+                    idx = 0
+                elif idx >= bins:
+                    idx = bins - 1
+                hist[idx] += vol
+            ranked = sorted(range(bins), key=lambda i: hist[i], reverse=True)
+            nodes: list[float] = []
+            for idx in ranked:
+                if hist[idx] <= 0:
+                    continue
+                px = float(centers[idx])
+                if any(abs(px - n) / max(abs(n), 1e-9) * 100.0 <= min_sep_pct for n in nodes):
+                    continue
+                nodes.append(px)
+                if len(nodes) >= top_nodes:
+                    break
+            return nodes
+        except Exception:
+            return []
+
+    def _pick_averaging_level(
+        self,
+        *,
+        symbol_id: int,
+        side: str,
+        ref_price: float,
+        timeframe: str,
+        level_index: int = 1,
+    ) -> Optional[float]:
+        """Pick averaging level according to configured method.
+
+        Methods:
+          - pivot: nearest qualifying pivot level
+          - combined: nearest pivot with nearby volume-profile confirmation
+        Returns ``None`` when no suitable level is found; caller should apply fallback.
+        """
+        try:
+            side_u = str(side or "").upper()
+            if ref_price <= 0 or side_u not in {"LONG", "SHORT"}:
+                return None
+            rows = self._load_averaging_candles(symbol_id, timeframe)
+            if not rows:
+                return None
+            piv_lows, piv_highs = self._extract_pivot_levels(rows)
+            method = self._cfg_averaging_levels_method()
+            min_dist_pct = float(self._cfg_averaging_min_level_distance_pct())
+            dist_limit_pct = max(0.01, float(min_dist_pct))
+            level_index = max(1, int(level_index or 1))
+
+            if side_u == "LONG":
+                candidates = sorted({x for x in piv_lows if x > 0 and x < ref_price * (1.0 - dist_limit_pct/100.0)}, reverse=True)
+            else:
+                candidates = sorted({x for x in piv_highs if x > ref_price * (1.0 + dist_limit_pct/100.0)})
+
+            if not candidates:
+                return None
+
+            if method == "pivot":
+                return float(candidates[level_index - 1]) if len(candidates) >= level_index else None
+
+            # combined = pivot + volume confirmation
+            tol_pct = float(getattr(self.p, "averaging_level_tolerance_pct", 0.15) or 0.15)
+            cluster_tol_pct = float(getattr(self.p, "averaging_cluster_tolerance_pct", 0.25) or 0.25)
+            confirm_pct = max(tol_pct, cluster_tol_pct)
+            vp_nodes = self._extract_volume_profile_nodes(rows)
+            if not vp_nodes:
+                return None
+
+            confirmed: list[float] = []
+            for lvl in candidates:
+                if any(abs(lvl - node) / max(abs(lvl), 1e-9) * 100.0 <= confirm_pct for node in vp_nodes):
+                    confirmed.append(float(lvl))
+            return float(confirmed[level_index - 1]) if len(confirmed) >= level_index else None
+        except Exception:
+            return None
+
     def _parse_add_n(self, client_id: str) -> int:
         """Extract ADD number from client_order_id (.._ADD1/.._ADD2..)."""
         try:

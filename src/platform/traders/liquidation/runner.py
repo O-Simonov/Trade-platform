@@ -115,7 +115,6 @@ class TradeLiquidation(
         self._rest_snapshot_lock = threading.Lock()
         self._rest_snapshot: Dict[str, Any] = {}
         self._rest_snapshot_ts: Optional[datetime] = None
-        self._rest_snapshot_index: Dict[str, Any] = {}
 
         # cycle counter (used for reconcile/recovery throttling)
         self._cycle_n = 0
@@ -130,9 +129,6 @@ class TradeLiquidation(
         self._symbols_cache: Optional[Dict[int, str]] = None
         self._symbols_cache_ts: Optional[datetime] = None
 
-        # v14.3: in-cycle dedupe for noisy replace/cancel branches
-        self._cycle_action_guard: Dict[str, set[str]] = {}
-
         # last exchange /fapi/v2/positionRisk payload (live only)
         # used to keep DB "positions" / "position_snapshots" in sync with markPrice
         self._last_position_risk: Optional[List[Dict[str, Any]]] = None
@@ -146,106 +142,6 @@ class TradeLiquidation(
         if self.p.debug:
             self._dlog("position_ledger.raw_meta present=%s", self._pl_has_raw_meta)
             self._dlog("mode=%s account_id=%s hedge=%s", self.p.mode, str(self.account_id), str(self.p.hedge_enabled))
-
-
-    def _cycle_guard_hit(self, bucket: str, key: str) -> bool:
-        """Return True if the same action key was already processed in the current cycle."""
-        try:
-            if not bool(getattr(self.p, "cycle_action_dedupe_enabled", True)):
-                return False
-            bucket_s = str(bucket or "").strip()
-            key_s = str(key or "").strip()
-            if not bucket_s or not key_s:
-                return False
-            store = getattr(self, "_cycle_action_guard", None)
-            if not isinstance(store, dict):
-                self._cycle_action_guard = {}
-                store = self._cycle_action_guard
-            seen = store.get(bucket_s)
-            if not isinstance(seen, set):
-                seen = set()
-                store[bucket_s] = seen
-            if key_s in seen:
-                return True
-            seen.add(key_s)
-        except Exception:
-            return False
-        return False
-
-    def _should_replace_tp_order(self, *, pos_side: str, current_trigger: float | None, desired_trigger: float, tick: float) -> bool:
-        """Replace TP only when the trigger changed materially enough."""
-        try:
-            cur_trg = float(current_trigger) if current_trigger is not None else 0.0
-            desired = float(desired_trigger or 0.0)
-            tick_f = float(tick or 0.0)
-            if cur_trg <= 0.0 or desired <= 0.0:
-                return True
-            min_ticks = max(int(getattr(self.p, "tp_replace_min_trigger_improve_ticks", 3) or 3), 0)
-            min_pct = max(float(getattr(self.p, "tp_replace_min_trigger_improve_pct", 0.10) or 0.10), 0.0)
-            tol_abs = max(tick_f * float(min_ticks), abs(desired) * (min_pct / 100.0), 1e-12)
-            if abs(cur_trg - desired) <= tol_abs:
-                return False
-            side_u = str(pos_side).upper()
-            never_worsen = bool(getattr(self.p, "tp_replace_never_worsen", True))
-            if never_worsen:
-                if side_u == "LONG" and cur_trg <= (desired + tol_abs):
-                    return False
-                if side_u != "LONG" and cur_trg >= (desired - tol_abs):
-                    return False
-            return True
-        except Exception:
-            return True
-
-    def _startup_orchestration_should_defer(self, *, kind: str, symbol: str = "", pos_uid: str = "") -> bool:
-        """Defer non-critical startup actions for the first heavy cycles.
-
-        v14.2.3 goal: keep the first cycle focused on critical protection (ADD / HEDGE_SL),
-        while postponing non-critical trailing placement to the next cycle(s).
-
-        v14.4 protection-first override: never defer protection/surveillance actions.
-        """
-        try:
-            if not self._is_live:
-                return False
-            if bool(getattr(self.p, "protection_first_enabled", True)):
-                return False
-            if not bool(getattr(self.p, "startup_orchestration_enabled", True)):
-                return False
-            cycle_n = int(getattr(self, "_cycle_n", 0) or 0)
-            orch_cycles = max(0, int(getattr(self.p, "startup_orchestration_cycles", 2) or 2))
-            if cycle_n <= 0 or cycle_n > orch_cycles:
-                return False
-
-            kind_u = str(kind or "").strip().lower()
-            defer_cycles = 0
-            if kind_u in {"main_tp_trailing_pre_last_add", "main_tp_trailing_after_last_add"}:
-                defer_cycles = max(0, int(getattr(self.p, "startup_defer_tp_trailing_cycles", 1) or 1))
-            elif kind_u in {"hedge_trailing", "hedge_trl"}:
-                defer_cycles = max(0, int(getattr(self.p, "startup_defer_hedge_trailing_cycles", 1) or 1))
-            else:
-                return False
-
-            if cycle_n <= defer_cycles:
-                try:
-                    if not hasattr(self, "_startup_orch_logged") or not isinstance(self._startup_orch_logged, set):
-                        self._startup_orch_logged = set()
-                    key = f"{cycle_n}|{kind_u}|{str(symbol).upper()}|{str(pos_uid)}"
-                    if key not in self._startup_orch_logged:
-                        self._startup_orch_logged.add(key)
-                        self._dlog(
-                            "startup-orch defer kind=%s cycle=%s/%s symbol=%s pos_uid=%s",
-                            kind_u,
-                            cycle_n,
-                            orch_cycles,
-                            str(symbol).upper(),
-                            str(pos_uid),
-                        )
-                except Exception:
-                    pass
-                return True
-            return False
-        except Exception:
-            return False
 
     def _symbols_map(self, cache_ttl_sec: float = 600.0) -> Dict[int, str]:
         """Return {symbol_id: symbol} cache (DB read is cheap but keep it tidy)."""
@@ -507,73 +403,10 @@ class TradeLiquidation(
         log.info("[TL] loaded symbol_filters rows=%s exchange_id=%s", len(out), ex_id)
         return out
 
-    def _rebuild_rest_snapshot_indexes(self, *keys: str) -> None:
-        if not bool(getattr(self.p, "snapshot_indexing_enabled", True)):
-            return
-        targets = {str(k or '').strip() for k in (keys or ()) if str(k or '').strip()}
-        if not targets:
-            return
-        with self._rest_snapshot_lock:
-            idx = self._rest_snapshot_index if isinstance(getattr(self, "_rest_snapshot_index", None), dict) else {}
-            self._rest_snapshot_index = idx
-            for key in targets:
-                rows = self._rest_snapshot.get(key)
-                if key in {"open_orders_all", "open_algo_orders_all"} and isinstance(rows, list):
-                    by_symbol: Dict[str, List[Dict[str, Any]]] = {}
-                    by_client: Dict[Tuple[str, str], Dict[str, Any]] = {}
-                    by_algo: Dict[Tuple[str, str], Dict[str, Any]] = {}
-                    for row in rows:
-                        if not isinstance(row, dict):
-                            continue
-                        sym = str(row.get("symbol") or "").upper().strip()
-                        if sym:
-                            by_symbol.setdefault(sym, []).append(row)
-                        cid = str(row.get("clientAlgoId") or row.get("clientOrderId") or "").strip()
-                        if sym and cid:
-                            by_client[(sym, cid)] = row
-                        aid = str(row.get("algoId") or "").strip()
-                        if sym and aid:
-                            by_algo[(sym, aid)] = row
-                    idx[f"{key}:by_symbol"] = by_symbol
-                    idx[f"{key}:by_client"] = by_client
-                    idx[f"{key}:by_algo"] = by_algo
-                elif key == "position_risk" and isinstance(rows, list):
-                    by_symbol_side: Dict[Tuple[str, str], Dict[str, Any]] = {}
-                    by_symbol: Dict[str, List[Dict[str, Any]]] = {}
-                    symbol_has_pos: Dict[str, bool] = {}
-                    for row in rows:
-                        if not isinstance(row, dict):
-                            continue
-                        sym = str(row.get("symbol") or "").upper().strip()
-                        if not sym:
-                            continue
-                        by_symbol.setdefault(sym, []).append(row)
-                        pos_side = str(row.get("positionSide") or "").upper().strip()
-                        amt = _safe_float(row.get("positionAmt"), 0.0)
-                        side = pos_side if pos_side in {"LONG", "SHORT"} else ("LONG" if amt > 0 else "SHORT")
-                        by_symbol_side[(sym, side)] = row
-                        if abs(amt) > 1e-12:
-                            symbol_has_pos[sym] = True
-                        else:
-                            symbol_has_pos.setdefault(sym, False)
-                    idx["position_risk:by_symbol_side"] = by_symbol_side
-                    idx["position_risk:by_symbol"] = by_symbol
-                    idx["position_risk:symbol_has_pos"] = symbol_has_pos
-
     def _rest_snapshot_set(self, **kv: Any) -> None:
-        rebuild_keys: List[str] = []
         with self._rest_snapshot_lock:
             self._rest_snapshot.update(kv)
             self._rest_snapshot_ts = _utc_now()
-            for key in kv.keys():
-                if key in {"open_orders_all", "open_algo_orders_all", "position_risk"}:
-                    rebuild_keys.append(key)
-
-        if rebuild_keys:
-            try:
-                self._rebuild_rest_snapshot_indexes(*rebuild_keys)
-            except Exception:
-                pass
 
         # Keep last /positionRisk payload for DB sync (markPrice source of truth)
         if "position_risk" in kv:
@@ -583,130 +416,6 @@ class TradeLiquidation(
     def _rest_snapshot_get(self, key: str) -> Any:
         with self._rest_snapshot_lock:
             return self._rest_snapshot.get(key)
-
-    def _rest_snapshot_index_get(self, key: str) -> Any:
-        with self._rest_snapshot_lock:
-            idx = self._rest_snapshot_index if isinstance(getattr(self, "_rest_snapshot_index", None), dict) else {}
-            return idx.get(key)
-
-    def _snapshot_orders_for_symbol(self, symbol: str, *, algo: bool = False) -> List[Dict[str, Any]]:
-        if not bool(getattr(self.p, "snapshot_indexing_enabled", True)):
-            return []
-        sym = str(symbol or "").upper().strip()
-        if not sym:
-            return []
-        key = "open_algo_orders_all:by_symbol" if algo else "open_orders_all:by_symbol"
-        mp = self._rest_snapshot_index_get(key)
-        if isinstance(mp, dict):
-            rows = mp.get(sym)
-            if isinstance(rows, list):
-                return list(rows)
-        return []
-
-    def _snapshot_find_open_order(self, symbol: str, client_id: str, *, algo: bool = False, algo_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
-        if not bool(getattr(self.p, "snapshot_indexing_enabled", True)):
-            return None
-        sym = str(symbol or "").upper().strip()
-        cid = str(client_id or "").strip()
-        aid = str(algo_id or "").strip()
-        if not sym:
-            return None
-        by_client = self._rest_snapshot_index_get(("open_algo_orders_all" if algo else "open_orders_all") + ":by_client")
-        if isinstance(by_client, dict) and cid:
-            row = by_client.get((sym, cid))
-            if isinstance(row, dict):
-                return row
-        by_algo = self._rest_snapshot_index_get(("open_algo_orders_all" if algo else "open_orders_all") + ":by_algo")
-        if isinstance(by_algo, dict) and aid:
-            row = by_algo.get((sym, aid))
-            if isinstance(row, dict):
-                return row
-        return None
-
-    def _algo_orders_fingerprint(self, rows: Any) -> str:
-        try:
-            if not isinstance(rows, list):
-                return ""
-            slim = []
-            for r in rows:
-                if not isinstance(r, dict):
-                    continue
-                slim.append((
-                    str(r.get("clientAlgoId") or r.get("clientOrderId") or ""),
-                    str(r.get("symbol") or ""),
-                    str(r.get("positionSide") or ""),
-                    str(r.get("type") or ""),
-                    str(r.get("side") or ""),
-                    str(r.get("triggerPrice") or ""),
-                    str(r.get("quantity") or r.get("origQty") or ""),
-                ))
-            slim.sort()
-            return hashlib.sha1(json.dumps(slim, separators=(",", ":"), ensure_ascii=False).encode("utf-8", errors="ignore")).hexdigest()
-        except Exception:
-            return ""
-
-    def _persist_open_algo_orders_snapshot(self, ao: Any) -> None:
-        """Persist open algo orders to DB only when materially needed.
-
-        This reduces per-cycle DB churn without affecting trading decisions, because
-        the in-memory REST snapshot remains the source of truth for the current cycle.
-        """
-        if not isinstance(ao, list):
-            return
-        min_interval = max(0.0, float(getattr(self.p, "open_algo_sync_min_interval_sec", 20) or 20))
-        on_change_only = bool(getattr(self.p, "open_algo_sync_on_change_only", True))
-        now_ts = time.time()
-        fp = self._algo_orders_fingerprint(ao)
-        last_ts = float(getattr(self, "_open_algo_sync_last_ts", 0.0) or 0.0)
-        last_fp = str(getattr(self, "_open_algo_sync_last_fp", "") or "")
-        if on_change_only and fp and last_fp == fp and (now_ts - last_ts) < min_interval:
-            return
-        if (not on_change_only) and (now_ts - last_ts) < min_interval:
-            return
-
-        rows = []
-        active_cids: list[str] = []
-        for r in ao:
-            if not isinstance(r, dict):
-                continue
-            cid = str(r.get("clientAlgoId") or r.get("clientOrderId") or "").strip()
-            if not cid:
-                continue
-            if cid.startswith("TL_"):
-                active_cids.append(cid)
-            rows.append(
-                {
-                    "exchange_id": int(self.exchange_id),
-                    "account_id": int(self.account_id),
-                    "client_algo_id": cid,
-                    "algo_id": str(r.get("algoId") or r.get("algoOrderId") or r.get("orderId") or ""),
-                    "symbol": str(r.get("symbol") or "").upper(),
-                    "side": str(r.get("side") or ""),
-                    "position_side": str(r.get("positionSide") or ""),
-                    "type": str(r.get("type") or ""),
-                    "quantity": None if r.get("quantity") is None else float(r.get("quantity")),
-                    "trigger_price": None if r.get("triggerPrice") is None else float(r.get("triggerPrice")),
-                    "working_type": str(r.get("workingType") or ""),
-                    "status": "OPEN",
-                    "strategy_id": str(self.strategy_id),
-                    "pos_uid": None,
-                    "raw_json": r if isinstance(r, dict) else {"result": r},
-                }
-            )
-        try:
-            if rows:
-                self.store.upsert_algo_orders(rows)
-            self.store.sync_open_algo_orders_not_found(
-                exchange_id=int(self.exchange_id),
-                account_id=int(self.account_id),
-                active_client_algo_ids=active_cids,
-                prefix="TL_",
-                not_found_status="CANCELED",
-            )
-            self._open_algo_sync_last_ts = now_ts
-            self._open_algo_sync_last_fp = fp
-        except Exception:
-            pass
 
     def _get_position_amt_live(self, symbol: str, side: str) -> float:
         """Return absolute position amount for (symbol, side) on the exchange.
@@ -901,7 +610,50 @@ class TradeLiquidation(
                         open_algo_orders_all=ao,
                     )
                     # Persist open algo orders for accounting/monitoring (best-effort)
-                    self._persist_open_algo_orders_snapshot(ao)
+                    try:
+                        rows = []
+                        active_cids: list[str] = []
+                        for r in ao if isinstance(ao, list) else []:
+                            cid = str(r.get("clientAlgoId") or r.get("clientOrderId") or "").strip()
+                            if not cid:
+                                continue
+                            if cid.startswith("TL_"):
+                                active_cids.append(cid)
+                            rows.append(
+                                {
+                                    "exchange_id": int(self.exchange_id),
+                                    "account_id": int(self.account_id),
+                                    "client_algo_id": cid,
+                                    "algo_id": str(r.get("algoId") or r.get("algoOrderId") or r.get("orderId") or ""),
+                                    "symbol": str(r.get("symbol") or "").upper(),
+                                    "side": str(r.get("side") or ""),
+                                    "position_side": str(r.get("positionSide") or ""),
+                                    "type": str(r.get("type") or ""),
+                                    "quantity": None if r.get("quantity") is None else float(r.get("quantity")),
+                                    "trigger_price": None if r.get("triggerPrice") is None else float(r.get("triggerPrice")),
+                                    "working_type": str(r.get("workingType") or ""),
+                                    "status": "OPEN",
+                                    "strategy_id": str(self.strategy_id),
+                                    "pos_uid": None,
+                                    "raw_json": r if isinstance(r, dict) else {"result": r},
+                                }
+                            )
+                        if rows:
+                            self.store.upsert_algo_orders(rows)
+
+                        # Mark previously OPEN algo orders as NOT_FOUND if they disappeared from exchange.
+                        try:
+                            self.store.sync_open_algo_orders_not_found(
+                                exchange_id=int(self.exchange_id),
+                                account_id=int(self.account_id),
+                                active_client_algo_ids=active_cids,
+                                prefix="TL_",
+                                not_found_status="CANCELED",
+                            )
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
 
                 except Exception:
                     log.debug("[trade_liquidation] openOrders sync fetch failed", exc_info=True)
@@ -933,185 +685,48 @@ class TradeLiquidation(
         if out:
             # Persist open algo orders + reconcile missing ones (best-effort)
             try:
-                self._persist_open_algo_orders_snapshot(out.get("open_algo_orders_all"))
+                ao = out.get("open_algo_orders_all")
+                rows = []
+                active_cids: list[str] = []
+                for r in ao if isinstance(ao, list) else []:
+                    cid = str(r.get("clientAlgoId") or r.get("clientOrderId") or "").strip()
+                    if not cid:
+                        continue
+                    if cid.startswith("TL_"):
+                        active_cids.append(cid)
+                    rows.append(
+                        {
+                            "exchange_id": int(self.exchange_id),
+                            "account_id": int(self.account_id),
+                            "client_algo_id": cid,
+                            "algo_id": str(r.get("algoId") or r.get("algoOrderId") or r.get("orderId") or ""),
+                            "symbol": str(r.get("symbol") or "").upper(),
+                            "side": str(r.get("side") or ""),
+                            "position_side": str(r.get("positionSide") or ""),
+                            "type": str(r.get("type") or ""),
+                            "quantity": None if r.get("quantity") is None else float(r.get("quantity")),
+                            "trigger_price": None if r.get("triggerPrice") is None else float(r.get("triggerPrice")),
+                            "working_type": str(r.get("workingType") or ""),
+                            "status": "OPEN",
+                            "strategy_id": str(self.strategy_id),
+                            "pos_uid": None,
+                            "raw_json": r if isinstance(r, dict) else {"result": r},
+                        }
+                    )
+                if rows:
+                    self.store.upsert_algo_orders(rows)
+
+                # Mark missing
+                self.store.sync_open_algo_orders_not_found(
+                    exchange_id=int(self.exchange_id),
+                    account_id=int(self.account_id),
+                    active_client_algo_ids=active_cids,
+                    prefix="TL_",
+                    not_found_status="CANCELED",
+                )
             except Exception:
                 pass
             self._rest_snapshot_set(**out)
-
-    def _detect_position_protection(self, pos: Dict[str, Any]) -> Dict[str, Any]:
-        """Best-effort live protection audit for a single open position."""
-        sym = str(pos.get("symbol") or "").strip().upper()
-        side = str(pos.get("side") or "").strip().upper()
-        pos_uid = str(pos.get("pos_uid") or "")
-        out = {
-            "symbol": sym,
-            "side": side,
-            "pos_uid": pos_uid,
-            "has_sl": False,
-            "has_tp": False,
-            "has_trl": False,
-            "protected": False,
-            "followup": False,
-        }
-        try:
-            if not self._is_live or not sym or side not in {"LONG", "SHORT"}:
-                return out
-            hedge_mode = bool(getattr(self, "_hedge_mode", True))
-            close_side = "SELL" if side == "LONG" else "BUY"
-            position_side = side if hedge_mode else "BOTH"
-            prefix = str(getattr(self.p, "client_order_id_prefix", "TL") or "TL")
-            tok = _coid_token(pos_uid, n=20)
-            cid_sl = f"{prefix}_{tok}_SL"
-            cid_tp = f"{prefix}_{tok}_TP"
-            cid_trl = f"{prefix}_{tok}_TRL"
-
-            open_by_symbol = self._rest_snapshot_index_get("open_algo_orders_all:by_client_set") or {}
-            existing = open_by_symbol.get(sym, set()) if isinstance(open_by_symbol, dict) else set()
-            rows_idx = self._rest_snapshot_index_get("open_algo_orders_all:by_symbol") or {}
-            rows = rows_idx.get(sym, []) if isinstance(rows_idx, dict) else []
-
-            def _to_bool(x: Any) -> bool:
-                if isinstance(x, bool):
-                    return bool(x)
-                if x is None:
-                    return False
-                return str(x).strip().lower() in {"1", "true", "yes", "y", "on"}
-
-            has_any_sl = False
-            has_any_tp = False
-            has_any_trl = False
-            for o in rows:
-                try:
-                    otype = str(o.get("orderType") or o.get("type") or "").upper()
-                    oside = str(o.get("side") or "").upper()
-                    ops = str(o.get("positionSide") or "").upper()
-                    if hedge_mode and ops and ops not in {position_side, "BOTH"}:
-                        continue
-                    if oside and oside != close_side:
-                        continue
-                    close_pos = _to_bool(o.get("closePosition"))
-                    if otype in {"TAKE_PROFIT_MARKET", "TAKE_PROFIT"} and close_pos:
-                        has_any_tp = True
-                    if otype in {"STOP_MARKET", "STOP"} and close_pos:
-                        has_any_sl = True
-                    if otype == "TRAILING_STOP_MARKET":
-                        has_any_trl = True
-                except Exception:
-                    continue
-
-            has_sl = (cid_sl in existing) or bool(has_any_sl)
-            has_tp = (cid_tp in existing) or bool(has_any_tp)
-            has_trl = (cid_trl in existing) or bool(has_any_trl)
-            if not has_sl:
-                has_sl = self._find_known_algo_order_by_client_id(sym, cid_sl) is not None
-            if not has_tp:
-                tp_known = self._find_known_algo_order_by_client_id(sym, cid_tp)
-                if tp_known is None:
-                    tp_known = self._find_semantic_open_algo(
-                        sym,
-                        client_suffix="_TP",
-                        position_side=position_side if hedge_mode else None,
-                        order_type="TAKE_PROFIT_MARKET",
-                        side=close_side,
-                    )
-                has_tp = tp_known is not None
-            if not has_trl:
-                trl_known = self._find_known_algo_order_by_client_id(sym, cid_trl)
-                if trl_known is None:
-                    trl_known = self._find_semantic_open_algo(
-                        sym,
-                        client_suffix="_TRL",
-                        position_side=position_side if hedge_mode else None,
-                        order_type="TRAILING_STOP_MARKET",
-                        side=close_side,
-                    )
-                has_trl = trl_known is not None
-
-            out.update({
-                "has_sl": bool(has_sl),
-                "has_tp": bool(has_tp),
-                "has_trl": bool(has_trl),
-                "protected": bool(has_sl or has_tp or has_trl),
-                "followup": bool(has_tp or has_trl),
-            })
-            return out
-        except Exception:
-            return out
-
-    def _protection_post_cycle_audit(self) -> Dict[str, Any]:
-        """Protection-first audit: verify that live positions are not left without protection."""
-        stats = {
-            "enabled": False,
-            "open_positions": 0,
-            "missing_before": 0,
-            "followup_missing_before": 0,
-            "recovered": 0,
-            "missing_after": 0,
-            "followup_missing_after": 0,
-        }
-        try:
-            if not self._is_live:
-                return stats
-            if not bool(getattr(self.p, "protection_post_cycle_audit_enabled", True)):
-                return stats
-            stats["enabled"] = True
-            if bool(getattr(self.p, "protection_force_snapshot_refresh_before_audit", True)):
-                self._maybe_refresh_rest_snapshot()
-            open_positions = list(self._get_open_positions() or [])
-            stats["open_positions"] = len(open_positions)
-            require_followup = bool(getattr(self.p, "protection_require_followup_enabled", True))
-            missing = []
-            followup_missing = []
-            for pos in open_positions:
-                det = self._detect_position_protection(pos)
-                if not bool(det.get("protected")):
-                    missing.append(det)
-                src_kind = str(pos.get("source") or "live").strip().lower()
-                if require_followup and src_kind != "live_hedge" and not bool(det.get("followup")):
-                    followup_missing.append(det)
-
-            stats["missing_before"] = len(missing)
-            stats["followup_missing_before"] = len(followup_missing)
-            if missing or followup_missing:
-                log.warning(
-                    "[trade_liquidation][PROTECTION_MISSING] open=%s missing=%s followup_missing=%s",
-                    len(open_positions), len(missing), len(followup_missing)
-                )
-                if bool(getattr(self.p, "auto_recovery_enabled", False)):
-                    recovered = int(self._auto_recovery_brackets() or 0)
-                    stats["recovered"] = recovered
-                    if bool(getattr(self.p, "protection_force_snapshot_refresh_before_audit", True)):
-                        self._maybe_refresh_rest_snapshot()
-                    missing_after = []
-                    followup_after = []
-                    for pos in list(self._get_open_positions() or []):
-                        det = self._detect_position_protection(pos)
-                        if not bool(det.get("protected")):
-                            missing_after.append(det)
-                        src_kind = str(pos.get("source") or "live").strip().lower()
-                        if require_followup and src_kind != "live_hedge" and not bool(det.get("followup")):
-                            followup_after.append(det)
-                    stats["missing_after"] = len(missing_after)
-                    stats["followup_missing_after"] = len(followup_after)
-                    if missing_after or followup_after:
-                        log.error(
-                            "[trade_liquidation][PROTECTION_RESTORE_FAILED] missing=%s followup_missing=%s recovered=%s",
-                            len(missing_after), len(followup_after), recovered
-                        )
-                    else:
-                        log.info(
-                            "[trade_liquidation][PROTECTION_RESTORED] recovered=%s open=%s",
-                            recovered, len(open_positions)
-                        )
-            else:
-                every_n = max(1, int(getattr(self.p, "protection_log_ok_every_n_cycles", 10) or 10))
-                cycle_n = int(getattr(self, "_cycle_n", 0) or 0)
-                if cycle_n <= 3 or cycle_n % every_n == 0:
-                    log.info("[trade_liquidation][PROTECTION_OK] open=%s", len(open_positions))
-            return stats
-        except Exception:
-            log.exception("[trade_liquidation][PROTECTION_AUDIT] unexpected error")
-            return stats
 
     def run_once(self) -> Dict[str, Any]:
         started = _utc_now()
@@ -1121,10 +736,6 @@ class TradeLiquidation(
             self._cycle_n = int(getattr(self, "_cycle_n", 0) or 0) + 1
         except Exception:
             self._cycle_n = 1
-        try:
-            self._startup_orch_logged = set()
-        except Exception:
-            pass
 
         # Step 4: prefetch REST state (parallel where possible)
         # This populates in-memory snapshot for this cycle.
@@ -1258,7 +869,10 @@ class TradeLiquidation(
 
         close_stats = self._process_open_positions()
         open_stats = self._process_new_signals()
-        protection_audit = self._protection_post_cycle_audit() if bool(getattr(self.p, "protection_first_enabled", True)) else {}
+        try:
+            log.info("[trade_liquidation][ENTRY_STATUS] open_symbols=%s open_legs=%s capacity=%s considered=%s opened=%s skipped=%s blocked_reason=%s", str(open_stats.get("open_symbols")), str(open_stats.get("open_legs")), str(open_stats.get("capacity")), str(open_stats.get("considered")), str(open_stats.get("opened")), str(open_stats.get("skipped")), str(open_stats.get("blocked_reason")))
+        except Exception:
+            pass
 
         elapsed = (_utc_now() - started).total_seconds()
         out = {
@@ -1273,7 +887,6 @@ class TradeLiquidation(
             "reconcile": reconcile_stats,
             "reconcile_adds": reconcile_adds_stats,
             "elapsed_s": elapsed,
-            "protection_audit": protection_audit,
         }
         self._dlog("cycle end: closed=%s opened=%s elapsed=%.2fs", str(close_stats), str(open_stats), float(elapsed))
         return out
@@ -2272,18 +1885,6 @@ class TradeLiquidation(
             # Hard guarantee: TP must be on the correct side of entry.
             # (Some safety/rounding logic can otherwise push it across.)
             tp_price = _ensure_tp_trail_side(tp_price, entry, tick, side, kind="tp")
-            # Compare/place TP using the same safe trigger price that survives exchange validation.
-            tp_side = "SELL" if side == "LONG" else "BUY"
-            tp_buffer_pct = float(getattr(self.p, "tp_trigger_buffer_pct", 0.25) or 0.25)
-            tp_mark = _safe_float(ex_mark_map.get((sym, side)), 0.0)
-            desired_tp_trigger = _tl_safe_trigger_price(
-                symbol=sym,
-                close_side=tp_side,
-                desired=float(tp_price),
-                mark=tp_mark,
-                tick=float(tick or 0.0),
-                buffer_pct=tp_buffer_pct,
-            )
             # If our TP exists but trigger price no longer matches (e.g. after averaging fill),
             # cancel it so we can recreate at the new correct level.
             try:
@@ -2299,10 +1900,10 @@ class TradeLiquidation(
                         tp_trg = 0.0
                     tol = max(
                         float(tick or 0.0) * float(PRICE_EPS_TICKS),
-                        abs(float(desired_tp_trigger)) * (float(AVG_EPS_PCT) / 100.0),
+                        abs(float(tp_price)) * (float(AVG_EPS_PCT) / 100.0),
                         1e-12,
                     )
-                    if tp_trg > 0.0 and abs(tp_trg - float(desired_tp_trigger)) > tol:
+                    if tp_trg > 0.0 and abs(tp_trg - float(tp_price)) > tol:
                         # cancel stale TP (throttle to avoid churn)
                         _last = float(self._bracket_replace_last_ts.get((pos_uid, "tp"), 0.0) or 0.0)
                         if (now_ts - _last) >= float(REPLACE_COOLDOWN_SEC):
@@ -2318,6 +1919,7 @@ class TradeLiquidation(
             # Ensure TP exists (and matches current avg/entry-based level)
             if not has_tp:
                 try:
+                    tp_side = "SELL" if side == "LONG" else "BUY"
                     resp_tp = self._binance.new_algo_order(
                         symbol=sym,
                         side=tp_side,
@@ -2327,7 +1929,7 @@ class TradeLiquidation(
                         positionSide=side,
                         algoType="CONDITIONAL",
                         clientAlgoId=cid_tp,
-                        triggerPrice=str(desired_tp_trigger),
+                        triggerPrice=str(tp_price),
                     )
                     try:
                         self._upsert_algo_order_shadow(resp_tp, pos_uid=pos_uid, strategy_id=self.STRATEGY_ID)
@@ -2341,7 +1943,7 @@ class TradeLiquidation(
                             order_type="TAKE_PROFIT_MARKET",
                             side=tp_side,
                             quantity=float(qty_use),
-                            trigger_price=float(desired_tp_trigger),
+                            trigger_price=float(tp_price),
                             close_position=True,
                             pos_uid=pos_uid,
                         )
@@ -2372,6 +1974,17 @@ class TradeLiquidation(
                         allow_place_sl = False
                 if allow_place_sl:
                     try:
+                        if avg_enabled and defer_sl and cfg_max_adds > 0:
+                            rm = p.get("raw_meta") or {}
+                            st = (rm.get("avg_state") or {}) if isinstance(rm, dict) else {}
+                            last_add_fill = _safe_float(st.get("last_add_fill_price"), 0.0)
+                            dist_pct = float(getattr(self.p, "sl_after_last_add_distance_pct", 0.0) or 0.0)
+                            if last_add_fill > 0 and dist_pct > 0:
+                                if side == "LONG":
+                                    sl_price = last_add_fill * (1.0 - _pct_to_mult(dist_pct))
+                                else:
+                                    sl_price = last_add_fill * (1.0 + _pct_to_mult(dist_pct))
+                                log.info("[trade_liquidation][RECOVER] using deferred main SL from last add %s %s last_add=%.8f dist_pct=%.4f sl=%.8f", sym, side, float(last_add_fill), float(dist_pct), float(sl_price))
                         sl_mode = str(getattr(self.p, "sl_order_mode", "stop_market") or "stop_market").strip().lower()
                         if sl_mode in {"trailing_stop_market", "trailing", "tsm"} and bool(getattr(self.p, "trailing_enabled", True)):
                             callback_rate = float(getattr(self.p, "trailing_trail_pct", 0.6) or 0.6)
@@ -2679,9 +2292,7 @@ class TradeLiquidation(
                     if trl_ao is not None:
                         # Desired activation price from current exchange entry price
                         mark = float(ex_mark_map.get(sym) or 0.0)
-                        profile = self._get_effective_main_trailing_profile(p=p, main_side=side, entry_px=float(entry), mark=float(mark or entry))
-                        activation_pct = float(profile.get("activation_pct") or 0.0)
-                        desired_cb = float(profile.get("callback_pct") or 0.0)
+                        activation_pct = float(getattr(self.p, "trailing_activation_pct", 0.0) or 0.0)
                         activation_buf_pct = float(getattr(self.p, "trailing_activation_buffer_pct", 0.0) or 0.0)
                         activation = max(0.0, activation_pct - activation_buf_pct)
                         ref_price = float(entry)
@@ -2700,19 +2311,13 @@ class TradeLiquidation(
                         except Exception:
                             cur_act_f = None
 
-                        cur_cb = trl_ao.get("callbackRate") or trl_ao.get("priceRate") or trl_ao.get("callback")
-                        try:
-                            cur_cb_f = float(cur_cb) if cur_cb is not None else None
-                        except Exception:
-                            cur_cb_f = None
-                        if self._should_replace_main_trailing(
-                            main_side=side,
-                            current_activation=cur_act_f,
-                            current_callback=cur_cb_f,
-                            desired_activation=float(desired_act),
-                            desired_callback=float(desired_cb),
-                            tick=float(tick or 0.0),
-                        ):
+                        # Tolerance: 2 ticks
+                        tol = max(
+                    float(tick or 0.0) * float(PRICE_EPS_TICKS),
+                    abs(float(tr_activate)) * (float(AVG_EPS_PCT) / 100.0),
+                    1e-12,
+                )
+                        if cur_act_f is None or abs(cur_act_f - float(desired_act)) > tol:
                             self.log.info(
                                 f"[trade_liquidation][auto-recovery] stale TRL {sym} {pos_side}: "
                                 f"cur_activate={cur_act_f} desired_activate={desired_act} -> cancel+recreate"
@@ -2789,8 +2394,7 @@ class TradeLiquidation(
                         if tick <= 0:
                             # fallback: reuse ticks from sym meta if present
                             tick = float((raw_meta or {}).get("tick_size") or 0) or 0.0
-                        profile = self._get_effective_main_trailing_profile(p=p, main_side=side, entry_px=float(ref_price), mark=float(mark or ref_price))
-                        act_pct = float(profile.get("activation_pct") or (getattr(self.p, "trailing_activation_pct", 0.5) or 0.5))
+                        act_pct = float(getattr(self.p, "trailing_activation_pct", 0.5) or 0.5)
                         act_des = ref_price * (1 + act_pct / 100.0) if side == "LONG" else ref_price * (1 - act_pct / 100.0)
                         act = _round_to_tick(act_des, tick_size=tick, mode="nearest") if tick > 0 else act_des
                         buf = float(getattr(self.p, "trailing_activation_buffer_pct", 0.15) or 0.15)
@@ -2798,7 +2402,11 @@ class TradeLiquidation(
                             act = self._safe_price_above_mark(act, mark, tick, buf)
                         else:
                             act = self._safe_price_below_mark(act, mark, tick, buf)
-                        cb = float(profile.get("callback_pct") or getattr(self.p, "trailing_callback_rate", None) or getattr(self.p, "trailing_trail_pct", None) or 0.5)
+                        cb = float(
+                            getattr(self.p, "trailing_callback_rate", None)
+                            or getattr(self.p, "trailing_trail_pct", None)
+                            or 0.5
+                        )
                         def _place_trl(i_try: int):
                             p_trl = dict(
                                 symbol=sym,

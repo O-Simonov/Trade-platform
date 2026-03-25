@@ -35,11 +35,11 @@ traders:
       allowed_timeframes: ["5m", "15m", "1h"]
 
       # Максимальный возраст сигнала в минутах от signal_ts
-      max_signal_age_minutes: 120
+      max_signal_age_minutes: 30
 
       # Кулдаун по символу:
       # не открывать новую сделку по тому же символу, если недавно уже была сделка/попытка
-      per_symbol_cooldown_minutes: 120
+      per_symbol_cooldown_minutes: 60
 
       # Максимум попыток открытия сделки по одному сигналу
       max_attempts_per_signal: 3
@@ -60,7 +60,7 @@ traders:
       expire_old_signals: true
 
       # Сигнал NEW экспирируется, если старше этого возраста
-      expire_max_age_minutes: 120
+      expire_max_age_minutes: 60
 
       # Максимум сигналов за один проход блока экспирации
       expire_batch_limit: 5000
@@ -119,6 +119,7 @@ traders:
       hedge_trigger_buffer_pct: 0.3
       hedge_cooldown_sec: 180                       # Кулдаун между действиями по hedge
       hedge_reopen_enabled: true                    # Повторно открывать hedge после его закрытия
+      hedge_open_only_after_max_adds: true         # Первый hedge открывать только после выполнения всех доборов main
 
       hedge_reopen_price_filter_enabled: true       # Включить повторный перезаход по цене относительно прошлого выхода hedge
       hedge_reopen_price_move_pct: 0.3              # Для main LONG / short hedge: цена должна стать ниже anchor на 0.3%; для main SHORT / long hedge: выше на 0.3%
@@ -137,7 +138,7 @@ traders:
       hedge_unwind_min_qty_ratio: 0.15            # Не делать частичный unwind, если остаток hedge станет меньше 15% от исходного
 
       # --- Adaptive hedge AI (мягкое увеличение hedge только при усилении движения против main)
-      hedge_adaptive_enabled: true               # Включить адаптивное усиление hedge
+      hedge_adaptive_enabled: true                # Включить адаптивное усиление hedge
       hedge_adaptive_trigger_pct: 0.8            # После какого adverse move (%) начать усиливать hedge
       hedge_adaptive_step_pct: 0.8               # Шаг adverse move (%) для дополнительного усиления
       hedge_adaptive_boost_per_step: 0.08        # Дополнительный koff за каждый шаг adverse move
@@ -198,8 +199,9 @@ traders:
       # Лимиты по позициям
       # ======================================================
 
-      max_open_positions: 8                        # Максимум одновременно открытых позиций
-      max_position_notional_pct_wallet: 12.0       # Ограничение notional одной позиции как % от кошелька
+      max_open_positions: 12                       # Максимум одновременно открытых позиций
+
+      max_position_notional_pct_wallet: 15.0       # Ограничение notional одной позиции как % от кошелька
       risk_wallet_pct: 1.5                         # Риск на сделку от кошелька
 
       live_entry_reduce_on_max_position: true      # Если позиция не проходит по лимитам → уменьшать размер и пробовать снова
@@ -227,32 +229,6 @@ traders:
       main_trailing_after_tp2_cb_pct: 0.40        # Callback trailing после TP2
       main_exit_small_remainder_enabled: true     # Быстрее закрывать слишком маленький остаток main
       main_exit_small_remainder_qty_ratio: 0.20   # Остаток <20% исходного размера считаем маленьким
-
-      # --- v14.2: увеличение прибыли без роста базового риска
-      adaptive_tp_trailing_enabled: true          # Адаптивно ужимать callback trailing по мере роста прибыли
-      adaptive_tp_trailing_level1_profit_pct: 1.2 # При прибыли от 1.2% использовать уровень 1
-      adaptive_tp_trailing_level1_cb_pct: 0.55    # Callback trailing на уровне 1
-      adaptive_tp_trailing_level2_profit_pct: 2.4 # При прибыли от 2.4% использовать уровень 2
-      adaptive_tp_trailing_level2_cb_pct: 0.45    # Callback trailing на уровне 2
-      adaptive_tp_trailing_level3_profit_pct: 4.0 # При прибыли от 4.0% использовать уровень 3
-      adaptive_tp_trailing_level3_cb_pct: 0.35    # Callback trailing на уровне 3
-      main_trend_bonus_enabled: true              # После подтвержденного движения чуть дольше держать сильный тренд
-      main_trend_bonus_activate_profit_pct: 1.4   # С какого профита включать trend bonus
-      main_trend_bonus_profit_step_pct: 1.0       # Каждый дополнительный 1% прибыли усиливает удержание
-      main_trend_bonus_activation_shift_step_pct: 0.15 # На сколько сдвигать activation trailing за шаг
-      main_trend_bonus_activation_shift_max_pct: 0.45  # Максимальный суммарный сдвиг activation trailing
-      main_trailing_never_worsen: true            # Не ухудшать уже более защитный trailing
-      main_trailing_min_activation_improve_ticks: 2 # Минимальное улучшение activation в тиках для replace
-      main_trailing_min_callback_improve_pct: 0.05 # Минимальное улучшение callback для replace
-
-      # --- v14.3: снижение шумных cancel/replace и лишних проходов
-      cycle_action_dedupe_enabled: true           # Не выполнять одну и ту же тяжёлую ветку дважды за один цикл
-      tp_replace_never_worsen: true               # Не заменять TP на менее защитный вариант
-      tp_replace_min_trigger_improve_ticks: 3     # Минимальное изменение TP trigger в тиках для replace
-      tp_replace_min_trigger_improve_pct: 0.10    # Минимальное изменение TP trigger в процентах для replace
-      hedge_trailing_reissue_min_qty_change_pct: 2.5   # Игнорировать шумные микросдвиги qty для HEDGE_TRL
-      hedge_stop_loss_reissue_min_qty_change_pct: 2.5  # Игнорировать шумные микросдвиги qty для HEDGE_SL
-
       recalc_sl_tp: true                           # Пересчитывать SL/TP после усреднений
 
       # ======================================================
@@ -402,24 +378,3 @@ traders:
       async_rest_enabled: true                     # Включить параллельные REST-запросы
       async_rest_workers: 6                        # Количество воркеров
       async_rest_timeout_sec: 8                    # Таймаут async REST-запроса в секундах
-
-      # ======================================================
-      # Performance / housekeeping (v14.2.1 / v14.2.3)
-      # ======================================================
-      open_algo_sync_min_interval_sec: 20          # Не писать snapshot algo-ордеров в БД каждый цикл без нужды
-      open_algo_sync_on_change_only: true          # Синхронизировать algo snapshot в БД только при изменении или по таймеру
-      snapshot_indexing_enabled: true              # Индексы по snapshot open/algo orders и positionRisk для ускорения первого тяжёлого цикла
-
-      # Startup orchestration (v14.2.3)
-      startup_orchestration_enabled: true         # В первые циклы сначала ставить только критичные защитные ордера
-      startup_orchestration_cycles: 2             # Окно оркестрации после старта
-      startup_defer_tp_trailing_cycles: 1         # Main TP trailing перенести с 1-го цикла на следующий
-      startup_defer_hedge_trailing_cycles: 1      # Hedge trailing перенести с 1-го цикла на следующий
-
-      # v14.4 protection-first
-      protection_first_enabled: true              # Приоритет: сначала защита каждой живой позиции, потом оптимизация/ускорение
-      protection_post_cycle_audit_enabled: true   # В конце каждого цикла проверять, что открытые позиции не остались без защиты
-      protection_force_snapshot_refresh_before_audit: true  # Перед аудитом обновлять REST snapshot по бирже
-      protection_require_followup_enabled: true   # Требовать не только защиту, но и сопровождение (TP или TRL)
-      protection_log_ok_every_n_cycles: 10        # Как часто логировать PROTECTION_OK в спокойном режиме
-      surviving_leg_promote_to_main_enabled: true # Если одна нога закрылась, выжившая live_hedge-нога становится новой main

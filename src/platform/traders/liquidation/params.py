@@ -259,7 +259,7 @@ class TradeLiquidationParams:
     exchange_id: int = 1
     account_id: Optional[int] = None
     account_name: str = "BASE"
-    screener_name: str = "scr_liquidation_binance"
+    screener_name: Union[str, Tuple[str, ...]] = "scr_liquidation_binance"
     allowed_timeframes: Tuple[str, ...] = ("15m", "1h")
     signal_status_new: str = "NEW"
 
@@ -288,6 +288,8 @@ class TradeLiquidationParams:
     stop_loss_pct: float = 2.0
     take_profit_pct: float = 5.0
     recalc_sl_tp: bool = True
+    defer_stop_loss_until_last_add: bool = False
+    sl_after_last_add_distance_pct: float = 0.0
 
     # --- orders (LIVE)
     entry_order_type: str = "market"  # market | limit (we use market for live entry now)
@@ -326,6 +328,7 @@ class TradeLiquidationParams:
     hedge_stop_loss_be_activation_pct_max: float = 100.0
 
     hedge_reopen_enabled: bool = True
+    hedge_open_only_after_max_adds: bool = True
     hedge_reopen_price_filter_enabled: bool = False
     hedge_reopen_price_move_pct: float = 0.0
     hedge_reopen_anchor_shift_trigger_pct: float = 0.0
@@ -360,31 +363,6 @@ class TradeLiquidationParams:
     main_trailing_after_tp2_cb_pct: float = 0.40
     main_exit_small_remainder_enabled: bool = True
     main_exit_small_remainder_qty_ratio: float = 0.20
-
-    # v14.2 safe profit optimizer for MAIN trailing
-    adaptive_tp_trailing_enabled: bool = True
-    adaptive_tp_trailing_level1_profit_pct: float = 1.2
-    adaptive_tp_trailing_level1_cb_pct: float = 0.55
-    adaptive_tp_trailing_level2_profit_pct: float = 2.4
-    adaptive_tp_trailing_level2_cb_pct: float = 0.45
-    adaptive_tp_trailing_level3_profit_pct: float = 4.0
-    adaptive_tp_trailing_level3_cb_pct: float = 0.35
-    main_trend_bonus_enabled: bool = True
-    main_trend_bonus_activate_profit_pct: float = 1.4
-    main_trend_bonus_profit_step_pct: float = 1.0
-    main_trend_bonus_activation_shift_step_pct: float = 0.15
-    main_trend_bonus_activation_shift_max_pct: float = 0.45
-    main_trailing_never_worsen: bool = True
-    main_trailing_min_activation_improve_ticks: int = 2
-    main_trailing_min_callback_improve_pct: float = 0.05
-
-    # v14.3 noise reduction / replace materiality
-    tp_replace_never_worsen: bool = True
-    tp_replace_min_trigger_improve_ticks: int = 3
-    tp_replace_min_trigger_improve_pct: float = 0.10
-    hedge_trailing_reissue_min_qty_change_pct: float = 2.5
-    hedge_stop_loss_reissue_min_qty_change_pct: float = 2.5
-    cycle_action_dedupe_enabled: bool = True
 
     hedge_unwind_full_exit_enabled: bool = True
     hedge_funding_guard_enabled: bool = True
@@ -471,26 +449,6 @@ class TradeLiquidationParams:
     backfill_batch_limit: int = 50
     backfill_fill_fees: bool = True
     backfill_overwrite: bool = False  # If True, refresh CLOSED even if already backfilled
-
-    # --- performance / housekeeping throttles (v14.2.1 / v14.2.3)
-    open_algo_sync_min_interval_sec: int = 20
-    open_algo_sync_on_change_only: bool = True
-    snapshot_indexing_enabled: bool = True
-
-    # --- startup orchestration (v14.2.3)
-    startup_orchestration_enabled: bool = True
-    startup_orchestration_cycles: int = 2
-    startup_defer_tp_trailing_cycles: int = 1
-    startup_defer_hedge_trailing_cycles: int = 1
-
-    # --- protection-first (v14.4)
-    protection_first_enabled: bool = True
-    protection_post_cycle_audit_enabled: bool = True
-    protection_force_snapshot_refresh_before_audit: bool = True
-    protection_require_followup_enabled: bool = True
-    protection_log_ok_every_n_cycles: int = 10
-    surviving_leg_promote_to_main_enabled: bool = True
-
     # --- store unknown config keys here (so getattr(self, key) works)
     extras: Dict[str, Any] = field(default_factory=dict, repr=False)
 
@@ -557,6 +515,17 @@ class TradeLiquidationParams:
             if tf:
                 params["allowed_timeframes"] = (tf,)
 
+        # screener_name list -> tuple
+        sn = params.get("screener_name", cls().screener_name)
+        if isinstance(sn, list):
+            params["screener_name"] = tuple(str(x) for x in sn if str(x).strip())
+        elif isinstance(sn, tuple):
+            params["screener_name"] = tuple(str(x) for x in sn if str(x).strip())
+        elif sn is None:
+            params["screener_name"] = cls().screener_name
+        else:
+            params["screener_name"] = str(sn)
+
         # allowed_timeframes list -> tuple
         atf = params.get("allowed_timeframes")
         if isinstance(atf, list):
@@ -585,6 +554,8 @@ class TradeLiquidationParams:
 
         params["use_exchange_balance"] = _as_bool(params.get("use_exchange_balance", cls().use_exchange_balance), cls().use_exchange_balance)
         params["recalc_sl_tp"] = _as_bool(params.get("recalc_sl_tp", cls().recalc_sl_tp), cls().recalc_sl_tp)
+        params["defer_stop_loss_until_last_add"] = _as_bool(params.get("defer_stop_loss_until_last_add", cls().defer_stop_loss_until_last_add), cls().defer_stop_loss_until_last_add)
+        params["sl_after_last_add_distance_pct"] = float(_as_float(params.get("sl_after_last_add_distance_pct", cls().sl_after_last_add_distance_pct), cls().sl_after_last_add_distance_pct) or cls().sl_after_last_add_distance_pct)
         params["trailing_enabled"] = _as_bool(params.get("trailing_enabled", cls().trailing_enabled), cls().trailing_enabled)
         params["averaging_enabled"] = _as_bool(params.get("averaging_enabled", cls().averaging_enabled), cls().averaging_enabled)
         params["hedge_enabled"] = _as_bool(params.get("hedge_enabled", cls().hedge_enabled), cls().hedge_enabled)
@@ -599,6 +570,7 @@ class TradeLiquidationParams:
         )
         params["hedge_level_tolerance_pct"] = float(_as_float(params.get("hedge_level_tolerance_pct", cls().hedge_level_tolerance_pct), cls().hedge_level_tolerance_pct) or cls().hedge_level_tolerance_pct)
         params["hedge_reopen_enabled"] = _as_bool(params.get("hedge_reopen_enabled", cls().hedge_reopen_enabled), cls().hedge_reopen_enabled)
+        params["hedge_open_only_after_max_adds"] = _as_bool(params.get("hedge_open_only_after_max_adds", cls().hedge_open_only_after_max_adds), cls().hedge_open_only_after_max_adds)
         params["hedge_reopen_price_filter_enabled"] = _as_bool(params.get("hedge_reopen_price_filter_enabled", cls().hedge_reopen_price_filter_enabled), cls().hedge_reopen_price_filter_enabled)
         params["hedge_reopen_price_move_pct"] = float(_as_float(params.get("hedge_reopen_price_move_pct", cls().hedge_reopen_price_move_pct), cls().hedge_reopen_price_move_pct) or cls().hedge_reopen_price_move_pct)
         params["hedge_reopen_anchor_shift_trigger_pct"] = float(_as_float(params.get("hedge_reopen_anchor_shift_trigger_pct", cls().hedge_reopen_anchor_shift_trigger_pct), cls().hedge_reopen_anchor_shift_trigger_pct) or cls().hedge_reopen_anchor_shift_trigger_pct)
@@ -624,27 +596,6 @@ class TradeLiquidationParams:
         params["main_trailing_after_tp2_cb_pct"] = float(_as_float(params.get("main_trailing_after_tp2_cb_pct", cls().main_trailing_after_tp2_cb_pct), cls().main_trailing_after_tp2_cb_pct) or cls().main_trailing_after_tp2_cb_pct)
         params["main_exit_small_remainder_enabled"] = _as_bool(params.get("main_exit_small_remainder_enabled", cls().main_exit_small_remainder_enabled), cls().main_exit_small_remainder_enabled)
         params["main_exit_small_remainder_qty_ratio"] = float(_as_float(params.get("main_exit_small_remainder_qty_ratio", cls().main_exit_small_remainder_qty_ratio), cls().main_exit_small_remainder_qty_ratio) or cls().main_exit_small_remainder_qty_ratio)
-        params["adaptive_tp_trailing_enabled"] = _as_bool(params.get("adaptive_tp_trailing_enabled", cls().adaptive_tp_trailing_enabled), cls().adaptive_tp_trailing_enabled)
-        params["adaptive_tp_trailing_level1_profit_pct"] = float(_as_float(params.get("adaptive_tp_trailing_level1_profit_pct", cls().adaptive_tp_trailing_level1_profit_pct), cls().adaptive_tp_trailing_level1_profit_pct) or cls().adaptive_tp_trailing_level1_profit_pct)
-        params["adaptive_tp_trailing_level1_cb_pct"] = float(_as_float(params.get("adaptive_tp_trailing_level1_cb_pct", cls().adaptive_tp_trailing_level1_cb_pct), cls().adaptive_tp_trailing_level1_cb_pct) or cls().adaptive_tp_trailing_level1_cb_pct)
-        params["adaptive_tp_trailing_level2_profit_pct"] = float(_as_float(params.get("adaptive_tp_trailing_level2_profit_pct", cls().adaptive_tp_trailing_level2_profit_pct), cls().adaptive_tp_trailing_level2_profit_pct) or cls().adaptive_tp_trailing_level2_profit_pct)
-        params["adaptive_tp_trailing_level2_cb_pct"] = float(_as_float(params.get("adaptive_tp_trailing_level2_cb_pct", cls().adaptive_tp_trailing_level2_cb_pct), cls().adaptive_tp_trailing_level2_cb_pct) or cls().adaptive_tp_trailing_level2_cb_pct)
-        params["adaptive_tp_trailing_level3_profit_pct"] = float(_as_float(params.get("adaptive_tp_trailing_level3_profit_pct", cls().adaptive_tp_trailing_level3_profit_pct), cls().adaptive_tp_trailing_level3_profit_pct) or cls().adaptive_tp_trailing_level3_profit_pct)
-        params["adaptive_tp_trailing_level3_cb_pct"] = float(_as_float(params.get("adaptive_tp_trailing_level3_cb_pct", cls().adaptive_tp_trailing_level3_cb_pct), cls().adaptive_tp_trailing_level3_cb_pct) or cls().adaptive_tp_trailing_level3_cb_pct)
-        params["main_trend_bonus_enabled"] = _as_bool(params.get("main_trend_bonus_enabled", cls().main_trend_bonus_enabled), cls().main_trend_bonus_enabled)
-        params["main_trend_bonus_activate_profit_pct"] = float(_as_float(params.get("main_trend_bonus_activate_profit_pct", cls().main_trend_bonus_activate_profit_pct), cls().main_trend_bonus_activate_profit_pct) or cls().main_trend_bonus_activate_profit_pct)
-        params["main_trend_bonus_profit_step_pct"] = float(_as_float(params.get("main_trend_bonus_profit_step_pct", cls().main_trend_bonus_profit_step_pct), cls().main_trend_bonus_profit_step_pct) or cls().main_trend_bonus_profit_step_pct)
-        params["main_trend_bonus_activation_shift_step_pct"] = float(_as_float(params.get("main_trend_bonus_activation_shift_step_pct", cls().main_trend_bonus_activation_shift_step_pct), cls().main_trend_bonus_activation_shift_step_pct) or cls().main_trend_bonus_activation_shift_step_pct)
-        params["main_trend_bonus_activation_shift_max_pct"] = float(_as_float(params.get("main_trend_bonus_activation_shift_max_pct", cls().main_trend_bonus_activation_shift_max_pct), cls().main_trend_bonus_activation_shift_max_pct) or cls().main_trend_bonus_activation_shift_max_pct)
-        params["main_trailing_never_worsen"] = _as_bool(params.get("main_trailing_never_worsen", cls().main_trailing_never_worsen), cls().main_trailing_never_worsen)
-        params["main_trailing_min_activation_improve_ticks"] = int(_as_int(params.get("main_trailing_min_activation_improve_ticks", cls().main_trailing_min_activation_improve_ticks), cls().main_trailing_min_activation_improve_ticks) or cls().main_trailing_min_activation_improve_ticks)
-        params["main_trailing_min_callback_improve_pct"] = float(_as_float(params.get("main_trailing_min_callback_improve_pct", cls().main_trailing_min_callback_improve_pct), cls().main_trailing_min_callback_improve_pct) or cls().main_trailing_min_callback_improve_pct)
-        params["tp_replace_never_worsen"] = _as_bool(params.get("tp_replace_never_worsen", cls().tp_replace_never_worsen), cls().tp_replace_never_worsen)
-        params["tp_replace_min_trigger_improve_ticks"] = int(_as_int(params.get("tp_replace_min_trigger_improve_ticks", cls().tp_replace_min_trigger_improve_ticks), cls().tp_replace_min_trigger_improve_ticks) or cls().tp_replace_min_trigger_improve_ticks)
-        params["tp_replace_min_trigger_improve_pct"] = float(_as_float(params.get("tp_replace_min_trigger_improve_pct", cls().tp_replace_min_trigger_improve_pct), cls().tp_replace_min_trigger_improve_pct) or cls().tp_replace_min_trigger_improve_pct)
-        params["hedge_trailing_reissue_min_qty_change_pct"] = float(_as_float(params.get("hedge_trailing_reissue_min_qty_change_pct", cls().hedge_trailing_reissue_min_qty_change_pct), cls().hedge_trailing_reissue_min_qty_change_pct) or cls().hedge_trailing_reissue_min_qty_change_pct)
-        params["hedge_stop_loss_reissue_min_qty_change_pct"] = float(_as_float(params.get("hedge_stop_loss_reissue_min_qty_change_pct", cls().hedge_stop_loss_reissue_min_qty_change_pct), cls().hedge_stop_loss_reissue_min_qty_change_pct) or cls().hedge_stop_loss_reissue_min_qty_change_pct)
-        params["cycle_action_dedupe_enabled"] = _as_bool(params.get("cycle_action_dedupe_enabled", cls().cycle_action_dedupe_enabled), cls().cycle_action_dedupe_enabled)
         params["hedge_unwind_full_exit_enabled"] = _as_bool(params.get("hedge_unwind_full_exit_enabled", cls().hedge_unwind_full_exit_enabled), cls().hedge_unwind_full_exit_enabled)
         params["hedge_funding_guard_enabled"] = _as_bool(params.get("hedge_funding_guard_enabled", cls().hedge_funding_guard_enabled), cls().hedge_funding_guard_enabled)
         params["hedge_funding_bad_limit_pct"] = float(_as_float(params.get("hedge_funding_bad_limit_pct", cls().hedge_funding_bad_limit_pct), cls().hedge_funding_bad_limit_pct) or cls().hedge_funding_bad_limit_pct)

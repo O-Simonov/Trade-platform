@@ -58,11 +58,19 @@ class TradeLiquidationEntryRulesMixin:
     def _process_new_signals(self) -> Dict[str, int]:
         open_positions = self._get_open_positions()
         open_by_symbol = {int(p["symbol_id"]) for p in open_positions}
-        open_count = len(open_positions)
+        open_symbol_count = len(open_by_symbol)
+        open_leg_count = len(open_positions)
 
-        capacity = max(0, int(self.p.max_open_positions) - open_count)
+        capacity = max(0, int(self.p.max_open_positions) - open_symbol_count)
         if capacity <= 0:
-            return {"capacity": 0, "considered": 0, "opened": 0, "skipped": 0}
+            log.info(
+                "[trade_liquidation][ENTRY_BLOCK] reason=max_open_symbols capacity=%d open_symbols=%d open_legs=%d max_open_positions=%d",
+                int(capacity),
+                int(open_symbol_count),
+                int(open_leg_count),
+                int(self.p.max_open_positions),
+            )
+            return {"capacity": 0, "considered": 0, "opened": 0, "skipped": 0, "open_symbols": open_symbol_count, "open_legs": open_leg_count, "blocked_reason": "max_open_symbols"}
 
         # Step 3: portfolio cap (LIVE): if usedMargin/wallet is too high, do NOT open new positions.
         if self._is_live:
@@ -75,7 +83,8 @@ class TradeLiquidationEntryRulesMixin:
                     float(m.get("used_over_wallet", 0.0)),
                     float(m.get("cap_ratio", 0.0)),
                 )
-                return {"capacity": capacity, "considered": 0, "opened": 0, "skipped": 0, "blocked_by_cap": 1}
+                log.info("[trade_liquidation][ENTRY_BLOCK] reason=portfolio_cap capacity=%d open_symbols=%d open_legs=%d", int(capacity), int(open_symbol_count), int(open_leg_count))
+                return {"capacity": capacity, "considered": 0, "opened": 0, "skipped": 0, "blocked_by_cap": 1, "open_symbols": open_symbol_count, "open_legs": open_leg_count, "blocked_reason": "portfolio_cap"}
 
         # Prefer snapshot wallet balance if present (prefetched in run_once)
         wallet = _safe_float(self._rest_snapshot_get("wallet_balance_usdt"), 0.0)
@@ -83,7 +92,8 @@ class TradeLiquidationEntryRulesMixin:
             wallet = self._wallet_balance_usdt()
         if wallet <= 0:
             log.warning("[trade_liquidation] wallet_balance(USDT)=0 -> skip opening")
-            return {"capacity": capacity, "considered": 0, "opened": 0, "skipped": 0}
+            log.info("[trade_liquidation][ENTRY_BLOCK] reason=wallet_zero capacity=%d open_symbols=%d open_legs=%d", int(capacity), int(open_symbol_count), int(open_leg_count))
+            return {"capacity": capacity, "considered": 0, "opened": 0, "skipped": 0, "open_symbols": open_symbol_count, "open_legs": open_leg_count, "blocked_reason": "wallet_zero"}
 
         signals = self._fetch_new_signals(limit=50)
 
@@ -92,7 +102,7 @@ class TradeLiquidationEntryRulesMixin:
                 "new signals: fetched=%d capacity=%d open=%d wallet=%.2fUSDT allowed_tfs=%s",
                 len(signals),
                 capacity,
-                open_count,
+                open_symbol_count,
                 wallet,
                 list(self.p.allowed_timeframes) if self.p.allowed_timeframes else "ALL",
             )
@@ -100,6 +110,7 @@ class TradeLiquidationEntryRulesMixin:
         opened = 0
         considered = 0
         skipped = 0
+        skip_reasons: Dict[str, int] = {}
         seen_symbols: set[int] = set()
 
         for sig in signals:
@@ -111,24 +122,29 @@ class TradeLiquidationEntryRulesMixin:
             tf = str(sig.get("timeframe") or "")
             if tf and self.p.allowed_timeframes and tf not in self.p.allowed_timeframes:
                 skipped += 1
+                skip_reasons["bad_timeframe"] = skip_reasons.get("bad_timeframe", 0) + 1
                 continue
 
             if symbol_id in seen_symbols:
                 skipped += 1
+                skip_reasons["duplicate_symbol_in_batch"] = skip_reasons.get("duplicate_symbol_in_batch", 0) + 1
                 continue
             seen_symbols.add(symbol_id)
 
             if symbol_id in open_by_symbol:
                 skipped += 1
+                skip_reasons["already_open_symbol"] = skip_reasons.get("already_open_symbol", 0) + 1
                 continue
 
             if self._is_symbol_in_cooldown(symbol_id):
                 skipped += 1
+                skip_reasons["symbol_cooldown"] = skip_reasons.get("symbol_cooldown", 0) + 1
                 continue
 
             signal_id = int(sig["signal_id"])
             if not self._try_claim_signal(signal_id):
                 skipped += 1
+                skip_reasons["claim_failed"] = skip_reasons.get("claim_failed", 0) + 1
                 continue
 
             ok = False
@@ -142,8 +158,11 @@ class TradeLiquidationEntryRulesMixin:
                 opened += 1
             else:
                 skipped += 1
+                skip_reasons["open_failed"] = skip_reasons.get("open_failed", 0) + 1
 
-        return {"capacity": capacity, "considered": considered, "opened": opened, "skipped": skipped}
+        fetched = int(len(signals))
+        log.info("[trade_liquidation][ENTRY_SCAN] fetched=%d considered=%d opened=%d skipped=%d capacity=%d open_symbols=%d open_legs=%d skip_reasons=%s", fetched, int(considered), int(opened), int(skipped), int(capacity), int(open_symbol_count), int(open_leg_count), skip_reasons or {})
+        return {"capacity": capacity, "considered": considered, "opened": opened, "skipped": skipped, "open_symbols": open_symbol_count, "open_legs": open_leg_count, "blocked_reason": None, "fetched": fetched}
 
     def _open_from_signal(self, sig: Dict[str, Any], wallet_balance_usdt: float) -> bool:
         signal_id = int(sig["signal_id"])
@@ -1080,7 +1099,7 @@ class TradeLiquidationEntryRulesMixin:
         self._mark_signal_taken(int(signal_id))
 
         log.info(
-            "[trade_liquidation][LIVE] OPEN %s %s qty=%.8f avg=%.6f SL=%.6f TP=%.6f (sl=%s tp=%s hedge=%s pos_uid=%s)",
+            "[trade_liquidation][LIVE] OPEN %s %s qty=%.8f avg=%.6f SL=%.6f TP=%.6f (sl=%s tp=%s hedge_mode=%s hedge_opened=%s pos_uid=%s)",
             symbol,
             ledger_side,
             float(qty),
@@ -1090,6 +1109,7 @@ class TradeLiquidationEntryRulesMixin:
             str(sl_mode),
             str(tp_mode),
             str(hedge_mode),
+            "False",
             str(pos_uid),
         )
         return True

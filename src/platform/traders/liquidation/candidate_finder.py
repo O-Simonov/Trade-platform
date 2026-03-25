@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 
-import json
 import logging
-import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -12,6 +10,21 @@ from .params import *
 log = logging.getLogger("traders.trade_liquidation")
 
 class TradeLiquidationCandidateFinderMixin:
+    def _normalized_screener_names(self) -> List[str]:
+        raw = getattr(self.p, 'screener_name', None)
+        if isinstance(raw, (list, tuple, set)):
+            items = [str(x).strip() for x in raw if str(x).strip()]
+        else:
+            s = str(raw or '').strip()
+            items = [s] if s else []
+        out: List[str] = []
+        seen = set()
+        for s in items:
+            if s not in seen:
+                seen.add(s)
+                out.append(s)
+        return out
+
     def _fetch_new_signals(self, limit: int = 50) -> List[Dict[str, Any]]:
         q = """
 
@@ -36,7 +49,7 @@ class TradeLiquidationCandidateFinderMixin:
           ON sf.exchange_id = sig.exchange_id
          AND sf.symbol_id = sig.symbol_id
         WHERE sig.exchange_id=%(ex)s
-          AND sc.name=%(scr)s
+          AND sc.name = ANY(%(scr_list)s)
           AND sig.status=%(st)s
           AND sig.signal_ts >= now() - (%(age)s::text || ' minutes')::interval
         ORDER BY sig.signal_ts DESC
@@ -48,7 +61,7 @@ class TradeLiquidationCandidateFinderMixin:
                 q,
                 {
                     "ex": int(self.exchange_id),
-                    "scr": str(self.p.screener_name),
+                    "scr_list": self._normalized_screener_names(),
                     "st": str(self.p.signal_status_new),
                     "age": int(self.p.max_signal_age_minutes),
                     "lim": int(limit),
@@ -68,7 +81,7 @@ class TradeLiquidationCandidateFinderMixin:
           FROM signals sig
           JOIN screeners sc ON sc.screener_id = sig.screener_id
           WHERE sig.exchange_id=%(ex)s
-            AND sc.name=%(scr)s
+            AND sc.name = ANY(%(scr_list)s)
             AND sig.status=%(st)s
             AND sig.signal_ts < now() - (%(age)s::text || ' minutes')::interval
           ORDER BY sig.signal_ts ASC
@@ -86,7 +99,7 @@ class TradeLiquidationCandidateFinderMixin:
                 q,
                 {
                     "ex": int(self.exchange_id),
-                    "scr": str(self.p.screener_name),
+                    "scr_list": self._normalized_screener_names(),
                     "st": str(self.p.signal_status_new),
                     "age": int(age),
                     "lim": int(limit) if limit > 0 else 1000000000,
@@ -100,7 +113,7 @@ class TradeLiquidationCandidateFinderMixin:
                 "[trade_liquidation] expired old signals: %d (age>%dmin, screener=%s, limit=%s)",
                 int(n),
                 int(age),
-                str(self.p.screener_name),
+                str(self._normalized_screener_names()),
                 str(limit if limit > 0 else "ALL"),
             )
         return n
@@ -126,113 +139,18 @@ class TradeLiquidationCandidateFinderMixin:
         v = rows[0].get("opened_at")
         return v if isinstance(v, datetime) else None
 
-    def _promote_surviving_live_hedge_rows(self, pos_rows: List[Dict[str, Any]], qty_map: Dict[tuple, float], tol: float) -> Dict[str, Dict[str, Any]]:
-        """If the original main leg is gone but the hedge leg remains open, promote the surviving
-        live_hedge row to source='live' so the rest of the strategy manages it as the new main leg.
-        """
-        promoted: Dict[str, Dict[str, Any]] = {}
-        if not bool(getattr(self.p, 'surviving_leg_promote_to_main_enabled', True)):
-            return promoted
-        try:
-            by_symbol: Dict[str, List[Dict[str, Any]]] = {}
-            for row in pos_rows or []:
-                sym = str(row.get('symbol') or '').upper()
-                if not sym:
-                    continue
-                by_symbol.setdefault(sym, []).append(row)
-
-            for sym, rows in by_symbol.items():
-                open_main_rows = []
-                open_hedge_rows = []
-                for row in rows:
-                    side = str(row.get('side') or '').upper()
-                    if side not in {'LONG', 'SHORT'}:
-                        continue
-                    exch_qty = float(qty_map.get((sym, side), 0.0) or 0.0)
-                    if abs(exch_qty) <= tol:
-                        continue
-                    src = str(row.get('source') or 'live').strip().lower()
-                    if src == 'live':
-                        open_main_rows.append(row)
-                    elif src == 'live_hedge':
-                        open_hedge_rows.append(row)
-
-                if open_main_rows or len(open_hedge_rows) != 1:
-                    continue
-
-                hedge_row = dict(open_hedge_rows[0])
-                pos_uid = str(hedge_row.get('pos_uid') or '')
-                if not pos_uid:
-                    continue
-                try:
-                    patch = {
-                        'promotion': {
-                            'promoted_from_live_hedge': True,
-                            'promotion_reason': 'surviving_leg_became_main',
-                            'promotion_ts': float(time.time()),
-                        }
-                    }
-                    if bool(getattr(self, '_pl_has_raw_meta', False)):
-                        self.store.execute(
-                            """
-                            UPDATE position_ledger
-                            SET source='live',
-                                raw_meta = COALESCE(raw_meta,'{}'::jsonb) || %(meta)s::jsonb,
-                                updated_at=now()
-                            WHERE exchange_id=%(ex)s AND account_id=%(acc)s AND pos_uid=%(pos_uid)s AND status='OPEN';
-                            """,
-                            {
-                                'meta': json.dumps(patch),
-                                'ex': int(self.exchange_id),
-                                'acc': int(self.account_id),
-                                'pos_uid': pos_uid,
-                            },
-                        )
-                    else:
-                        self.store.execute(
-                            """
-                            UPDATE position_ledger
-                            SET source='live', updated_at=now()
-                            WHERE exchange_id=%(ex)s AND account_id=%(acc)s AND pos_uid=%(pos_uid)s AND status='OPEN';
-                            """,
-                            {'ex': int(self.exchange_id), 'acc': int(self.account_id), 'pos_uid': pos_uid},
-                        )
-                    try:
-                        self.store.execute(
-                            """
-                            DELETE FROM hedge_links
-                            WHERE exchange_id=%(ex)s AND symbol_id=%(sym)s
-                              AND (base_account_id=%(acc)s OR hedge_account_id=%(acc)s)
-                              AND (base_pos_uid=%(pos_uid)s OR hedge_pos_uid=%(pos_uid)s);
-                            """,
-                            {'ex': int(self.exchange_id), 'sym': int(hedge_row.get('symbol_id')), 'acc': int(self.account_id), 'pos_uid': pos_uid},
-                        )
-                    except Exception:
-                        pass
-                    hedge_row['source'] = 'live'
-                    promoted[pos_uid] = hedge_row
-                    log.warning('[TL][PROMOTE_SURVIVING_LEG] promoted live_hedge -> live sym=%s side=%s pos_uid=%s', sym, str(hedge_row.get('side') or '').upper(), pos_uid)
-                except Exception:
-                    log.exception('[TL][PROMOTE_SURVIVING_LEG] failed sym=%s pos_uid=%s', sym, pos_uid)
-            return promoted
-        except Exception:
-            log.exception('[TL][PROMOTE_SURVIVING_LEG] unexpected error')
-            return promoted
-
     def _get_open_positions(self):
         """Возвращает OPEN позиции стратегии.
 
-        В LIVE режиме считаем "открыто" по факту на бирже и при необходимости
-        повышаем выжившую live_hedge-ногу до source='live', если исходная основная
-        нога уже закрылась, а противоположная нога осталась на бирже открытой.
-        """
-        mode_u = str(self.mode).lower()
-        if mode_u == 'live':
-            source_clause = "COALESCE(pl.source,'live') IN ('live','live_hedge')"
-        else:
-            source_clause = "COALESCE(pl.source,'paper') = 'paper'"
+        В LIVE режиме считаем "открыто" по факту на бирже:
+          - если в ledger позиция OPEN, но на Binance qty уже 0 (закрыли руками/по SL/TP/ликвидации),
+            то (если включено reconcile_auto_close_ledger) помечаем её CLOSED и снимаем все ордера по символу.
+          - для расчёта open_positions в логах возвращаем только те позиции, у которых qty на бирже != 0.
 
-        sql = f"""
+        Это нужно, чтобы open_positions=... отражал реальность и не блокировал новые входы,
+        когда позиции уже закрылись на бирже.
+        """
+        sql = """
         SELECT
           pl.exchange_id,
           pl.account_id,
@@ -266,108 +184,110 @@ class TradeLiquidationCandidateFinderMixin:
           AND pl.account_id  = %(account_id)s
           AND pl.strategy_id = %(strategy_id)s
           AND pl.status      = 'OPEN'
-          AND ({source_clause})
+          AND (
+                COALESCE(pl.source, CASE WHEN %(mode)s = 'live' THEN 'live' ELSE 'paper' END)
+                = CASE WHEN %(mode)s = 'live' THEN 'live' ELSE 'paper' END
+              )
         ORDER BY pl.opened_at ASC
         """
         pos = self.store.query_dict(sql, dict(
             exchange_id=int(self.exchange_id),
             account_id=int(self.account_id),
             strategy_id=str(self.strategy_id),
+            mode=str(self.mode).lower(),
         ))
 
-        if mode_u != 'live':
+        # PAPER: просто считаем по ledger
+        if str(self.mode).lower() != "live":
             return pos
 
-        pr = self._rest_snapshot_get('position_risk')
-        if not isinstance(pr, list):
-            try:
-                pr = self._binance.position_risk()
-            except Exception as e:
-                self._dlog('positionRisk fetch failed in _get_open_positions: %s', e)
-                return [p for p in pos if str(p.get('source') or 'live').strip().lower() != 'live_hedge']
+        # LIVE: сверяемся с биржей, чтобы OPEN отражал реальность
+        try:
+            pr = self._binance.position_risk()
+        except Exception as e:
+            # если не смогли получить snapshot, не ломаем цикл — вернём ledger как есть
+            self._dlog("positionRisk fetch failed in _get_open_positions: %s", e)
+            return pos
 
+        # build map (symbol, positionSide) -> abs(positionAmt) and markPrice
         qty_map = {}
         mark_map = {}
         for r in pr or []:
-            sym = (r.get('symbol') or '').upper()
-            ps = (r.get('positionSide') or '').upper()
+            sym = (r.get("symbol") or "").upper()
+            ps = (r.get("positionSide") or "").upper()
             if not sym or not ps:
                 continue
             try:
-                amt = float(r.get('positionAmt') or 0.0)
+                amt = float(r.get("positionAmt") or 0.0)
             except Exception:
                 amt = 0.0
             try:
-                mp = float(r.get('markPrice') or 0.0)
+                mp = float(r.get("markPrice") or 0.0)
             except Exception:
                 mp = 0.0
             qty_map[(sym, ps)] = abs(amt)
             mark_map[(sym, ps)] = mp
 
-        tol = float(getattr(self.params, 'reconcile_qty_tolerance', 1e-8) or 1e-8)
-        auto_close = bool(getattr(self.params, 'reconcile_auto_close_ledger', True))
-        promoted = self._promote_surviving_live_hedge_rows(pos, qty_map, tol)
+        tol = float(getattr(self.params, "reconcile_qty_tolerance", 1e-8) or 1e-8)
+        auto_close = bool(getattr(self.params, "reconcile_auto_close_ledger", True))
         closed_now = 0
         open_real = []
 
         for p in pos:
-            p = dict(p)
-            pos_uid = str(p.get('pos_uid') or '')
-            if pos_uid and pos_uid in promoted:
-                p.update(promoted[pos_uid])
-                p['source'] = 'live'
-
-            sym = (p.get('symbol') or '').upper()
-            side = (p.get('side') or '').upper()
-            src = str(p.get('source') or 'live').strip().lower()
+            sym = (p.get("symbol") or "").upper()
+            side = (p.get("side") or "").upper()  # LONG/SHORT
             exch_qty = float(qty_map.get((sym, side), 0.0) or 0.0)
 
-            if src == 'live_hedge':
-                continue
-
             if abs(exch_qty) <= tol:
+                # На бирже позиции уже нет, но в ledger ещё OPEN
                 if auto_close:
                     try:
                         exit_price = float(mark_map.get((sym, side), 0.0) or 0.0)
+                        # Try to get real exit stats from exchange trade history (close price + realized pnl)
                         stats = self._fetch_exchange_exit_stats(
                             symbol=sym,
                             pos_side=side,
-                            opened_at=p.get('opened_at'),
+                            opened_at=p.get("opened_at"),
                             closed_at=_utc_now(),
-                            qty_expected=_safe_float(p.get('qty_current'), default=0.0),
+                            qty_expected=_safe_float(p.get("qty_current"), default=0.0),
                         )
-                        ex_exit = stats.get('exit_price')
-                        ex_pnl = stats.get('realized_pnl')
-                        ex_close_ms = stats.get('close_time_ms')
+                        ex_exit = stats.get("exit_price")
+                        ex_pnl = stats.get("realized_pnl")
+                        ex_close_ms = stats.get("close_time_ms")
 
                         if ex_exit is None:
                             ex_exit = exit_price
                         if not ex_exit:
-                            ex_exit = float(p.get('avg_price') or p.get('entry_price') or 0.0)
+                            # fallback: если markPrice не пришёл, используем avg_price/entry_price
+                            ex_exit = float(p.get("avg_price") or p.get("entry_price") or 0.0)
 
                         if ex_pnl is None:
-                            entry = _safe_float(p.get('avg_price'), default=_safe_float(p.get('entry_price'), default=0.0))
-                            qty = _safe_float(p.get('qty_current'), default=0.0)
-                            ex_pnl = (float(ex_exit) - entry) * qty if str(side).upper() == 'LONG' else (entry - float(ex_exit)) * qty
+                            # last resort: approximate (still better than missing)
+                            entry = _safe_float(p.get("avg_price"), default=_safe_float(p.get("entry_price"), default=0.0))
+                            qty = _safe_float(p.get("qty_current"), default=0.0)
+                            ex_pnl = (float(ex_exit) - entry) * qty if str(side).upper() == "LONG" else (entry - float(ex_exit)) * qty
 
                         self._close_position_exchange(
                             p,
                             exit_price=float(ex_exit),
                             realized_pnl=float(ex_pnl),
                             close_time_ms=ex_close_ms,
-                            reason='exchange_qty_zero',
-                            timeframe='reconcile',
+                            reason="exchange_qty_zero",
+                            timeframe="reconcile",
                         )
+                        # снимаем все ордера по символу (обычные + algo)
                         self._live_cancel_symbol_orders(sym)
                         closed_now += 1
                     except Exception as e:
-                        self._dlog('auto-close ledger failed pos_uid=%s sym=%s side=%s: %s', p.get('pos_uid'), sym, side, e)
+                        self._dlog("auto-close ledger failed pos_uid=%s sym=%s side=%s: %s",
+                                   p.get("pos_uid"), sym, side, e)
                 continue
 
+            # позиция реально открыта
             open_real.append(p)
 
         if closed_now:
-            log.info('[TL] ledger auto-closed (exchange qty=0): closed_now=%s', closed_now)
+            log.info("[TL] ledger auto-closed (exchange qty=0): closed_now=%s", closed_now)
 
         return open_real
 

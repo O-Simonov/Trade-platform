@@ -1441,7 +1441,24 @@ class TradeLiquidationOrderBuilderMixin:
             if not self._has_open_position_live(str(sym).upper(), side_u):
                 return False
 
-            entry_price = _safe_float(pos.get("avg_price") or pos.get("entry_price") or 0.0, 0.0)
+            # Prefer exchange-reported avg entry from positionRisk for live positions.
+            # This avoids stale activation prices when avg entry changed after fills/adds.
+            entry_price = 0.0
+            try:
+                pr = self._rest_snapshot_get("position_risk") or []
+                for r in pr if isinstance(pr, list) else []:
+                    if str(r.get("symbol") or "").upper() != str(sym_u).upper():
+                        continue
+                    ps = str(r.get("positionSide") or "").upper()
+                    if ps and ps in {"LONG", "SHORT"} and ps != side_u:
+                        continue
+                    entry_price = abs(float(r.get("entryPrice") or r.get("avgEntryPrice") or r.get("avgPrice") or 0.0))
+                    if entry_price > 0.0:
+                        break
+            except Exception:
+                entry_price = 0.0
+            if entry_price <= 0.0:
+                entry_price = _safe_float(pos.get("avg_price") or pos.get("entry_price") or 0.0, 0.0)
             if entry_price <= 0.0:
                 return False
 

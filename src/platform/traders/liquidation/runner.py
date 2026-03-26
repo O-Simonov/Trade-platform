@@ -834,6 +834,9 @@ class TradeLiquidation(
                 log.debug("[trade_liquidation] backfill_closed_exit_pnl failed", exc_info=True)
 
         open_positions = self._get_open_positions()
+        max_symbols_per_cycle = int(getattr(self.p, "max_symbols_per_cycle", 5) or 5)
+        managed_positions = self._cycle_subset(open_positions or [], "open_positions", max_symbols_per_cycle)
+        self._cycle_open_positions_subset = list(managed_positions or [])
 
         # LIVE: averaging adds maintenance.
         # Ensure we have the next ADD order queued, but never exceed max_adds.
@@ -841,7 +844,7 @@ class TradeLiquidation(
         if self._is_live and bool(getattr(self.p, "averaging_enabled", False)) and self._cfg_max_adds() > 0:
             try:
                 placed_any = False
-                for p in open_positions or []:
+                for p in managed_positions or []:
                     if self._live_ensure_next_add_order(pos=p):
                         placed_any = True
                         break
@@ -851,9 +854,10 @@ class TradeLiquidation(
             except Exception:
                 log.debug("[trade_liquidation][LIVE][AVG] ensure_next_add failed", exc_info=True)
         self._dlog(
-            "cycle start: open_positions=%d/%d | signal_tf=%s | sl_mode=%s tp_mode=%s | trailing=%s | avg=%s levels=%s | canceled_leftovers=%d",
+            "cycle start: open_positions=%d/%d managed=%d signal_tf=%s | sl_mode=%s tp_mode=%s | trailing=%s | avg=%s levels=%s | canceled_leftovers=%d",
             len(open_positions),
             int(self.p.max_open_positions),
+            len(managed_positions),
             ",".join(self.p.allowed_timeframes) if self.p.allowed_timeframes else "*",
             str(self.p.sl_order_mode),
             str(self.p.tp_order_mode),
@@ -870,11 +874,46 @@ class TradeLiquidation(
         close_stats = self._process_open_positions()
         open_stats = self._process_new_signals()
         try:
-            log.info("[trade_liquidation][ENTRY_STATUS] open_symbols=%s open_legs=%s capacity=%s considered=%s opened=%s skipped=%s blocked_reason=%s", str(open_stats.get("open_symbols")), str(open_stats.get("open_legs")), str(open_stats.get("capacity")), str(open_stats.get("considered")), str(open_stats.get("opened")), str(open_stats.get("skipped")), str(open_stats.get("blocked_reason")))
+            st = (
+                str(open_stats.get("open_symbols")),
+                str(open_stats.get("open_legs")),
+                str(open_stats.get("capacity")),
+                str(open_stats.get("considered")),
+                str(open_stats.get("opened")),
+                str(open_stats.get("skipped")),
+                str(open_stats.get("blocked_reason")),
+            )
+            self._stateful_info(
+                "entry_status",
+                st,
+                "[trade_liquidation][ENTRY_STATUS] open_symbols=%s open_legs=%s capacity=%s considered=%s opened=%s skipped=%s blocked_reason=%s",
+                *st,
+            )
         except Exception:
             pass
 
         elapsed = (_utc_now() - started).total_seconds()
+        try:
+            if bool(getattr(self.p, "enable_cycle_summary", True)):
+                every = max(1, int(getattr(self.p, "cycle_summary_interval", 1) or 1))
+                if int(getattr(self, "_cycle_n", 0) or 0) % every == 0:
+                    log.info(
+                        "[trade_liquidation][CYCLE_SUMMARY] elapsed=%.2fs managed=%d total_open=%d recovered=%d open_symbols=%s open_legs=%s capacity=%s opened=%s skipped=%s blocked_reason=%s closed=%s",
+                        float(elapsed),
+                        len(managed_positions),
+                        len(open_positions),
+                        int(recovered),
+                        str(open_stats.get("open_symbols")),
+                        str(open_stats.get("open_legs")),
+                        str(open_stats.get("capacity")),
+                        str(open_stats.get("opened")),
+                        str(open_stats.get("skipped")),
+                        str(open_stats.get("blocked_reason")),
+                        str(close_stats),
+                    )
+        except Exception:
+            pass
+
         out = {
             "strategy": self.STRATEGY_ID,
             "paper": not self._is_live,
@@ -1625,6 +1664,21 @@ class TradeLiquidation(
 
         now = _utc_now()
         recovered = 0
+        recovery_actions = 0
+        max_symbols = int(getattr(self.p, "max_recovery_symbols_per_cycle", 5) or 5)
+        max_actions = int(getattr(self.p, "max_recovery_actions_per_cycle", 6) or 6)
+        led = self._cycle_subset(led or [], "recovery_positions", max_symbols)
+
+        def _reserve_recovery_action() -> bool:
+            nonlocal recovery_actions
+            if recovery_actions >= max_actions:
+                return False
+            recovery_actions += 1
+            return True
+
+        def _rollback_recovery_action() -> None:
+            nonlocal recovery_actions
+            recovery_actions = max(0, int(recovery_actions) - 1)
 
         # In hedge mode, a symbol side can be managed as a dedicated hedge leg of the
         # opposite main position. In that case generic main TRAILING recovery must not
@@ -1724,6 +1778,8 @@ class TradeLiquidation(
 
 
         for p in led:
+            if recovery_actions >= max_actions:
+                break
             try:
                 opened_at = p.get("opened_at")
                 if isinstance(opened_at, datetime):
@@ -1994,6 +2050,8 @@ class TradeLiquidation(
                     except Exception:
                         allow_place_sl = False
                 if allow_place_sl:
+                    if not _reserve_recovery_action():
+                        break
                     try:
                         if avg_enabled and defer_sl and cfg_max_adds > 0:
                             rm = p.get("raw_meta") or {}
@@ -2190,6 +2248,7 @@ class TradeLiquidation(
                         recovered += 1
                         log.info("[trade_liquidation][RECOVERY] placed missing SL %s %s pos_uid=%s", sym, side, pos_uid)
                     except Exception:
+                        _rollback_recovery_action()
                         log.exception("[trade_liquidation][RECOVERY] failed to place SL %s %s pos_uid=%s", sym, side, pos_uid)
 
             if (not main_partial_tp_enabled) and place_tp and (not has_tp) and tp_price > 0:
@@ -2297,6 +2356,7 @@ class TradeLiquidation(
                         recovered += 1
                     log.info("[trade_liquidation][RECOVERY] placed missing TP %s %s pos_uid=%s", sym, side, pos_uid)
                 except Exception:
+                    _rollback_recovery_action()
                     log.exception("[trade_liquidation][RECOVERY] failed to place TP %s %s pos_uid=%s", sym, side, pos_uid)
 
             # If TRAILING exists but based on old entry/avg price, cancel so it can be re-placed on the new level.
@@ -2389,6 +2449,8 @@ class TradeLiquidation(
                     )
                     continue
                 if trailing_enabled and (not has_trl) and (not is_hedge_managed_side):
+                    if not _reserve_recovery_action():
+                        break
                     try:
                         if not hasattr(self, "_recent_main_trl_place_ts"):
                             self._recent_main_trl_place_ts = {}
@@ -2480,6 +2542,7 @@ class TradeLiquidation(
                             pass
                         log.info("[trade_liquidation][RECOVERY] placed missing TRAILING %s %s pos_uid=%s", sym, side, pos_uid) if not (isinstance(resp_trl, dict) and resp_trl.get("_duplicate")) else None
             except Exception:
+                _rollback_recovery_action()
                 log.exception("[trade_liquidation][RECOVERY] failed trailing recovery for %s %s pos_uid=%s", sym, side, pos_uid)
 
             # Averaging ADD recovery: after restart ADD orders may be missing because they were previously

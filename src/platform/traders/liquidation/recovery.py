@@ -742,6 +742,21 @@ class TradeLiquidationRecoveryMixin:
 
         now = _utc_now()
         recovered = 0
+        recovery_actions = 0
+        max_symbols = int(getattr(self.p, 'max_recovery_symbols_per_cycle', 5) or 5)
+        max_actions = int(getattr(self.p, 'max_recovery_actions_per_cycle', 6) or 6)
+        led = self._cycle_subset(led or [], 'recovery_positions', max_symbols)
+
+        def _reserve_recovery_action() -> bool:
+            nonlocal recovery_actions
+            if recovery_actions >= max_actions:
+                return False
+            recovery_actions += 1
+            return True
+
+        def _rollback_recovery_action() -> None:
+            nonlocal recovery_actions
+            recovery_actions = max(0, int(recovery_actions) - 1)
 
         # In hedge mode, a symbol side can be managed as a dedicated hedge leg of the
         # opposite main position. In that case generic main TRAILING recovery must not
@@ -841,6 +856,8 @@ class TradeLiquidationRecoveryMixin:
 
 
         for p in led:
+            if recovery_actions >= max_actions:
+                break
             try:
                 opened_at = p.get("opened_at")
                 if isinstance(opened_at, datetime):
@@ -1111,6 +1128,8 @@ class TradeLiquidationRecoveryMixin:
                     except Exception:
                         allow_place_sl = False
                 if allow_place_sl:
+                    if not _reserve_recovery_action():
+                        break
                     try:
                         if avg_enabled and defer_sl and cfg_max_adds > 0:
                             rm = p.get("raw_meta") or {}
@@ -1307,9 +1326,12 @@ class TradeLiquidationRecoveryMixin:
                         recovered += 1
                         log.info("[trade_liquidation][RECOVERY] placed missing SL %s %s pos_uid=%s", sym, side, pos_uid)
                     except Exception:
+                        _rollback_recovery_action()
                         log.exception("[trade_liquidation][RECOVERY] failed to place SL %s %s pos_uid=%s", sym, side, pos_uid)
 
             if (not main_partial_tp_enabled) and place_tp and (not has_tp) and tp_price > 0:
+                if not _reserve_recovery_action():
+                    break
                 try:
                     tp_mode = str(getattr(self.p, "tp_order_mode", "take_profit_market") or "take_profit_market").strip().lower()
                     if tp_mode in {"take_profit_market", "takeprofit_market", "tp_market", "market"}:
@@ -1414,6 +1436,7 @@ class TradeLiquidationRecoveryMixin:
                         recovered += 1
                     log.info("[trade_liquidation][RECOVERY] placed missing TP %s %s pos_uid=%s", sym, side, pos_uid)
                 except Exception:
+                    _rollback_recovery_action()
                     log.exception("[trade_liquidation][RECOVERY] failed to place TP %s %s pos_uid=%s", sym, side, pos_uid)
 
             # If TRAILING exists but based on old entry/avg price, cancel so it can be re-placed on the new level.
@@ -1506,6 +1529,8 @@ class TradeLiquidationRecoveryMixin:
                     )
                     continue
                 if trailing_enabled and (not has_trl) and (not is_hedge_managed_side):
+                    if not _reserve_recovery_action():
+                        break
                     try:
                         if not hasattr(self, "_recent_main_trl_place_ts"):
                             self._recent_main_trl_place_ts = {}
@@ -1597,6 +1622,7 @@ class TradeLiquidationRecoveryMixin:
                             pass
                         log.info("[trade_liquidation][RECOVERY] placed missing TRAILING %s %s pos_uid=%s", sym, side, pos_uid) if not (isinstance(resp_trl, dict) and resp_trl.get("_duplicate")) else None
             except Exception:
+                _rollback_recovery_action()
                 log.exception("[trade_liquidation][RECOVERY] failed trailing recovery for %s %s pos_uid=%s", sym, side, pos_uid)
 
             # Averaging ADD recovery: after restart ADD orders may be missing because they were previously

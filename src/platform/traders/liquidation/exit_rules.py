@@ -710,7 +710,7 @@ class TradeLiquidationExitRulesMixin:
                 post_invariant = 0
                 if bool(getattr(self.p, "averaging_enabled", False)) and self._cfg_max_adds() > 0:
                     try:
-                        open_positions = self._get_open_positions()
+                        open_positions = list(getattr(self, '_cycle_open_positions_subset', None) or self._get_open_positions() or [])
                         for p in open_positions or []:
                             try:
                                 if self._live_ensure_next_add_order(pos=p):
@@ -731,7 +731,7 @@ class TradeLiquidationExitRulesMixin:
                 return out
             return {"checked": 0, "closed": 0}
 
-        positions = self._get_open_positions()
+        positions = list(getattr(self, '_cycle_open_positions_subset', None) or self._get_open_positions() or [])
         closed = 0
         checked = 0
 

@@ -63,12 +63,11 @@ class TradeLiquidationEntryRulesMixin:
 
         capacity = max(0, int(self.p.max_open_positions) - open_symbol_count)
         if capacity <= 0:
-            log.info(
+            self._stateful_info(
+                "entry_block",
+                ("max_open_symbols", int(capacity), int(open_symbol_count), int(open_leg_count), int(self.p.max_open_positions)),
                 "[trade_liquidation][ENTRY_BLOCK] reason=max_open_symbols capacity=%d open_symbols=%d open_legs=%d max_open_positions=%d",
-                int(capacity),
-                int(open_symbol_count),
-                int(open_leg_count),
-                int(self.p.max_open_positions),
+                int(capacity), int(open_symbol_count), int(open_leg_count), int(self.p.max_open_positions),
             )
             return {"capacity": 0, "considered": 0, "opened": 0, "skipped": 0, "open_symbols": open_symbol_count, "open_legs": open_leg_count, "blocked_reason": "max_open_symbols"}
 
@@ -83,7 +82,7 @@ class TradeLiquidationEntryRulesMixin:
                     float(m.get("used_over_wallet", 0.0)),
                     float(m.get("cap_ratio", 0.0)),
                 )
-                log.info("[trade_liquidation][ENTRY_BLOCK] reason=portfolio_cap capacity=%d open_symbols=%d open_legs=%d", int(capacity), int(open_symbol_count), int(open_leg_count))
+                self._stateful_info("entry_block", ("portfolio_cap", int(capacity), int(open_symbol_count), int(open_leg_count)), "[trade_liquidation][ENTRY_BLOCK] reason=portfolio_cap capacity=%d open_symbols=%d open_legs=%d", int(capacity), int(open_symbol_count), int(open_leg_count))
                 return {"capacity": capacity, "considered": 0, "opened": 0, "skipped": 0, "blocked_by_cap": 1, "open_symbols": open_symbol_count, "open_legs": open_leg_count, "blocked_reason": "portfolio_cap"}
 
         # Prefer snapshot wallet balance if present (prefetched in run_once)
@@ -92,7 +91,7 @@ class TradeLiquidationEntryRulesMixin:
             wallet = self._wallet_balance_usdt()
         if wallet <= 0:
             log.warning("[trade_liquidation] wallet_balance(USDT)=0 -> skip opening")
-            log.info("[trade_liquidation][ENTRY_BLOCK] reason=wallet_zero capacity=%d open_symbols=%d open_legs=%d", int(capacity), int(open_symbol_count), int(open_leg_count))
+            self._stateful_info("entry_block", ("wallet_zero", int(capacity), int(open_symbol_count), int(open_leg_count)), "[trade_liquidation][ENTRY_BLOCK] reason=wallet_zero capacity=%d open_symbols=%d open_legs=%d", int(capacity), int(open_symbol_count), int(open_leg_count))
             return {"capacity": capacity, "considered": 0, "opened": 0, "skipped": 0, "open_symbols": open_symbol_count, "open_legs": open_leg_count, "blocked_reason": "wallet_zero"}
 
         signals = self._fetch_new_signals(limit=50)
@@ -161,7 +160,8 @@ class TradeLiquidationEntryRulesMixin:
                 skip_reasons["open_failed"] = skip_reasons.get("open_failed", 0) + 1
 
         fetched = int(len(signals))
-        log.info("[trade_liquidation][ENTRY_SCAN] fetched=%d considered=%d opened=%d skipped=%d capacity=%d open_symbols=%d open_legs=%d skip_reasons=%s", fetched, int(considered), int(opened), int(skipped), int(capacity), int(open_symbol_count), int(open_leg_count), skip_reasons or {})
+        state = (fetched, int(considered), int(opened), int(skipped), int(capacity), int(open_symbol_count), int(open_leg_count), tuple(sorted((skip_reasons or {}).items())))
+        self._stateful_info("entry_scan", state, "[trade_liquidation][ENTRY_SCAN] fetched=%d considered=%d opened=%d skipped=%d capacity=%d open_symbols=%d open_legs=%d skip_reasons=%s", fetched, int(considered), int(opened), int(skipped), int(capacity), int(open_symbol_count), int(open_leg_count), skip_reasons or {})
         return {"capacity": capacity, "considered": considered, "opened": opened, "skipped": skipped, "open_symbols": open_symbol_count, "open_legs": open_leg_count, "blocked_reason": None, "fetched": fetched}
 
     def _open_from_signal(self, sig: Dict[str, Any], wallet_balance_usdt: float) -> bool:

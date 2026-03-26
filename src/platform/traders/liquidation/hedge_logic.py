@@ -219,7 +219,10 @@ class TradeLiquidationHedgeLogicMixin:
                 },
             )
             try:
-                log.info('[TL][HEDGE_BIND] %s %s base_pos_uid=%s hedge_pos_uid=%s created=%s qty=%.8f entry=%.8f', str(symbol).upper(), hedge_side, base_pos_uid, hedge_pos_uid, bool(created), float(qty), float(entry_px))
+                if bool(created):
+                    self._ilog('[TL][HEDGE_BIND] %s %s base_pos_uid=%s hedge_pos_uid=%s created=%s qty=%.8f entry=%.8f', str(symbol).upper(), hedge_side, base_pos_uid, hedge_pos_uid, bool(created), float(qty), float(entry_px))
+                else:
+                    self._rate_limited_log(logging.DEBUG, 'hedge_binding', f'hedge_binding:{str(symbol).upper()}:{str(hedge_side).upper()}', '[TL][HEDGE_BIND] %s %s base_pos_uid=%s hedge_pos_uid=%s created=%s qty=%.8f entry=%.8f', str(symbol).upper(), hedge_side, base_pos_uid, hedge_pos_uid, bool(created), float(qty), float(entry_px))
             except Exception:
                 pass
             return hedge_pos_uid
@@ -2804,7 +2807,7 @@ class TradeLiquidationHedgeLogicMixin:
 
             if hedge_amt <= 0 and open_trigger and (not allow_first_hedge_open):
                 try:
-                    log.info('[TL][HEDGE_OPEN_DEFERRED_UNTIL_MAX_ADDS] %s %s adds_done=%s/%s upnl=%.8f sl_hit=%s', symbol, str(main_side).upper(), int(adds_done_for_hedge), int(max_adds_for_hedge), float(main_upnl or 0.0), bool(sl_hit))
+                    self._rate_limited_log(logging.DEBUG, 'hedge_deferred', f'hedge_deferred:{str(symbol).upper()}:{str(main_side).upper()}', '[TL][HEDGE_OPEN_DEFERRED_UNTIL_MAX_ADDS] %s %s adds_done=%s/%s upnl=%.8f sl_hit=%s', symbol, str(main_side).upper(), int(adds_done_for_hedge), int(max_adds_for_hedge), float(main_upnl or 0.0), bool(sl_hit))
                 except Exception:
                     pass
 

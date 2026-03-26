@@ -1936,7 +1936,7 @@ class TradeLiquidationOrderBuilderMixin:
                                     "cid": str(want_cid),
                                 },
                             )
-                            log.info("[trade_liquidation][LIVE][AVG] shadow ADD marked CANCELED as stale %s %s cid=%s source=%s", sym, side, want_cid, db_source)
+                            self._rate_limited_log(logging.DEBUG, 'stale_add', f'stale_add:{sym}:{side}:{want_cid}', '[trade_liquidation][LIVE][AVG] shadow ADD marked CANCELED as stale %s %s cid=%s source=%s', sym, side, want_cid, db_source)
                         except Exception:
                             pass
         except Exception:

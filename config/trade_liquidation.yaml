@@ -24,7 +24,7 @@ traders:
       signal_status_new: NEW                       # Какой статус сигнала считать "новым"
       allowed_timeframes: ["5m", "15m", "1h"]      # Разрешённые таймфреймы сигналов
 
-      max_signal_age_minutes: 30      # Максимальный возраст сигнала в минутах от signal_ts
+      max_signal_age_minutes: 90      # Максимальный возраст сигнала в минутах от signal_ts; увеличен, чтобы не терять редкие NEW-сигналы
       per_symbol_cooldown_minutes: 60 # не открывать новую сделку по тому же символу, если недавно уже была сделка/попытка
       expire_status: EXPIRED          # Статус сигнала при экспирации
       expire_old_signals: true        # Автоматически экспирировать старые NEW-сигналы
@@ -84,7 +84,7 @@ traders:
       hedge_unwind_step2_pct: 1.6                 # Второй шаг unwind после движения на 1.6%
       hedge_unwind_step2_share: 0.35              # Закрыть еще 35% исходного hedge объема
       hedge_unwind_full_exit_enabled: true        # Разрешить полностью закрывать hedge при сильном возврате цены
-      hedge_unwind_full_exit_pct: 1.6             # Полностью закрыть остаток hedge при сильном возврате цены
+      hedge_unwind_full_exit_pct: 2.4             # Полностью закрыть остаток hedge при сильном возврате цены
       hedge_unwind_cooldown_sec: 30               # Кулдаун между unwind-действиями
       hedge_unwind_min_qty_ratio: 0.15            # Не делать частичный unwind, если остаток hedge станет меньше 15% от исходного
 
@@ -138,7 +138,7 @@ traders:
       # ======================================================
       # Лимиты по позициям
       # ======================================================
-      max_open_positions: 12                       # Максимум одновременно открытых позиций
+      max_open_positions: 15                       # Максимум одновременно открытых позиций
       max_position_notional_pct_wallet: 15.0       # Ограничение notional одной позиции как % от кошелька
       risk_wallet_pct: 1.5                         # Риск на сделку от кошелька
       live_entry_reduce_on_max_position: true      # Если позиция не проходит по лимитам → уменьшать размер и пробовать снова
@@ -148,16 +148,16 @@ traders:
       # Базовые SL / TP
       # ======================================================
       stop_loss_pct: 2.0                           # Базовый SL (%)
-      take_profit_pct: 6.0                         # Базовый TP (%)
+      take_profit_pct: 6.0                         # Базовый full TP (%) по main; используется как fallback, если partial TP выключен
       # --- Частичная фиксация прибыли по main
-      main_partial_tp_enabled: true               # Разрешить частично фиксировать прибыль по main
-      main_partial_tp1_pct: 1.8                   # Первый частичный TP при +2.5%
+      main_partial_tp_enabled: true               # Разрешить частично фиксировать прибыль по main; при true обычный full TP по main не ставится
+      main_partial_tp1_pct: 1.8                   # Первый partial TP при движении в прибыль на 1.8% от средней цены входа main
       main_partial_tp1_share: 0.30                # Закрыть 30% позиции
-      main_partial_tp2_pct: 3.8                   # Второй частичный TP при +4.5%
+      main_partial_tp2_pct: 3.8                   # Второй partial TP при движении в прибыль на 3.8% от средней цены входа main
       main_partial_tp2_share: 0.30                # Закрыть еще 30% позиции
       main_partial_tp_cooldown_sec: 30            # Кулдаун между partial TP
       main_partial_tp_min_qty_ratio: 0.15         # Не резать позицию, если остаток станет меньше 15% от исходного
-      recalc_sl_tp: true                          # Пересчитывать SL/TP после усреднений
+      recalc_sl_tp: true                          # Пересчитывать уровни SL/TP/trailing после усреднений и изменения средней цены
       # ======================================================
       # Вход и bracket-ордера
       # ======================================================
@@ -170,18 +170,25 @@ traders:
       time_in_force: GTC                           # Политика времени жизни ордера: GTC / IOC / FOK
       client_order_id_prefix: TL                   # Префикс clientOrderId
       enable_stop_loss: true                       # Включить постановку SL
-      defer_stop_loss_until_last_add: true         # Не ставить SL сразу, пока не будут выполнены все доборы
+      defer_stop_loss_until_last_add: true         # Не ставить обычный SL сразу, пока не будут выполнены все доборы; на main trailing это больше не влияет
       sl_after_last_add_distance_pct: 2.0          # Дистанция SL после последнего добора, если включён отложенный SL
       # ======================================================
-      # Trailing stop для main
+      # Main trailing stop
       # ======================================================
-      trailing_enabled: true                       # Включить trailing
-      trailing_activation_pct: 2.5                 # Активация trailing после +X% в прибыль
-      trailing_trail_pct: 0.6                      # Дистанция trailing (%)
-      trailing_activation_buffer_pct: 0.3          # Буфер от мгновенного срабатывания trailing после его постановки
-      tp_trigger_buffer_pct: 0.3                   # Буфер для triggerPrice TP, чтобы ордер не срабатывал мгновенно
-      trailing_place_retries: 3                    # Сколько раз повторять постановку trailing при ошибке Binance
-      tp_place_retries: 3                          # Сколько раз повторять постановку TP при ошибке Binance
+      trailing_enabled: true                       # Включить trailing по основной позиции
+      trailing_activation_pct: 2.5                 # На каком профит-движении (% от средней цены входа main) активируется trailing
+      trailing_trail_pct: 0.6                      # callbackRate (%) для trailing stop по main
+      trailing_activation_buffer_pct: 0.3          # Буфер к activation price, чтобы избежать мгновенного срабатывания на постановке
+      tp_trigger_buffer_pct: 0.3                   # Буфер для triggerPrice TP, если full TP используется как fallback-режим без partial TP
+      trailing_place_retries: 3                    # Сколько раз повторять постановку main trailing при ошибке Binance
+      tp_place_retries: 3                          # Сколько раз повторять постановку full TP при ошибке Binance
+      trailing_reissue_on_qty_change: true         # Перевыставлять main trailing при изменении остатка позиции (например после partial TP)
+      trailing_reissue_cooldown_sec: 30            # Минимальная пауза между повторными перевыставлениями main trailing
+      trailing_qty_tolerance: 1e-8                 # Допуск сравнения qty, ниже которого изменение считается шумом
+      # Важно:
+      # - Main trailing теперь может ставиться заранее, ещё до выполнения всех доборов.
+      # - Если цена сразу идёт в прибыль, partial TP фиксирует часть позиции, а trailing ведёт остаток.
+      # - Открытие hedge при этом по-прежнему может оставаться отложенным до выполнения всех доборов.
       # ======================================================
       # Усреднение (averaging / adds)
       # ======================================================

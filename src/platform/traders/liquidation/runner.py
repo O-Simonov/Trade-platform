@@ -1834,10 +1834,11 @@ class TradeLiquidation(
             has_sl = (cid_sl in existing) or bool(any_sl)
             has_tp = (cid_tp in existing) or bool(any_tp)
             has_trl = (cid_trl in existing) or bool(any_trl)
+            main_partial_tp_enabled = bool(getattr(self.p, "main_partial_tp_enabled", False))
 
             # Strong dedupe for our own protective algo orders. Exchange snapshots can lag,
             # and without DB/local markers the next cycle may re-place the same TP/TRL.
-            if not has_tp:
+            if (not main_partial_tp_enabled) and (not has_tp):
                 tp_known = self._find_known_algo_order_by_client_id(sym, cid_tp)
                 if tp_known is None:
                     tp_known = self._find_semantic_open_algo(
@@ -1885,26 +1886,14 @@ class TradeLiquidation(
             # Hard guarantee: TP must be on the correct side of entry.
             # (Some safety/rounding logic can otherwise push it across.)
             tp_price = _ensure_tp_trail_side(tp_price, entry, tick, side, kind="tp")
-            # If our TP exists but trigger price no longer matches (e.g. after averaging fill),
-            # cancel it so we can recreate at the new correct level.
-            try:
-                tp_order = None
-                for ao in (open_algo_by_symbol.get(sym) or []):
-                    if str(ao.get("clientAlgoId") or "") == cid_tp:
-                        tp_order = ao
-                        break
-                if tp_order is not None:
-                    try:
-                        tp_trg = float(tp_order.get("triggerPrice") or tp_order.get("stopPrice") or 0.0)
-                    except Exception:
-                        tp_trg = 0.0
-                    tol = max(
-                        float(tick or 0.0) * float(PRICE_EPS_TICKS),
-                        abs(float(tp_price)) * (float(AVG_EPS_PCT) / 100.0),
-                        1e-12,
-                    )
-                    if tp_trg > 0.0 and abs(tp_trg - float(tp_price)) > tol:
-                        # cancel stale TP (throttle to avoid churn)
+            if main_partial_tp_enabled:
+                try:
+                    tp_order = None
+                    for ao in (open_algo_by_symbol.get(sym) or []):
+                        if str(ao.get("clientAlgoId") or "") == cid_tp:
+                            tp_order = ao
+                            break
+                    if tp_order is not None:
                         _last = float(self._bracket_replace_last_ts.get((pos_uid, "tp"), 0.0) or 0.0)
                         if (now_ts - _last) >= float(REPLACE_COOLDOWN_SEC):
                             try:
@@ -1913,45 +1902,77 @@ class TradeLiquidation(
                                 pass
                             has_tp = False
                             self._bracket_replace_last_ts[(pos_uid, "tp")] = now_ts
-            except Exception:
-                pass
-
-            # Ensure TP exists (and matches current avg/entry-based level)
-            if not has_tp:
+                            log.info("[trade_liquidation][RECOVER] canceled base TP for %s %s because main_partial_tp_enabled=true", sym, side)
+                except Exception:
+                    pass
+            else:
+                # If our TP exists but trigger price no longer matches (e.g. after averaging fill),
+                # cancel it so we can recreate at the new correct level.
                 try:
-                    tp_side = "SELL" if side == "LONG" else "BUY"
-                    resp_tp = self._binance.new_algo_order(
-                        symbol=sym,
-                        side=tp_side,
-                        type="TAKE_PROFIT_MARKET",
-                        closePosition="true",
-                        workingType="MARK_PRICE",
-                        positionSide=side,
-                        algoType="CONDITIONAL",
-                        clientAlgoId=cid_tp,
-                        triggerPrice=str(tp_price),
-                    )
-                    try:
-                        self._upsert_algo_order_shadow(resp_tp, pos_uid=pos_uid, strategy_id=self.STRATEGY_ID)
-                    except Exception:
-                        pass
-                    try:
-                        self._mark_local_algo_open(
-                            cid_tp,
-                            symbol=sym,
-                            position_side=position_side,
-                            order_type="TAKE_PROFIT_MARKET",
-                            side=tp_side,
-                            quantity=float(qty_use),
-                            trigger_price=float(tp_price),
-                            close_position=True,
-                            pos_uid=pos_uid,
+                    tp_order = None
+                    for ao in (open_algo_by_symbol.get(sym) or []):
+                        if str(ao.get("clientAlgoId") or "") == cid_tp:
+                            tp_order = ao
+                            break
+                    if tp_order is not None:
+                        try:
+                            tp_trg = float(tp_order.get("triggerPrice") or tp_order.get("stopPrice") or 0.0)
+                        except Exception:
+                            tp_trg = 0.0
+                        tol = max(
+                            float(tick or 0.0) * float(PRICE_EPS_TICKS),
+                            abs(float(tp_price)) * (float(AVG_EPS_PCT) / 100.0),
+                            1e-12,
                         )
-                    except Exception:
-                        pass
-                    has_tp = True
-                except Exception as _e:
-                    log.warning("[trade_liquidation][RECOVER] failed to place TP %s %s: %s", sym, side, _e)
+                        if tp_trg > 0.0 and abs(tp_trg - float(tp_price)) > tol:
+                            # cancel stale TP (throttle to avoid churn)
+                            _last = float(self._bracket_replace_last_ts.get((pos_uid, "tp"), 0.0) or 0.0)
+                            if (now_ts - _last) >= float(REPLACE_COOLDOWN_SEC):
+                                try:
+                                    self._cancel_algo_by_client_id_safe(sym, cid_tp)
+                                except Exception:
+                                    pass
+                                has_tp = False
+                                self._bracket_replace_last_ts[(pos_uid, "tp")] = now_ts
+                except Exception:
+                    pass
+
+                # Ensure TP exists (and matches current avg/entry-based level)
+                if not has_tp:
+                    try:
+                        tp_side = "SELL" if side == "LONG" else "BUY"
+                        resp_tp = self._binance.new_algo_order(
+                            symbol=sym,
+                            side=tp_side,
+                            type="TAKE_PROFIT_MARKET",
+                            closePosition="true",
+                            workingType="MARK_PRICE",
+                            positionSide=side,
+                            algoType="CONDITIONAL",
+                            clientAlgoId=cid_tp,
+                            triggerPrice=str(tp_price),
+                        )
+                        try:
+                            self._upsert_algo_order_shadow(resp_tp, pos_uid=pos_uid, strategy_id=self.STRATEGY_ID)
+                        except Exception:
+                            pass
+                        try:
+                            self._mark_local_algo_open(
+                                cid_tp,
+                                symbol=sym,
+                                position_side=position_side,
+                                order_type="TAKE_PROFIT_MARKET",
+                                side=tp_side,
+                                quantity=float(qty_use),
+                                trigger_price=float(tp_price),
+                                close_position=True,
+                                pos_uid=pos_uid,
+                            )
+                        except Exception:
+                            pass
+                        has_tp = True
+                    except Exception as _e:
+                        log.warning("[trade_liquidation][RECOVER] failed to place TP %s %s: %s", sym, side, _e)
 
             # place missing orders
             
@@ -2171,7 +2192,7 @@ class TradeLiquidation(
                     except Exception:
                         log.exception("[trade_liquidation][RECOVERY] failed to place SL %s %s pos_uid=%s", sym, side, pos_uid)
 
-            if place_tp and (not has_tp) and tp_price > 0:
+            if (not main_partial_tp_enabled) and place_tp and (not has_tp) and tp_price > 0:
                 try:
                     tp_mode = str(getattr(self.p, "tp_order_mode", "take_profit_market") or "take_profit_market").strip().lower()
                     if tp_mode in {"take_profit_market", "takeprofit_market", "tp_market", "market"}:

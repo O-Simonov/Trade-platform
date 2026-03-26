@@ -27,6 +27,206 @@ from .params import *
 log = logging.getLogger("traders.trade_liquidation")
 
 class TradeLiquidationHedgeLogicMixin:
+    def _ensure_live_hedge_binding(self, *, base_pos: dict, symbol: str, symbol_id: int, hedge_ps: str, hedge_amt: float, hedge_entry: float, mark: float) -> str | None:
+        """Ensure there is an OPEN live_hedge mirror row and hedge_links binding for an already-open hedge leg.
+
+        Returns hedge_pos_uid when binding exists/was created, else None.
+        """
+        try:
+            base_pos_uid = str((base_pos or {}).get('pos_uid') or '').strip()
+            if not base_pos_uid:
+                return None
+            ex = int(self.exchange_id)
+            acc = int(self.account_id)
+            sym_id = int(symbol_id)
+            hedge_side = str(hedge_ps).upper()
+            qty = abs(float(hedge_amt or 0.0))
+            if qty <= 0.0:
+                return None
+            entry_px = float(hedge_entry or 0.0)
+            if entry_px <= 0.0:
+                entry_px = float(mark or 0.0)
+            if entry_px <= 0.0:
+                return None
+
+            # Prefer an already linked OPEN live_hedge row for this base position.
+            row = None
+            try:
+                row = self.store.fetch_one(
+                    """
+                    SELECT pl.pos_uid
+                    FROM position_ledger pl
+                    JOIN hedge_links hl
+                      ON hl.exchange_id = pl.exchange_id
+                     AND hl.symbol_id = pl.symbol_id
+                     AND hl.hedge_account_id = pl.account_id
+                     AND hl.hedge_pos_uid = pl.pos_uid
+                    WHERE pl.exchange_id=%s AND pl.account_id=%s AND pl.symbol_id=%s
+                      AND pl.side=%s AND pl.status='OPEN'
+                      AND COALESCE(pl.source,'live')='live_hedge'
+                      AND hl.base_account_id=%s AND hl.base_pos_uid=%s
+                    ORDER BY pl.updated_at DESC NULLS LAST, pl.opened_at DESC NULLS LAST
+                    LIMIT 1
+                    """,
+                    (ex, acc, sym_id, hedge_side, acc, base_pos_uid),
+                )
+            except Exception:
+                row = None
+
+            # Fallback: reuse any OPEN live_hedge row for same symbol/side/account.
+            if not row:
+                try:
+                    row = self.store.fetch_one(
+                        """
+                        SELECT pos_uid
+                        FROM position_ledger
+                        WHERE exchange_id=%s AND account_id=%s AND symbol_id=%s
+                          AND side=%s AND status='OPEN'
+                          AND COALESCE(source,'live')='live_hedge'
+                        ORDER BY updated_at DESC NULLS LAST, opened_at DESC NULLS LAST
+                        LIMIT 1
+                        """,
+                        (ex, acc, sym_id, hedge_side),
+                    )
+                except Exception:
+                    row = None
+
+            hedge_pos_uid = str((row or {}).get('pos_uid') or '').strip()
+            created = False
+            if not hedge_pos_uid:
+                hedge_pos_uid = str(uuid.uuid4())
+                created = True
+                if getattr(self, '_pl_has_raw_meta', False):
+                    meta = json.dumps({
+                        'hedge_mirror': {
+                            'base_pos_uid': base_pos_uid,
+                            'symbol': str(symbol).upper(),
+                            'hedge_side': hedge_side,
+                            'adopted_from_exchange': True,
+                            'created_ts': float(time.time()),
+                        }
+                    })
+                    self.store.execute(
+                        """
+                        INSERT INTO position_ledger (
+                            exchange_id, account_id, symbol_id, pos_uid,
+                            strategy_id, source, side, status, opened_at,
+                            qty_opened, qty_current, entry_price, avg_price,
+                            position_value_usdt, scale_in_count, raw_meta, updated_at
+                        ) VALUES (
+                            %(ex)s, %(acc)s, %(sym)s, %(pos_uid)s,
+                            %(sid)s, 'live_hedge', %(side)s, 'OPEN', now(),
+                            %(qty)s, %(qty)s, %(entry)s, %(entry)s,
+                            %(val)s, 0, %(meta)s::jsonb, now()
+                        )
+                        """,
+                        {
+                            'ex': ex, 'acc': acc, 'sym': sym_id, 'pos_uid': hedge_pos_uid,
+                            'sid': getattr(self, 'STRATEGY_ID', 'trade_liquidation'), 'side': hedge_side,
+                            'qty': float(qty), 'entry': float(entry_px), 'val': float(entry_px * qty), 'meta': meta,
+                        },
+                    )
+                else:
+                    self.store.execute(
+                        """
+                        INSERT INTO position_ledger (
+                            exchange_id, account_id, symbol_id, pos_uid,
+                            strategy_id, source, side, status, opened_at,
+                            qty_opened, qty_current, entry_price, avg_price,
+                            position_value_usdt, scale_in_count, updated_at
+                        ) VALUES (
+                            %(ex)s, %(acc)s, %(sym)s, %(pos_uid)s,
+                            %(sid)s, 'live_hedge', %(side)s, 'OPEN', now(),
+                            %(qty)s, %(qty)s, %(entry)s, %(entry)s,
+                            %(val)s, 0, now()
+                        )
+                        """,
+                        {
+                            'ex': ex, 'acc': acc, 'sym': sym_id, 'pos_uid': hedge_pos_uid,
+                            'sid': getattr(self, 'STRATEGY_ID', 'trade_liquidation'), 'side': hedge_side,
+                            'qty': float(qty), 'entry': float(entry_px), 'val': float(entry_px * qty),
+                        },
+                    )
+            else:
+                # Keep mirror row in sync with current exchange hedge qty/entry.
+                if getattr(self, '_pl_has_raw_meta', False):
+                    meta = json.dumps({
+                        'hedge_mirror': {
+                            'base_pos_uid': base_pos_uid,
+                            'symbol': str(symbol).upper(),
+                            'hedge_side': hedge_side,
+                            'adopted_from_exchange': True,
+                            'updated_ts': float(time.time()),
+                        }
+                    })
+                    self.store.execute(
+                        """
+                        UPDATE position_ledger
+                           SET qty_current=%(qty)s,
+                               qty_opened=GREATEST(COALESCE(qty_opened,0), %(qty)s),
+                               entry_price=CASE WHEN COALESCE(entry_price,0) <= 0 THEN %(entry)s ELSE entry_price END,
+                               avg_price=CASE WHEN COALESCE(avg_price,0) <= 0 THEN %(entry)s ELSE avg_price END,
+                               position_value_usdt=%(val)s,
+                               raw_meta=COALESCE(raw_meta,'{}'::jsonb) || %(meta)s::jsonb,
+                               updated_at=now(),
+                               status='OPEN'
+                         WHERE exchange_id=%(ex)s AND account_id=%(acc)s AND pos_uid=%(pos_uid)s
+                        """,
+                        {'ex': ex, 'acc': acc, 'pos_uid': hedge_pos_uid, 'qty': float(qty), 'entry': float(entry_px), 'val': float(entry_px * qty), 'meta': meta},
+                    )
+                else:
+                    self.store.execute(
+                        """
+                        UPDATE position_ledger
+                           SET qty_current=%(qty)s,
+                               qty_opened=GREATEST(COALESCE(qty_opened,0), %(qty)s),
+                               entry_price=CASE WHEN COALESCE(entry_price,0) <= 0 THEN %(entry)s ELSE entry_price END,
+                               avg_price=CASE WHEN COALESCE(avg_price,0) <= 0 THEN %(entry)s ELSE avg_price END,
+                               position_value_usdt=%(val)s,
+                               updated_at=now(),
+                               status='OPEN'
+                         WHERE exchange_id=%(ex)s AND account_id=%(acc)s AND pos_uid=%(pos_uid)s
+                        """,
+                        {'ex': ex, 'acc': acc, 'pos_uid': hedge_pos_uid, 'qty': float(qty), 'entry': float(entry_px), 'val': float(entry_px * qty)},
+                    )
+
+            # Ensure hedge_links row exists for current base -> hedge mapping.
+            try:
+                self.store.execute(
+                    """
+                    DELETE FROM hedge_links
+                    WHERE exchange_id=%(ex)s AND symbol_id=%(sym)s
+                      AND base_account_id=%(acc)s AND hedge_account_id=%(acc)s
+                      AND base_pos_uid=%(base)s AND hedge_pos_uid=%(hedge)s
+                    """,
+                    {'ex': ex, 'sym': sym_id, 'acc': acc, 'base': base_pos_uid, 'hedge': hedge_pos_uid},
+                )
+            except Exception:
+                pass
+            self.store.execute(
+                """
+                INSERT INTO hedge_links (
+                    exchange_id, base_account_id, hedge_account_id, symbol_id,
+                    base_pos_uid, hedge_pos_uid, hedge_ratio, created_at
+                ) VALUES (
+                    %(ex)s, %(acc)s, %(acc)s, %(sym)s,
+                    %(base)s, %(hedge)s, %(ratio)s, now()
+                )
+                """,
+                {
+                    'ex': ex, 'acc': acc, 'sym': sym_id, 'base': base_pos_uid, 'hedge': hedge_pos_uid,
+                    'ratio': float(qty / max(abs(float((base_pos or {}).get('qty_current') or (base_pos or {}).get('qty_opened') or qty)), 1e-12)),
+                },
+            )
+            try:
+                log.info('[TL][HEDGE_BIND] %s %s base_pos_uid=%s hedge_pos_uid=%s created=%s qty=%.8f entry=%.8f', str(symbol).upper(), hedge_side, base_pos_uid, hedge_pos_uid, bool(created), float(qty), float(entry_px))
+            except Exception:
+                pass
+            return hedge_pos_uid
+        except Exception:
+            log.exception('[TL][HEDGE_BIND] failed to ensure binding %s %s base_pos_uid=%s', str(symbol).upper(), str(hedge_ps).upper(), str((base_pos or {}).get('pos_uid') or ''))
+            return None
+
     def _get_live_symbol_funding_rate_pct(self, symbol: str) -> float:
         """Return current funding rate in PERCENT for a symbol, best-effort."""
         try:
@@ -1485,6 +1685,22 @@ class TradeLiquidationHedgeLogicMixin:
                 skipped += 1
                 continue
 
+            # Repair/ensure internal hedge binding for a live hedge leg already open on exchange.
+            # Without this, HEDGE_SL / HEDGE_TRL managers may skip a perfectly real hedge position
+            # just because live_hedge / hedge_links rows were not created yet.
+            try:
+                if float(hedge_amt or 0.0) > 0.0:
+                    self._ensure_live_hedge_binding(
+                        base_pos=p,
+                        symbol=str(symbol).upper(),
+                        symbol_id=int(symbol_id),
+                        hedge_ps=str(hedge_ps).upper(),
+                        hedge_amt=float(hedge_amt or 0.0),
+                        hedge_entry=float(hedge_entry or 0.0),
+                        mark=float(mark or 0.0),
+                    )
+            except Exception:
+                log.exception('[TL][HEDGE_BIND] unexpected error while ensuring binding %s %s base_pos_uid=%s', str(symbol).upper(), str(hedge_ps).upper(), str(p.get('pos_uid') or ''))
 
             # If hedge position has just been closed externally (e.g., by HEDGE_SL/HEDGE_TRL on exchange),
             # persist last_close_ts + last_close_px into position_ledger.raw_meta so that reopen filters
@@ -2074,6 +2290,27 @@ class TradeLiquidationHedgeLogicMixin:
                         hsl_owned = bool(row_hsl)
                     except Exception:
                         hsl_owned = False
+
+                    if not hsl_owned:
+                        try:
+                            row_any_hsl = self.store.fetch_one(
+                                """
+                                SELECT pl.pos_uid
+                                FROM position_ledger pl
+                                WHERE pl.exchange_id = %s
+                                  AND pl.account_id = %s
+                                  AND pl.symbol_id = %s
+                                  AND pl.side = %s
+                                  AND pl.status = 'OPEN'
+                                  AND COALESCE(pl.source, 'live') = 'live_hedge'
+                                ORDER BY pl.updated_at DESC NULLS LAST, pl.opened_at DESC NULLS LAST
+                                LIMIT 1
+                                """,
+                                (int(self.exchange_id), int(self.account_id), int(symbol_id), str(hedge_ps)),
+                            )
+                            hsl_owned = bool(row_any_hsl)
+                        except Exception:
+                            pass
 
                     tok = _coid_token(str(p.get('pos_uid') or ''), n=20)
                     cid_hsl = f"TL_{tok}_HEDGE_SL"

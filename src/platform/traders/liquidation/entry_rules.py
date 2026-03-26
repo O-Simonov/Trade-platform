@@ -835,7 +835,11 @@ class TradeLiquidationEntryRulesMixin:
             log.exception("[trade_liquidation][LIVE] failed to place SL for %s", symbol)
 
         try:
-            tp_resp = _place_tp()
+            main_partial_tp_enabled = bool(getattr(self.p, "main_partial_tp_enabled", False))
+            if not main_partial_tp_enabled:
+                tp_resp = _place_tp()
+            else:
+                log.info("[trade_liquidation][LIVE] skip base TP for %s because main_partial_tp_enabled=true", symbol)
         except Exception:
             log.exception("[trade_liquidation][LIVE] failed to place TP for %s", symbol)
 

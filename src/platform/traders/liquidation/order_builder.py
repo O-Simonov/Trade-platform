@@ -1420,13 +1420,13 @@ class TradeLiquidationOrderBuilderMixin:
     ) -> bool:
         """Ensure main TRAILING_STOP_MARKET exists before the last averaging add is filled.
 
-        This path is active only when averaging is enabled and
-        defer_stop_loss_until_last_add == False.
+        This path is active whenever averaging is enabled and there are still
+        pending adds left for the main position. Unlike STOP_MARKET SL deferral,
+        main trailing should be allowed *before* the last add so profit can be
+        protected even if price never returns to averaging levels.
         """
         try:
             if not bool(getattr(self.p, "trailing_enabled", False)):
-                return False
-            if bool(getattr(self.p, "defer_stop_loss_until_last_add", False)):
                 return False
             if int(max_adds or 0) <= 0 or int(adds_done or 0) >= int(max_adds or 0):
                 return False

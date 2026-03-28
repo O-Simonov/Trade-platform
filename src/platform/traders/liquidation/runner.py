@@ -1452,6 +1452,7 @@ class TradeLiquidation(
         if bool(getattr(self.p, "hedge_enabled", False)):
             place_sl = False
         place_tp = bool(getattr(self.p, "recovery_place_tp", True))
+        place_trailing = bool(getattr(self.p, "recovery_place_trailing", True))
         hedge_mode = bool(getattr(self.p, "hedge_enabled", False))
 
         # Open orders snapshot
@@ -1785,6 +1786,7 @@ class TradeLiquidation(
                 if isinstance(opened_at, datetime):
                     age_h = (now - opened_at.replace(tzinfo=timezone.utc) if opened_at.tzinfo is None else now - opened_at.astimezone(timezone.utc)).total_seconds() / 3600.0
                     if age_h > max_age_h:
+                        log.info("[trade_liquidation][RECOVERY] skip pos_uid=%s reason=max_age age_h=%.2f max_age_h=%.2f", str(p.get("pos_uid") or ""), float(age_h), float(max_age_h))
                         continue
             except Exception:
                 pass
@@ -1797,16 +1799,160 @@ class TradeLiquidation(
             if side not in {"LONG", "SHORT"}:
                 continue
 
+            pos_uid = str(p.get("pos_uid") or "").strip()
+            if not pos_uid:
+                continue
+            raw_meta = p.get("raw_meta") or {}
+            if isinstance(raw_meta, str):
+                try:
+                    import json as _json
+                    raw_meta = _json.loads(raw_meta) if raw_meta.strip() else {}
+                except Exception:
+                    raw_meta = {}
+            qty_ex = abs(_safe_float(ex_qty_map.get((sym, side)), 0.0))
+            qty_led = abs(_safe_float(p.get("qty_current"), 0.0))
+            qty_use = float(qty_ex if qty_ex > 0 else qty_led)
+            entry_ledger = _safe_float(p.get("entry_price"), 0.0)
+            entry = float(ex_entry_map.get((sym, side), entry_ledger) or 0.0)
+
             src_kind = str(p.get("source") or "live").lower().strip()
             if src_kind == "live_hedge":
-                # Hedge legs are managed by hedge_logic only.
-                # Skipping them here prevents accidental hedge TP/main protective orders on the hedge side.
+                # Hedge legs are managed by hedge_logic, but auto-recovery must still be able
+                # to restore missing HEDGE_TRL / HEDGE_SL after restart or manual cancel.
+                try:
+                    hedge_ps = str(side).upper()
+                    base_pos_uid = ""
+                    try:
+                        _rm_h = raw_meta or {}
+                        if isinstance(_rm_h, str):
+                            _rm_h = json.loads(_rm_h) if _rm_h.strip() else {}
+                        if isinstance(_rm_h, dict):
+                            _hm = _rm_h.get("hedge_mirror") or {}
+                            if isinstance(_hm, dict):
+                                base_pos_uid = str(_hm.get("base_pos_uid") or "").strip()
+                    except Exception:
+                        base_pos_uid = ""
+                    if not base_pos_uid:
+                        try:
+                            _row = self.store.fetch_one(
+                                """
+                                SELECT hl.base_pos_uid
+                                  FROM hedge_links hl
+                                 WHERE hl.exchange_id=%s
+                                   AND hl.hedge_account_id=%s
+                                   AND hl.symbol_id=%s
+                                   AND hl.hedge_pos_uid=%s
+                                 ORDER BY hl.created_at DESC NULLS LAST
+                                 LIMIT 1
+                                """,
+                                (int(self.exchange_id), int(self.account_id), int(symbol_id), str(pos_uid)),
+                            )
+                            base_pos_uid = str((_row or {}).get("base_pos_uid") or "").strip()
+                        except Exception:
+                            base_pos_uid = ""
+                    if base_pos_uid:
+                        base_pos = None
+                        try:
+                            base_pos = self.store.fetch_one(
+                                """
+                                SELECT symbol_id, pos_uid, side, status, qty_current, entry_price, avg_price, raw_meta, opened_at, source
+                                  FROM position_ledger
+                                 WHERE exchange_id=%s AND account_id=%s AND pos_uid=%s
+                                 ORDER BY updated_at DESC NULLS LAST, opened_at DESC NULLS LAST
+                                 LIMIT 1
+                                """,
+                                (int(self.exchange_id), int(self.account_id), str(base_pos_uid)),
+                            )
+                        except Exception:
+                            base_pos = None
+                        base_pos = dict(base_pos or {})
+                        if not base_pos.get("pos_uid"):
+                            base_pos["pos_uid"] = str(base_pos_uid)
+                        tok_h = _coid_token(str(base_pos_uid), n=20)
+                        cid_htrl = f"{prefix}_{tok_h}_HEDGE_TRL"
+                        cid_hsl = f"{prefix}_{tok_h}_HEDGE_SL"
+                        hedge_close_side = "BUY" if hedge_ps == "SHORT" else "SELL"
+                        has_htrl = self._find_known_algo_order_by_client_id(sym, cid_htrl) is not None
+                        if not has_htrl:
+                            has_htrl = self._find_semantic_open_algo(
+                                sym,
+                                client_suffix="_HEDGE_TRL",
+                                position_side=hedge_ps,
+                                order_type="TRAILING_STOP_MARKET",
+                                side=hedge_close_side,
+                                close_position=False,
+                            ) is not None
+                        has_hsl = self._find_known_algo_order_by_client_id(sym, cid_hsl) is not None
+                        if not has_hsl:
+                            has_hsl = self._find_semantic_open_algo(
+                                sym,
+                                client_suffix="_HEDGE_SL",
+                                position_side=hedge_ps,
+                                order_type="STOP_MARKET",
+                                side=hedge_close_side,
+                                close_position=True,
+                            ) is not None
+                        need_htrl = bool(place_trailing) and bool(getattr(self.p, "hedge_trailing_enabled", False)) and (not has_htrl)
+                        need_hsl = bool(getattr(self.p, "recovery_place_sl", True)) and float(getattr(self.p, "hedge_stop_loss_pct", 0.0) or 0.0) > 0.0 and (not has_hsl)
+                        if need_htrl or need_hsl:
+                            log.info(
+                                "[trade_liquidation][RECOVERY][HEDGE] restoring %s %s base_pos_uid=%s hedge_pos_uid=%s need_hsl=%s need_htrl=%s",
+                                sym, hedge_ps, str(base_pos_uid), str(pos_uid), bool(need_hsl), bool(need_htrl),
+                            )
+                            if _reserve_recovery_action():
+                                before_htrl = has_htrl
+                                before_hsl = has_hsl
+                                try:
+                                    self._ensure_immediate_hedge_protection(
+                                        base_pos=base_pos,
+                                        symbol=sym,
+                                        symbol_id=int(symbol_id),
+                                        hedge_ps=hedge_ps,
+                                        hedge_amt=float(qty_use or 0.0),
+                                        hedge_entry=float(entry or avg_price or 0.0),
+                                        mark=float(ex_mark_map.get((sym, side)) or 0.0),
+                                        allow_trailing=bool(need_htrl),
+                                        allow_sl=bool(need_hsl),
+                                    )
+                                    after_htrl = self._find_known_algo_order_by_client_id(sym, cid_htrl) is not None
+                                    if (not after_htrl) and need_htrl:
+                                        after_htrl = self._find_semantic_open_algo(
+                                            sym,
+                                            client_suffix="_HEDGE_TRL",
+                                            position_side=hedge_ps,
+                                            order_type="TRAILING_STOP_MARKET",
+                                            side=hedge_close_side,
+                                            close_position=False,
+                                        ) is not None
+                                    after_hsl = self._find_known_algo_order_by_client_id(sym, cid_hsl) is not None
+                                    if (not after_hsl) and need_hsl:
+                                        after_hsl = self._find_semantic_open_algo(
+                                            sym,
+                                            client_suffix="_HEDGE_SL",
+                                            position_side=hedge_ps,
+                                            order_type="STOP_MARKET",
+                                            side=hedge_close_side,
+                                            close_position=True,
+                                        ) is not None
+                                    recovered += int(bool(need_htrl and (not before_htrl) and after_htrl))
+                                    recovered += int(bool(need_hsl and (not before_hsl) and after_hsl))
+                                except Exception:
+                                    _rollback_recovery_action()
+                                    raise
+                    else:
+                        log.info(
+                            "[trade_liquidation][RECOVERY][HEDGE] skip %s %s hedge_pos_uid=%s reason=no_base_binding",
+                            sym, hedge_ps, str(pos_uid),
+                        )
+                except Exception:
+                    log.exception("[trade_liquidation][RECOVERY][HEDGE] failed for %s %s pos_uid=%s", sym, side, pos_uid)
                 continue
 
             is_hedge_managed_side = (sym, side) in hedge_managed_sides
 
             # If exchange says no position - skip recovery (reconcile will handle ledger close)
             if (sym, side) not in ex_has_pos:
+                log.info("[trade_liquidation][RECOVERY] skip %s %s pos_uid=%s reason=no_exchange_position", sym, side, str(p.get("pos_uid") or ""))
                 continue
 
             # Use exchange qty for protective orders (especially important for TRAILING_STOP_MARKET and limit TP),
@@ -2448,7 +2594,7 @@ class TradeLiquidation(
                         sym, side, pos_uid,
                     )
                     continue
-                if trailing_enabled and (not has_trl) and (not is_hedge_managed_side):
+                if place_trailing and trailing_enabled and (not has_trl) and (not is_hedge_managed_side):
                     if not _reserve_recovery_action():
                         break
                     try:

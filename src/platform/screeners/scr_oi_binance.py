@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from src.platform.core.utils.candles import interval_to_timedelta
@@ -334,52 +334,53 @@ class ScrParams:
     max_symbols: int = 0
 
     # windows
-    base_minutes: int = 240     # база (флэт/тренд)
-    trigger_minutes: int = 20   # триггер (всплеск OI/volume)
+    base_minutes: int = 240
+    trigger_minutes: int = 20
 
     # BASE volume calmness
-    # If set, we treat the base window as "calm" only when the largest base candle volume
-    # is not much larger than the median base volume. This helps detect "quiet" consolidation.
     base_volume_max_mult: Optional[float] = 2.0
 
     # PRICE base regime
-    price_sideways_max_pct: float = 1.2          # max range% in base to treat as боковик
-    price_downtrend_min_pct: float = 1.0         # min drop% in base to treat as downtrend
+    price_sideways_max_pct: float = 1.2
+    price_downtrend_min_pct: float = 1.0
+
+    # replay / freshness
+    max_signal_age_minutes: int = 30
+
+    # BUY base regime tuning
+    buy_allow_downtrend_base: bool = False
 
     # BUY trigger (5m)
-    buy_oi_rise_pct: float = 3.0                 # OI % за trigger_minutes
-    # Additional confirmation: open_interest_value must also rise by at least this percent.
-    # This keeps signals aligned with "notional" (USDT) growth, but we still compute the core OI on contracts.
+    buy_oi_rise_pct: float = 3.0
     oi_value_confirm_pct: Optional[float] = None
-    buy_volume_mult: float = 3.0                 # trigger avg volume multiplier vs base median
-    buy_volume_spike_mult: float = 3.0          # trigger max candle volume multiplier vs base median
-    buy_price_rise_pct: float = 0.3              # price % за trigger_minutes
-    buy_min_green_candles: int = 2               # сколько зелёных свечей в trigger
-    buy_require_last_green: bool = True      # последняя свеча в trigger должна быть зелёной
+    buy_volume_mult: float = 3.0
+    buy_volume_spike_mult: float = 3.0
+    buy_require_volume_spike: bool = True
+    buy_price_rise_pct: float = 0.3
+    buy_price_max_rise_pct: Optional[float] = 3.0
+    buy_min_green_candles: int = 2
+    buy_require_last_green: bool = True
 
     # SELL trigger
-    sell_oi_drop_one_candle_pct: float = 1.0     # OI % падение за 1 свечу (|<= -x|)
-    sell_oi_drop_window_pct: float = 1.5         # доп. критерий: OI % за trigger_minutes
-    sell_price_drop_last_pct: float = 0.5        # последняя свеча должна упасть хотя бы на x%
-    sell_volume_spike_mult: float = 2.5          # в trigger был пик >= base_avg * mult
-    sell_volume_drop_ratio: float = 0.45         # после пика: last_vol <= max_vol * ratio
-    sell_reversal_from_max_pct: float = 0.7      # падение от максимума в trigger до последнего close
-    # OI — ключи (раздельно: расчёт vs график)
-    #   - Для расчёта сигналов лучше использовать open_interest (контракты),
-    #     чтобы рост цены сам по себе не «раздувал» OI в USDT.
-    #   - Для графика часто удобнее open_interest_value (USDT).
-    oi_calc_key: str = "open_interest"            # open_interest (контракты) | open_interest_value (USDT)
-    oi_plot_key: str = "open_interest_value"      # open_interest_value (USDT) | open_interest (контракты)
+    sell_oi_drop_one_candle_pct: float = 1.0
+    sell_oi_drop_window_pct: float = 1.5
+    sell_price_drop_last_pct: float = 0.5
+    sell_volume_spike_mult: float = 2.5
+    sell_volume_drop_ratio: float = 0.45
+    sell_reversal_from_max_pct: float = 0.7
 
-    # Funding filter (для BUY)
+    # OI keys
+    oi_calc_key: str = "open_interest"
+    oi_plot_key: str = "open_interest_value"
+
+    # Funding filter (BUY)
     enable_funding: bool = True
-    buy_funding_max_pct: Optional[float] = -0.01  # funding_pct = rate * 100 ; для BUY ожидаем <= -0.01
-    buy_require_funding_decreasing: bool = False  # если true: last <= prev (становится более отрицательным)
+    buy_funding_max_pct: Optional[float] = -0.01
+    buy_require_funding_decreasing: bool = False
 
-    # Funding filter (для SELL)
-    # Для SELL по ТЗ: funding должен быть всегда положительный.
+    # Funding filter (SELL)
     sell_enable_funding: bool = True
-    sell_funding_min_pct: Optional[float] = 0.0  # funding_pct = rate*100 ; для SELL ожидаем > 0.0
+    sell_funding_min_pct: Optional[float] = 0.0
 
     # SL/TP
     stop_loss_pct: Optional[float] = 2.0
@@ -407,6 +408,7 @@ def _parse_params(params: Dict[str, Any]) -> ScrParams:
 
     p.base_minutes = max(60, _to_int(params.get("base_minutes"), p.base_minutes))
     p.trigger_minutes = max(5, _to_int(params.get("trigger_minutes"), p.trigger_minutes))
+    p.max_signal_age_minutes = max(1, _to_int(params.get("max_signal_age_minutes"), 30))
 
     bvm = params.get("base_volume_max_mult", p.base_volume_max_mult)
     p.base_volume_max_mult = None if bvm is None else _to_float(bvm, 2.0)
@@ -414,12 +416,29 @@ def _parse_params(params: Dict[str, Any]) -> ScrParams:
     p.price_sideways_max_pct = _to_float(params.get("price_sideways_max_pct"), p.price_sideways_max_pct)
     p.price_downtrend_min_pct = _to_float(params.get("price_downtrend_min_pct"), p.price_downtrend_min_pct)
 
+    p.buy_allow_downtrend_base = _to_bool(
+        params.get("buy_allow_downtrend_base"),
+        p.buy_allow_downtrend_base,
+    )
+
     p.buy_oi_rise_pct = _to_float(params.get("buy_oi_rise_pct"), p.buy_oi_rise_pct)
     oivc = params.get("oi_value_confirm_pct", p.oi_value_confirm_pct)
     p.oi_value_confirm_pct = None if oivc is None else _to_float(oivc, 0.0)
+
     p.buy_volume_mult = _to_float(params.get("buy_volume_mult"), p.buy_volume_mult)
+    p.buy_volume_spike_mult = _to_float(params.get("buy_volume_spike_mult"), p.buy_volume_spike_mult)
+    p.buy_require_volume_spike = _to_bool(
+        params.get("buy_require_volume_spike"),
+        p.buy_require_volume_spike,
+    )
+
     p.buy_price_rise_pct = _to_float(params.get("buy_price_rise_pct"), p.buy_price_rise_pct)
+
+    bmx = params.get("buy_price_max_rise_pct", p.buy_price_max_rise_pct)
+    p.buy_price_max_rise_pct = None if bmx is None else _to_float(bmx, 3.0)
+
     p.buy_min_green_candles = max(0, _to_int(params.get("buy_min_green_candles"), p.buy_min_green_candles))
+    p.buy_require_last_green = _to_bool(params.get("buy_require_last_green"), p.buy_require_last_green)
 
     p.sell_oi_drop_one_candle_pct = _to_float(params.get("sell_oi_drop_one_candle_pct"), p.sell_oi_drop_one_candle_pct)
     p.sell_oi_drop_window_pct = _to_float(params.get("sell_oi_drop_window_pct"), p.sell_oi_drop_window_pct)
@@ -427,9 +446,7 @@ def _parse_params(params: Dict[str, Any]) -> ScrParams:
     p.sell_volume_spike_mult = _to_float(params.get("sell_volume_spike_mult"), p.sell_volume_spike_mult)
     p.sell_volume_drop_ratio = _to_float(params.get("sell_volume_drop_ratio"), p.sell_volume_drop_ratio)
     p.sell_reversal_from_max_pct = _to_float(params.get("sell_reversal_from_max_pct"), p.sell_reversal_from_max_pct)
-    # OI keys (calc vs plot)
-    # Backward-compat: if old oi_value_key is provided and new keys are missing,
-    # we use it for both calc and plot.
+
     raw_calc = params.get("oi_calc_key", None)
     raw_plot = params.get("oi_plot_key", None)
     raw_legacy = params.get("oi_value_key", None)
@@ -445,10 +462,15 @@ def _parse_params(params: Dict[str, Any]) -> ScrParams:
         p.oi_calc_key = "open_interest"
     if p.oi_plot_key not in ("open_interest_value", "open_interest"):
         p.oi_plot_key = "open_interest_value"
+
     p.enable_funding = _to_bool(params.get("enable_funding"), p.enable_funding)
     bf = params.get("buy_funding_max_pct", p.buy_funding_max_pct)
     p.buy_funding_max_pct = None if bf is None else float(_to_float(bf, -0.01))
-    p.buy_require_funding_decreasing = _to_bool(params.get("buy_require_funding_decreasing"), p.buy_require_funding_decreasing)
+    p.buy_require_funding_decreasing = _to_bool(
+        params.get("buy_require_funding_decreasing"),
+        p.buy_require_funding_decreasing,
+    )
+
     p.sell_enable_funding = _to_bool(params.get("sell_enable_funding"), p.sell_enable_funding)
     sf = params.get("sell_funding_min_pct", p.sell_funding_min_pct)
     p.sell_funding_min_pct = None if sf is None else float(_to_float(sf, 0.0))
@@ -491,7 +513,7 @@ class ScrOiBinance:
 
         base_bars = max(5, int(sp.base_minutes * 60 // td.total_seconds()))
         trig_bars = max(1, int(sp.trigger_minutes * 60 // td.total_seconds()))
-        need_bars = base_bars + trig_bars + 10  # запас
+        need_bars = base_bars + trig_bars + 10
 
         symbols_map = storage.fetch_symbols_map(exchange_id=int(exchange_id), only_active=True)
         symbols = list(symbols_map.items())
@@ -527,12 +549,12 @@ class ScrOiBinance:
         buy_fail_funding: List[Dict[str, Any]] = []
         funding_filter_disabled = False
 
-        # Distribution helpers (for tuning thresholds)
         dist_all: Dict[str, List[float]] = {
             "oi_trig": [],
             "oi_value_trig": [],
             "vol_mult": [],
-            "vol_mult_max": [], "price_trig": [],
+            "vol_mult_max": [],
+            "price_trig": [],
             "base_range": [],
             "base_ret": [],
             "base_vol_ratio": [],
@@ -541,7 +563,8 @@ class ScrOiBinance:
             "oi_trig": [],
             "oi_value_trig": [],
             "vol_mult": [],
-            "vol_mult_max": [], "price_trig": [],
+            "vol_mult_max": [],
+            "price_trig": [],
             "base_range": [],
             "base_ret": [],
             "base_vol_ratio": [],
@@ -571,7 +594,6 @@ class ScrOiBinance:
             if len(candles) < (base_bars + trig_bars + 2):
                 continue
 
-            # normalize candle ts
             for c in candles:
                 ts = _as_dt(c.get("ts"))
                 if ts is None:
@@ -603,7 +625,6 @@ class ScrOiBinance:
             if last_close < sp.min_price or last_close > sp.max_price:
                 continue
 
-            # time bounds (для OI)
             start_ts = (candles[0].get("ts") or now_ts) - td * 2
             end_ts = (candles[-1].get("ts") or now_ts) + td * 2
 
@@ -619,7 +640,6 @@ class ScrOiBinance:
             except Exception:
                 oi_series = []
 
-            # Align OI (calc key) and OI value (USDT) separately.
             oi_vals_calc = _align_series_to_candles(candles=candles, series=oi_series, value_key=sp.oi_calc_key)
             oi_vals_value = _align_series_to_candles(candles=candles, series=oi_series, value_key="open_interest_value")
             if not oi_vals_calc or oi_vals_calc[-1] is None:
@@ -629,10 +649,8 @@ class ScrOiBinance:
 
             base_oi = oi_vals_calc[-(base_bars + trig_bars):-trig_bars]
             trig_oi = oi_vals_calc[-trig_bars:]
-
             trig_oi_value = oi_vals_value[-trig_bars:] if oi_vals_value else []
 
-            # volume
             base_vol = [_candle_quote_volume(c) for c in base_slice]
             trig_vol = [_candle_quote_volume(c) for c in trig_slice]
 
@@ -643,19 +661,21 @@ class ScrOiBinance:
             base_vol_med = _safe_median(base_vol_num)
             base_vol_max = max(base_vol_num) if base_vol_num else None
             trig_vol_avg = _safe_mean(trig_vol_num)
-
             trig_vol_max = max(trig_vol_num) if trig_vol_num else None
+
             if base_vol_avg is None or base_vol_avg <= 0 or trig_vol_avg is None:
                 continue
 
             stats["vol_ok"] += 1
 
-            # Use median as a more robust baseline (less sensitive to a few spikes in the base window)
             base_vol_ref = base_vol_med if (base_vol_med is not None and base_vol_med > 0) else base_vol_avg
             trig_vol_mult = (trig_vol_avg / base_vol_ref) if (base_vol_ref is not None and base_vol_ref > 0) else None
+            trig_vol_mult_max = (
+                float(trig_vol_max) / float(base_vol_ref)
+                if (trig_vol_max is not None and base_vol_ref is not None and float(base_vol_ref) > 0)
+                else None
+            )
 
-            trig_vol_mult_max = (float(trig_vol_max) / float(base_vol_ref)) if (trig_vol_max is not None and base_vol_ref is not None and float(base_vol_ref) > 0) else None
-            # base price regime
             base_hi = [_to_float(c.get("high"), 0.0) for c in base_slice]
             base_lo = [_to_float(c.get("low"), 0.0) for c in base_slice]
             base_cl = [_to_float(c.get("close"), 0.0) for c in base_slice]
@@ -664,11 +684,11 @@ class ScrOiBinance:
             price_range_pct = _range_pct(base_vals)
             price_base_ret = _pct(base_cl[0], base_cl[-1]) if base_cl and base_cl[0] > 0 and base_cl[-1] > 0 else None
 
-            # Collect base-window distributions
             if price_range_pct is not None:
                 dist_all["base_range"].append(float(price_range_pct))
             if price_base_ret is not None:
                 dist_all["base_ret"].append(float(price_base_ret))
+
             base_vol_ratio = None
             if base_vol_med is not None and base_vol_med > 0 and base_vol_max is not None:
                 base_vol_ratio = float(base_vol_max) / float(base_vol_med)
@@ -677,13 +697,14 @@ class ScrOiBinance:
             is_sideways = (price_range_pct is not None) and (price_range_pct <= float(sp.price_sideways_max_pct))
             is_downtrend = (price_base_ret is not None) and (price_base_ret <= -abs(float(sp.price_downtrend_min_pct)))
 
-            # Base volume calmness (optional)
             base_vol_calm = True
             if sp.base_volume_max_mult is not None and base_vol_med is not None and base_vol_med > 0 and base_vol_max is not None:
                 base_vol_calm = float(base_vol_max) <= float(base_vol_med) * float(sp.base_volume_max_mult)
 
-            base_ok = (is_sideways or is_downtrend) and base_vol_calm
-            if base_ok:
+            base_ok_buy = (is_sideways or (sp.buy_allow_downtrend_base and is_downtrend)) and base_vol_calm
+            base_ok_sell = (is_sideways or is_downtrend) and base_vol_calm
+
+            if base_ok_buy or base_ok_sell:
                 stats["base_ok"] += 1
                 if price_range_pct is not None:
                     dist_base["base_range"].append(float(price_range_pct))
@@ -692,15 +713,13 @@ class ScrOiBinance:
                 if base_vol_ratio is not None:
                     dist_base["base_vol_ratio"].append(float(base_vol_ratio))
 
-            # trigger price
             trig_op = [_to_float(c.get("open"), 0.0) for c in trig_slice]
             trig_cl = [_to_float(c.get("close"), 0.0) for c in trig_slice]
 
             price_trig_ret = _pct(trig_cl[0], trig_cl[-1]) if trig_cl and trig_cl[0] > 0 and trig_cl[-1] > 0 else None
             green_cnt = sum(1 for i in range(len(trig_slice)) if trig_cl[i] >= trig_op[i])
-
             last_green = bool(trig_cl) and bool(trig_op) and (trig_cl[-1] >= trig_op[-1])
-            # OI stats
+
             base_oi_f = [float(x) for x in base_oi if x is not None]
             trig_oi_f = [float(x) for x in trig_oi if x is not None]
 
@@ -715,7 +734,6 @@ class ScrOiBinance:
             oi_value_trig_ret_last = _pct(trig_oi_value_f[0], trig_oi_value_f[-1]) if trig_oi_value_f and trig_oi_value_f[0] != 0 else None
             oi_value_trig_ret = _pct(trig_oi_value_f[0], max(trig_oi_value_f)) if trig_oi_value_f and trig_oi_value_f[0] != 0 else None
 
-            # Collect distributions (for threshold tuning)
             if oi_trig_ret is not None:
                 dist_all["oi_trig"].append(float(oi_trig_ret))
             if oi_value_trig_ret is not None:
@@ -726,7 +744,8 @@ class ScrOiBinance:
                 dist_all["vol_mult_max"].append(float(trig_vol_mult_max))
             if price_trig_ret is not None:
                 dist_all["price_trig"].append(float(price_trig_ret))
-            if base_ok:
+
+            if base_ok_buy or base_ok_sell:
                 if oi_trig_ret is not None:
                     dist_base["oi_trig"].append(float(oi_trig_ret))
                 if oi_value_trig_ret is not None:
@@ -742,7 +761,6 @@ class ScrOiBinance:
             oi_prev = trig_oi_f[-2] if len(trig_oi_f) >= 2 else None
             oi_drop_one = _pct(oi_prev, oi_last) if (oi_prev is not None and oi_prev != 0) else None
 
-            # funding (для BUY)
             funding_last = None
             funding_prev = None
             funding_pct = None
@@ -750,7 +768,7 @@ class ScrOiBinance:
             funding_ok_buy = True
             funding_ok_sell = True
 
-            if (sp.enable_funding or sp.sell_enable_funding):
+            if sp.enable_funding or sp.sell_enable_funding:
                 try:
                     funding_last, funding_prev = _fetch_last_funding_two(
                         storage=storage,
@@ -760,7 +778,6 @@ class ScrOiBinance:
                     )
                 except Exception as e:
                     msg = str(e).lower()
-                    # If funding table is missing (e.g. you removed it), gracefully disable the funding filter
                     if ("funding" in msg) and ("does not exist" in msg or "undefined table" in msg):
                         if not funding_filter_disabled:
                             log.warning("[OI] funding table not available; disable funding filter for this run")
@@ -771,7 +788,6 @@ class ScrOiBinance:
                         funding_ok_buy = True
                     else:
                         funding_last, funding_prev = None, None
-
 
                 if funding_last is None:
                     funding_ok_buy = False
@@ -793,14 +809,11 @@ class ScrOiBinance:
                         else:
                             funding_ok_buy = funding_pct <= funding_prev_pct
 
-
-            # funding (для SELL)
             if sp.sell_enable_funding:
                 if funding_pct is None:
                     funding_ok_sell = False
                 else:
                     min_pct = float(sp.sell_funding_min_pct or 0.0)
-                    # для SELL ожидаем положительный funding
                     if not (float(funding_pct) > min_pct):
                         funding_ok_sell = False
 
@@ -817,7 +830,8 @@ class ScrOiBinance:
                     "vol_mult": trig_vol_mult,
                     "vol_mult_max": trig_vol_mult_max,
                     "funding_pct": funding_pct,
-                    "base_ok": bool(base_ok),
+                    "base_ok_buy": bool(base_ok_buy),
+                    "base_ok_sell": bool(base_ok_sell),
                     "base_vol_calm": bool(base_vol_calm),
                 })
 
@@ -827,7 +841,7 @@ class ScrOiBinance:
             if mode in ("both", "buy"):
                 buy_ok = True
 
-                if not base_ok:
+                if not base_ok_buy:
                     buy_ok = False
 
                 if buy_ok:
@@ -836,7 +850,6 @@ class ScrOiBinance:
                     else:
                         stats["buy_oi_ok"] += 1
 
-                # Confirm via open_interest_value (USDT)
                 if buy_ok and (sp.oi_value_confirm_pct is not None):
                     if oi_value_trig_ret is None or oi_value_trig_ret < float(sp.oi_value_confirm_pct):
                         buy_ok = False
@@ -846,17 +859,30 @@ class ScrOiBinance:
                 if buy_ok:
                     if trig_vol_mult is None or trig_vol_mult < float(sp.buy_volume_mult):
                         buy_ok = False
-                    else:
+
+                    if buy_ok and sp.buy_require_volume_spike:
+                        if trig_vol_mult_max is None or trig_vol_mult_max < float(sp.buy_volume_spike_mult):
+                            buy_ok = False
+
+                    if buy_ok:
                         stats["buy_vol_ok"] += 1
 
                 if buy_ok:
                     buy_ok_before_price = True
+
                     if price_trig_ret is None or price_trig_ret < float(sp.buy_price_rise_pct):
                         buy_ok = False
+
+                    if buy_ok and sp.buy_price_max_rise_pct is not None:
+                        if price_trig_ret is not None and price_trig_ret > float(sp.buy_price_max_rise_pct):
+                            buy_ok = False
+
                     if green_cnt < int(sp.buy_min_green_candles):
                         buy_ok = False
+
                     if sp.buy_require_last_green and not last_green:
                         buy_ok = False
+
                     if buy_ok_before_price and (not buy_ok) and sp.debug:
                         buy_fail_price.append({
                             "symbol": symbol,
@@ -872,6 +898,7 @@ class ScrOiBinance:
 
                 if buy_ok:
                     stats["buy_price_ok"] += 1
+
                 if buy_ok and sp.enable_funding:
                     if not funding_ok_buy:
                         if sp.debug:
@@ -899,6 +926,11 @@ class ScrOiBinance:
                     if signal_ts > (now_ts + td * 0.10):
                         signal_ts = last_ts
 
+                    signal_age_min = (now_ts - signal_ts).total_seconds() / 60.0
+                    if signal_age_min > float(sp.max_signal_age_minutes):
+                        buy_ok = False
+
+                if buy_ok:
                     oi_factor = min(1.0, float(oi_trig_ret) / max(1e-9, float(sp.buy_oi_rise_pct))) if oi_trig_ret is not None else 0.0
                     vol_factor = min(1.0, float(trig_vol_mult) / max(1e-9, float(sp.buy_volume_mult))) if trig_vol_mult is not None else 0.0
                     pr_factor = min(1.0, float(price_trig_ret) / max(1e-9, float(sp.buy_price_rise_pct))) if price_trig_ret is not None else 0.0
@@ -909,6 +941,7 @@ class ScrOiBinance:
                         f"OI {oi_trig_ret:.2f}%/{sp.trigger_minutes}m",
                         (f"OI$ {oi_value_trig_ret:.2f}%" if oi_value_trig_ret is not None else "OI$ n/a"),
                         f"Vol x{trig_vol_mult:.2f}",
+                        (f"VolPeak x{trig_vol_mult_max:.2f}" if trig_vol_mult_max is not None else "VolPeak n/a"),
                         f"Price {price_trig_ret:.2f}%/{sp.trigger_minutes}m",
                     ]
                     if funding_pct is not None:
@@ -926,17 +959,21 @@ class ScrOiBinance:
                         "oi_plot_key": sp.oi_plot_key,
                         "oi_base_range_pct": oi_base_range_pct,
                         "oi_trigger_ret_pct": oi_trig_ret,
+                        "oi_trigger_ret_last_pct": oi_trig_ret_last,
                         "oi_value_trigger_ret_pct": oi_value_trig_ret,
+                        "oi_value_trigger_ret_last_pct": oi_value_trig_ret_last,
                         "oi_value_confirm_pct": sp.oi_value_confirm_pct,
                         "base_vol_avg": float(base_vol_avg),
                         "base_vol_median": float(base_vol_med) if base_vol_med is not None else None,
                         "base_vol_calm": bool(base_vol_calm),
                         "trigger_vol_avg": float(trig_vol_avg),
                         "trigger_vol_mult": float(trig_vol_mult),
+                        "trigger_vol_mult_max": float(trig_vol_mult_max) if trig_vol_mult_max is not None else None,
                         "funding_pct": funding_pct,
                         "funding_prev_pct": funding_prev_pct,
                         "funding_ts": funding_last.get("ts") if funding_last else None,
                         "funding_prev_ts": funding_prev.get("ts") if funding_prev else None,
+                        "signal_age_minutes": signal_age_min,
                     }
 
                     stats["buy_signals"] += 1
@@ -964,7 +1001,7 @@ class ScrOiBinance:
             if mode in ("both", "sell"):
                 sell_ok = True
 
-                if not base_ok:
+                if not base_ok_sell:
                     sell_ok = False
 
                 if sell_ok:
@@ -1086,8 +1123,6 @@ class ScrOiBinance:
                     if sp.debug:
                         dbg.append((symbol, oi_strength, "SELL"))
 
-
-        # Summary / diagnostics
         if sp.debug or not out:
             log.info(
                 "[OI] stats: symbols=%d candles_ok=%d oi_ok=%d vol_ok=%d base_ok=%d | "
@@ -1112,7 +1147,6 @@ class ScrOiBinance:
                 int(stats.get("sell_signals", 0)),
             )
 
-            # Percentile distributions to tune thresholds quickly
             def _dist_line(xs: List[float]) -> str:
                 p50 = _percentile(xs, 50)
                 p90 = _percentile(xs, 90)
@@ -1122,7 +1156,6 @@ class ScrOiBinance:
                 return f"p50={p50:.2f} p90={p90:.2f} p99={p99:.2f}"
 
             def _dist_line_ret(xs: List[float]) -> str:
-                # For returns it's useful to see downside tail too
                 p50 = _percentile(xs, 50)
                 p10 = _percentile(xs, 10)
                 p1 = _percentile(xs, 1)
@@ -1160,37 +1193,37 @@ class ScrOiBinance:
             )
 
         if sp.debug:
-            # Show top candidates even if no signals
             if candidates:
-                # top by OI change
                 buy_c = [c for c in candidates if c.get("oi_trig_ret_pct") is not None]
                 buy_c.sort(key=lambda x: float(x.get("oi_trig_ret_pct") or 0.0), reverse=True)
                 log.info("[OI] top OI change (trigger window):")
                 for c in buy_c[: int(sp.debug_top)]:
                     log.info(
-                        "  %s oi=%.2f%% volx=%.2f volmaxx=%.2f price=%.2f%% base_ok=%s funding=%s",
+                        "  %s oi=%.2f%% volx=%.2f volmaxx=%.2f price=%.2f%% base_ok_buy=%s funding=%s",
                         c.get("symbol"),
                         float(c.get("oi_trig_ret_pct") or 0.0),
                         float(c.get("vol_mult") or 0.0),
                         float(c.get("vol_mult_max") or 0.0),
                         float(c.get("price_trig_ret_pct") or 0.0),
-                        str(bool(c.get("base_ok"))),
+                        str(bool(c.get("base_ok_buy"))),
                         str(c.get("funding_pct")),
                     )
 
-                # top by volume multiplier
                 vol_c = [c for c in candidates if (c.get("vol_mult") is not None) or (c.get("vol_mult_max") is not None)]
-                vol_c.sort(key=lambda x: max(float(x.get("vol_mult") or 0.0), float(x.get("vol_mult_max") or 0.0)), reverse=True)
+                vol_c.sort(
+                    key=lambda x: max(float(x.get("vol_mult") or 0.0), float(x.get("vol_mult_max") or 0.0)),
+                    reverse=True,
+                )
                 log.info("[OI] top volume mult (trigger/base):")
                 for c in vol_c[: int(sp.debug_top)]:
                     log.info(
-                        "  %s volx=%.2f volmaxx=%.2f oi=%.2f%% price=%.2f%% base_ok=%s funding=%s",
+                        "  %s volx=%.2f volmaxx=%.2f oi=%.2f%% price=%.2f%% base_ok_buy=%s funding=%s",
                         c.get("symbol"),
                         float(c.get("vol_mult") or 0.0),
                         float(c.get("vol_mult_max") or 0.0),
                         float(c.get("oi_trig_ret_pct") or 0.0),
                         float(c.get("price_trig_ret_pct") or 0.0),
-                        str(bool(c.get("base_ok"))),
+                        str(bool(c.get("base_ok_buy"))),
                         str(c.get("funding_pct")),
                     )
 

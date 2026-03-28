@@ -334,6 +334,18 @@ class TradeLiquidationParams:
     hedge_reopen_anchor_shift_trigger_pct: float = 0.0
     hedge_reopen_anchor_shift_step_pct: float = 0.0
 
+    # Main add when hedge entry is too far from main entry
+    main_add_on_hedge_price_diff_enabled: bool = False
+    main_add_on_hedge_price_diff_pct: float = 20.0
+    main_add_on_hedge_price_diff_koff_lot: float = 2.0
+
+    # If main leg is closed but hedge leg survives, create a new safe LIVE main row
+    # from the surviving hedge and stop treating it as a hedge mirror.
+    hedge_promote_survivor_to_main_enabled: bool = True
+
+    # Auto recovery
+    recovery_place_trailing: bool = True
+
     # Balanced hedge / profit optimization
     hedge_unwind_enabled: bool = False
     hedge_unwind_step1_pct: float = 0.8
@@ -575,6 +587,10 @@ class TradeLiquidationParams:
         params["hedge_reopen_price_move_pct"] = float(_as_float(params.get("hedge_reopen_price_move_pct", cls().hedge_reopen_price_move_pct), cls().hedge_reopen_price_move_pct) or cls().hedge_reopen_price_move_pct)
         params["hedge_reopen_anchor_shift_trigger_pct"] = float(_as_float(params.get("hedge_reopen_anchor_shift_trigger_pct", cls().hedge_reopen_anchor_shift_trigger_pct), cls().hedge_reopen_anchor_shift_trigger_pct) or cls().hedge_reopen_anchor_shift_trigger_pct)
         params["hedge_reopen_anchor_shift_step_pct"] = float(_as_float(params.get("hedge_reopen_anchor_shift_step_pct", cls().hedge_reopen_anchor_shift_step_pct), cls().hedge_reopen_anchor_shift_step_pct) or cls().hedge_reopen_anchor_shift_step_pct)
+        params["main_add_on_hedge_price_diff_enabled"] = _as_bool(params.get("main_add_on_hedge_price_diff_enabled", cls().main_add_on_hedge_price_diff_enabled), cls().main_add_on_hedge_price_diff_enabled)
+        params["main_add_on_hedge_price_diff_pct"] = float(_as_float(params.get("main_add_on_hedge_price_diff_pct", cls().main_add_on_hedge_price_diff_pct), cls().main_add_on_hedge_price_diff_pct) or cls().main_add_on_hedge_price_diff_pct)
+        params["main_add_on_hedge_price_diff_koff_lot"] = float(_as_float(params.get("main_add_on_hedge_price_diff_koff_lot", cls().main_add_on_hedge_price_diff_koff_lot), cls().main_add_on_hedge_price_diff_koff_lot) or cls().main_add_on_hedge_price_diff_koff_lot)
+        params["hedge_promote_survivor_to_main_enabled"] = _as_bool(params.get("hedge_promote_survivor_to_main_enabled", cls().hedge_promote_survivor_to_main_enabled), cls().hedge_promote_survivor_to_main_enabled)
         params["hedge_unwind_enabled"] = _as_bool(params.get("hedge_unwind_enabled", cls().hedge_unwind_enabled), cls().hedge_unwind_enabled)
         params["hedge_unwind_step1_pct"] = float(_as_float(params.get("hedge_unwind_step1_pct", cls().hedge_unwind_step1_pct), cls().hedge_unwind_step1_pct) or cls().hedge_unwind_step1_pct)
         params["hedge_unwind_step1_share"] = float(_as_float(params.get("hedge_unwind_step1_share", cls().hedge_unwind_step1_share), cls().hedge_unwind_step1_share) or cls().hedge_unwind_step1_share)

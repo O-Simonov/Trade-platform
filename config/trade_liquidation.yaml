@@ -45,8 +45,8 @@ traders:
       # Источник сигналов (скринеры) и фильтры по сигналам
       # ======================================================
       screener_name: ["scr_liquidation_binance", "scr_oi_binance", "scr_pump_binance"]  # Какие скринеры считаются источником сигналов
-      signal_status_new: NEW                      # Какой статус сигнала считать "новым"
-      allowed_timeframes: ["5m", "15m", "1h"]    # Разрешённые таймфреймы сигналов
+      signal_status_new: NEW                     # Какой статус сигнала считать "новым"
+      allowed_timeframes: ["5m", "15m"]    # Разрешённые таймфреймы сигналов
 
       max_signal_age_minutes: 90                 # Максимальный возраст сигнала в минутах от signal_ts; увеличен, чтобы не терять редкие NEW-сигналы
       per_symbol_cooldown_minutes: 60            # Не открывать новую сделку по тому же символу, если недавно уже была сделка/попытка
@@ -91,19 +91,24 @@ traders:
 
       # --- Hedge sizing с учетом funding
       hedge_funding_kof_limit: 0.6                  # Порог funding в %, после которого разрешается корректировка размера hedge
-      hedge_koff_funding_boost: 1.5                 # Усиление hedge_koff при выгодном funding
-      hedge_koff: 0.35                              # Базовый множитель размера hedge относительно main
-      hedge_max_ratio: 0.35                         # Жесткий потолок размера hedge относительно main
+      hedge_koff_funding_boost: 1.6                 # Усиление hedge_koff при выгодном funding
+      hedge_koff: 1.0                               # Базовый множитель размера hedge относительно main
+      hedge_max_ratio: 2.0                          # Жесткий потолок размера hedge относительно main
 
-      hedge_trigger_buffer_pct: 0.3                 # Буфер для триггера открытия hedge
+      hedge_trigger_buffer_pct: 0.5                 # Буфер для триггера открытия hedge
       hedge_cooldown_sec: 180                       # Кулдаун между действиями по hedge
       hedge_reopen_enabled: true                    # Повторно открывать hedge после его закрытия
       hedge_open_only_after_max_adds: true          # Первый hedge открывать только после выполнения всех доборов main
 
       hedge_reopen_price_filter_enabled: true       # Включить повторный перезаход по цене относительно прошлого выхода hedge
-      hedge_reopen_price_move_pct: 0.3              # Для main LONG / short hedge: цена должна стать ниже anchor на 0.3%; для main SHORT / long hedge: выше на 0.3%
-      hedge_reopen_anchor_shift_trigger_pct: 1.5    # Сдвигать anchor, если цена ушла на этот % в сторону основной позиции
+      hedge_reopen_price_move_pct: 0.5              # Для main LONG / short hedge: цена должна стать ниже anchor на 0.5%; для main SHORT / long hedge: выше на 0.5%
+      hedge_reopen_anchor_shift_trigger_pct: 2.0    # Сдвигать anchor, если цена ушла на этот % в сторону основной позиции
       hedge_reopen_anchor_shift_step_pct: 1.0       # На сколько сдвигать anchor при срабатывании триггера
+
+      main_add_on_hedge_price_diff_enabled: true    # Добор main, если цена входа main слишком сильно отличается от цены входа hedge
+      main_add_on_hedge_price_diff_pct: 20.0        # Порог расхождения entry main vs hedge в процентах %
+      main_add_on_hedge_price_diff_koff_lot: 2.0    # Объем добора = текущий объем main * коэффициент
+      hedge_promote_survivor_to_main_enabled: true  # Если main закрылась, а hedge осталась открытой — создать новую safe LIVE main-позицию из surviving hedge
 
       # --- Profit optimization / balanced hedge unwind
       hedge_unwind_enabled: true                    # Частично разгружать hedge, когда цена пошла обратно в сторону main
@@ -120,8 +125,8 @@ traders:
       hedge_adaptive_enabled: true                  # Включить адаптивное усиление hedge
       hedge_adaptive_trigger_pct: 0.8               # После какого adverse move (%) начать усиливать hedge
       hedge_adaptive_step_pct: 0.8                  # Шаг adverse move (%) для дополнительного усиления
-      hedge_adaptive_boost_per_step: 0.08           # Дополнительный koff за каждый шаг adverse move
-      hedge_adaptive_max_extra_koff: 0.20           # Максимальная добавка к hedge_koff от adaptive логики
+      hedge_adaptive_boost_per_step: 0.1           # Дополнительный koff за каждый шаг adverse move
+      hedge_adaptive_max_extra_koff: 0.50           # Максимальная добавка к hedge_koff от adaptive логики
 
       # --- Защита от плохого funding по hedge, чтобы не попасть на дойку
       hedge_funding_guard_enabled: true             # Разрешить динамически сокращать hedge при токсичном funding
@@ -135,9 +140,9 @@ traders:
       # Hedge trailing
       # ======================================================
       hedge_trailing_enabled: true                  # Включить отдельный trailing для hedge
-      hedge_trailing_activation_pct: 3.0            # Активация trailing в % от средней цены входа hedge
+      hedge_trailing_activation_pct: 2.0            # Активация trailing в % от средней цены входа hedge
       hedge_trailing_trail_pct: 0.6                 # callbackRate (%) для trailing
-      hedge_trailing_activation_buffer_pct: 0.3     # Буфер от мгновенного срабатывания
+      hedge_trailing_activation_buffer_pct: 0.5     # Буфер от мгновенного срабатывания
       hedge_trailing_place_retries: 3               # Ретраи постановки hedge trailing
       hedge_trailing_working_type: MARK_PRICE       # MARK_PRICE или CONTRACT_PRICE
       hedge_trailing_reissue_on_qty_change: true    # Перевыставлять hedge trailing при изменении размера hedge-позиции
@@ -152,24 +157,24 @@ traders:
       # 0 = выключено
       # SHORT: stop = entry * (1 + pct/100)
       # LONG : stop = entry * (1 - pct/100)
-      hedge_stop_loss_pct: 3.5                      # Базовый стоп-лосс hedge в процентах от цены входа
+      hedge_stop_loss_pct: 1.5                      # Базовый стоп-лосс hedge в процентах от цены входа
 
       # ======================================================
       # Hedge SL move to Break-Even / Profit-Lock
       # Работает только если hedge_stop_loss_pct > 0
       # ======================================================
-      hedge_stop_loss_be_pct: 0.7                   # Куда переносить hedge SL после активации: процент прибыли/запаса относительно entry
-      hedge_stop_loss_be_activation_pct: 1.5        # При каком движении в прибыль активировать перенос hedge SL в BE / profit-lock
-      hedge_stop_loss_be_pct_min: 0.5               # Минимально допустимое значение hedge_stop_loss_be_pct
+      hedge_stop_loss_be_pct: 0.6                   # Куда переносить hedge SL после активации: процент прибыли/запаса относительно entry
+      hedge_stop_loss_be_activation_pct: 1.0        # При каком движении в прибыль активировать перенос hedge SL в BE / profit-lock
+      hedge_stop_loss_be_pct_min: 0.6               # Минимально допустимое значение hedge_stop_loss_be_pct
       hedge_stop_loss_be_pct_max: 5.0               # Максимально допустимое значение hedge_stop_loss_be_pct
-      hedge_stop_loss_be_activation_pct_min: 0.5    # Минимально допустимое значение hedge_stop_loss_be_activation_pct
-      hedge_stop_loss_be_activation_pct_max: 8.0    # Максимально допустимое значение hedge_stop_loss_be_activation_pct
+      hedge_stop_loss_be_activation_pct_min: 0.6    # Минимально допустимое значение hedge_stop_loss_be_activation_pct
+      hedge_stop_loss_be_activation_pct_max: 5.0    # Максимально допустимое значение hedge_stop_loss_be_activation_pct
       hedge_close_on_main_positive: false           # Закрывать hedge, если основная позиция вышла в плюс
 
       # ======================================================
       # Лимиты по позициям
       # ======================================================
-      max_open_positions: 15                        # Максимум одновременно открытых позиций
+      max_open_positions: 10                        # Максимум одновременно открытых позиций
       max_position_notional_pct_wallet: 15.0        # Ограничение notional одной позиции как % от кошелька
       risk_wallet_pct: 1.5                          # Риск на сделку от кошелька
       live_entry_reduce_on_max_position: true       # Если позиция не проходит по лимитам → уменьшать размер и пробовать снова
@@ -184,9 +189,9 @@ traders:
 
       # --- Частичная фиксация прибыли по main
       main_partial_tp_enabled: true                 # Разрешить частично фиксировать прибыль по main; при true обычный full TP по main не ставится
-      main_partial_tp1_pct: 1.8                     # Первый partial TP при движении в прибыль на 1.8% от средней цены входа main
+      main_partial_tp1_pct: 1.5                     # Первый partial TP при движении в прибыль на 1.8% от средней цены входа main
       main_partial_tp1_share: 0.30                  # Закрыть 30% позиции
-      main_partial_tp2_pct: 3.8                     # Второй partial TP при движении в прибыль на 3.8% от средней цены входа main
+      main_partial_tp2_pct: 3.0                     # Второй partial TP при движении в прибыль на 3.8% от средней цены входа main
       main_partial_tp2_share: 0.30                  # Закрыть еще 30% позиции
       main_partial_tp_cooldown_sec: 30              # Кулдаун между partial TP
       main_partial_tp_min_qty_ratio: 0.15           # Не резать позицию, если остаток станет меньше 15% от исходного
@@ -212,7 +217,7 @@ traders:
       # ======================================================
       trailing_enabled: true                        # Включить trailing по основной позиции
       trailing_activation_pct: 2.5                  # На каком профит-движении (% от средней цены входа main) активируется trailing
-      trailing_trail_pct: 0.6                       # callbackRate (%) для trailing stop по main
+      trailing_trail_pct: 0.5                       # callbackRate (%) для trailing stop по main
       trailing_activation_buffer_pct: 0.3           # Буфер к activation price, чтобы избежать мгновенного срабатывания на постановке
       tp_trigger_buffer_pct: 0.3                    # Буфер для triggerPrice TP, если full TP используется как fallback-режим без partial TP
       trailing_place_retries: 3                     # Сколько раз повторять постановку main trailing при ошибке Binance
@@ -231,7 +236,7 @@ traders:
       # ======================================================
       averaging_enabled: true                       # Разрешить доборы
       averaging_max_adds: 2                         # Максимум доборов
-      averaging_add_position_multiplier: 2.0        # Во сколько раз увеличивать позицию при ADD1
+      averaging_add_position_multiplier: 3.0        # Во сколько раз увеличивать позицию при ADD1
 
       # Построение уровней для доборов
       averaging_levels_tf: 4h                       # Таймфрейм, по которому строятся уровни для усреднения
@@ -291,7 +296,7 @@ traders:
       reconcile_auto_adjust_ledger_qty_current: true  # Автоматически выравнивать qty_current по бирже
       reconcile_adjust_only_our_positions: true     # Корректировать только позиции, созданные этим ботом
       reconcile_ignore_external_positions: true     # Игнорировать внешние позиции
-      reconcile_every_n_cycles: 3                   # Делать reconcile не каждый цикл, а раз в N циклов
+      reconcile_every_n_cycles: 2                   # Делать reconcile не каждый цикл, а раз в N циклов
       reconcile_log_diffs: true                     # Логировать найденные расхождения
       reconcile_external_log_level: debug           # Уровень логирования внешних позиций
       reconcile_binance_adds_enabled: true          # Сверять исполнения ADDn по истории Binance
@@ -309,6 +314,7 @@ traders:
       auto_recovery_enabled: true                   # Включить авто-восстановление защитных ордеров
       recovery_place_sl: true                       # Пытаться восстанавливать SL
       recovery_place_tp: true                       # Пытаться восстанавливать TP
+      recovery_place_trailing: true                 # Пытаться восстанавливать ордер активации trailing
       recovery_max_age_hours: 240                   # Не восстанавливать слишком старые позиции
 
       # ======================================================

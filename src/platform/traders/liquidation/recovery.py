@@ -530,6 +530,7 @@ class TradeLiquidationRecoveryMixin:
         if bool(getattr(self.p, "hedge_enabled", False)):
             place_sl = False
         place_tp = bool(getattr(self.p, "recovery_place_tp", True))
+        place_trailing = bool(getattr(self.p, "recovery_place_trailing", True))
         hedge_mode = bool(getattr(self.p, "hedge_enabled", False))
 
         # Open orders snapshot
@@ -1528,7 +1529,7 @@ class TradeLiquidationRecoveryMixin:
                         sym, side, pos_uid,
                     )
                     continue
-                if trailing_enabled and (not has_trl) and (not is_hedge_managed_side):
+                if place_trailing and trailing_enabled and (not has_trl) and (not is_hedge_managed_side):
                     if not _reserve_recovery_action():
                         break
                     try:

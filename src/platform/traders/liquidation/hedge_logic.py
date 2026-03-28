@@ -27,6 +27,195 @@ from .params import *
 log = logging.getLogger("traders.trade_liquidation")
 
 class TradeLiquidationHedgeLogicMixin:
+
+    def _promote_surviving_hedge_to_main_safe(self, *, hedge_pos: dict, symbol: str, symbol_id: int, pr_map: dict, open_live_symbol_keys: set | None = None) -> bool:
+        """Safely convert a surviving OPEN live_hedge leg into a new LIVE main row.
+
+        Flow:
+          1) confirm original main leg is gone on exchange and there is no OPEN LIVE row for the symbol,
+          2) cancel hedge-specific protection orders (HEDGE_TRL / HEDGE_SL),
+          3) create a brand new OPEN source='live' ledger row using the surviving hedge exchange qty/entry,
+          4) close the old mirror row so it no longer participates in hedge-specific flows.
+        """
+        if not bool(getattr(self.p, 'hedge_promote_survivor_to_main_enabled', True)):
+            return False
+        try:
+            pos_uid_old = str((hedge_pos or {}).get('pos_uid') or '').strip()
+            hedge_side = str((hedge_pos or {}).get('side') or '').upper().strip()
+            if not pos_uid_old or hedge_side not in {'LONG', 'SHORT'}:
+                return False
+            hedge_exchange = pr_map.get((symbol, hedge_side)) or {}
+            try:
+                hedge_qty = abs(float(hedge_exchange.get('positionAmt') or 0.0))
+            except Exception:
+                hedge_qty = 0.0
+            if hedge_qty <= 0.0:
+                return False
+            main_side_old = 'SHORT' if hedge_side == 'LONG' else 'LONG'
+            main_exchange = pr_map.get((symbol, main_side_old)) or {}
+            try:
+                main_qty = abs(float(main_exchange.get('positionAmt') or 0.0))
+            except Exception:
+                main_qty = 0.0
+            if main_qty > 0.0:
+                return False
+
+            symbol_key = str(symbol).upper().strip()
+            open_live_symbol_keys = open_live_symbol_keys or set()
+            if (int(symbol_id), symbol_key) in open_live_symbol_keys:
+                return False
+            existing_live = None
+            try:
+                existing_live = self.store.fetch_one(
+                    """
+                    SELECT pos_uid, side
+                      FROM position_ledger
+                     WHERE exchange_id=%s AND account_id=%s AND strategy_id=%s
+                       AND symbol_id=%s AND status='OPEN' AND COALESCE(source,'live')='live'
+                     ORDER BY updated_at DESC NULLS LAST, opened_at DESC NULLS LAST
+                     LIMIT 1
+                    """,
+                    (int(self.exchange_id), int(self.account_id), str(self.STRATEGY_ID), int(symbol_id)),
+                )
+            except Exception:
+                existing_live = None
+            if existing_live:
+                return False
+
+            raw_meta_old = (hedge_pos or {}).get('raw_meta') or {}
+            if isinstance(raw_meta_old, str):
+                try:
+                    raw_meta_old = json.loads(raw_meta_old) if raw_meta_old.strip() else {}
+                except Exception:
+                    raw_meta_old = {}
+            if not isinstance(raw_meta_old, dict):
+                raw_meta_old = {}
+
+            entry = 0.0
+            for candidate in (
+                hedge_exchange.get('entryPrice'),
+                hedge_pos.get('avg_price'),
+                hedge_pos.get('entry_price'),
+                self._get_mark_price(symbol, hedge_side),
+            ):
+                try:
+                    entry = float(candidate or 0.0)
+                except Exception:
+                    entry = 0.0
+                if entry > 0.0:
+                    break
+            if entry <= 0.0:
+                return False
+
+            try:
+                tok_old = _coid_token(pos_uid_old, n=20)
+                self._cancel_algo_by_client_id_safe(symbol, f'TL_{tok_old}_HEDGE_TRL')
+                self._cancel_algo_by_client_id_safe(symbol, f'TL_{tok_old}_HEDGE_SL')
+            except Exception:
+                log.debug('[TL][HEDGE_PROMOTE] failed to cancel hedge protection for %s %s pos_uid=%s', symbol, hedge_side, pos_uid_old, exc_info=True)
+
+            promoted_pos_uid = str(uuid.uuid4())
+            promotion_meta = {
+                'promoted_from_hedge': {
+                    'enabled': True,
+                    'old_live_hedge_pos_uid': pos_uid_old,
+                    'symbol': symbol_key,
+                    'side': hedge_side,
+                    'qty': float(hedge_qty),
+                    'entry_price': float(entry),
+                    'promoted_ts': float(time.time()),
+                }
+            }
+            merged_meta = dict(raw_meta_old)
+            merged_meta.update(promotion_meta)
+            val = float(entry * hedge_qty)
+
+            if getattr(self, '_pl_has_raw_meta', False):
+                self.store.execute(
+                    """
+                    INSERT INTO position_ledger (
+                        exchange_id, account_id, symbol_id, pos_uid,
+                        strategy_id, source, side, status, opened_at,
+                        qty_opened, qty_current, entry_price, avg_price,
+                        position_value_usdt, scale_in_count, raw_meta, updated_at
+                    ) VALUES (
+                        %(ex)s, %(acc)s, %(sym)s, %(pos_uid)s,
+                        %(sid)s, 'live', %(side)s, 'OPEN', now(),
+                        %(qty)s, %(qty)s, %(entry)s, %(entry)s,
+                        %(val)s, 0, %(meta)s::jsonb, now()
+                    )
+                    """,
+                    {
+                        'ex': int(self.exchange_id), 'acc': int(self.account_id), 'sym': int(symbol_id),
+                        'pos_uid': promoted_pos_uid, 'sid': str(self.STRATEGY_ID), 'side': hedge_side,
+                        'qty': float(hedge_qty), 'entry': float(entry), 'val': float(val), 'meta': json.dumps(merged_meta),
+                    },
+                )
+                self.store.execute(
+                    """
+                    UPDATE position_ledger
+                       SET status='CLOSED',
+                           closed_at=now(),
+                           qty_closed=CASE WHEN COALESCE(qty_closed,0) > 0 THEN qty_closed ELSE qty_current END,
+                           qty_current=0,
+                           updated_at=now(),
+                           raw_meta = COALESCE(raw_meta,'{}'::jsonb) || %(meta)s::jsonb
+                     WHERE exchange_id=%(ex)s AND account_id=%(acc)s AND symbol_id=%(sym)s AND pos_uid=%(pos_uid)s
+                    """,
+                    {
+                        'ex': int(self.exchange_id), 'acc': int(self.account_id), 'sym': int(symbol_id), 'pos_uid': pos_uid_old,
+                        'meta': json.dumps({'promotion_close': {'reason': 'surviving_hedge_promoted_to_live_main', 'new_pos_uid': promoted_pos_uid, 'closed_ts': float(time.time())}}),
+                    },
+                )
+            else:
+                self.store.execute(
+                    """
+                    INSERT INTO position_ledger (
+                        exchange_id, account_id, symbol_id, pos_uid,
+                        strategy_id, source, side, status, opened_at,
+                        qty_opened, qty_current, entry_price, avg_price,
+                        position_value_usdt, scale_in_count, updated_at
+                    ) VALUES (
+                        %(ex)s, %(acc)s, %(sym)s, %(pos_uid)s,
+                        %(sid)s, 'live', %(side)s, 'OPEN', now(),
+                        %(qty)s, %(qty)s, %(entry)s, %(entry)s,
+                        %(val)s, 0, now()
+                    )
+                    """,
+                    {
+                        'ex': int(self.exchange_id), 'acc': int(self.account_id), 'sym': int(symbol_id),
+                        'pos_uid': promoted_pos_uid, 'sid': str(self.STRATEGY_ID), 'side': hedge_side,
+                        'qty': float(hedge_qty), 'entry': float(entry), 'val': float(val),
+                    },
+                )
+                self.store.execute(
+                    """
+                    UPDATE position_ledger
+                       SET status='CLOSED',
+                           closed_at=now(),
+                           qty_closed=CASE WHEN COALESCE(qty_closed,0) > 0 THEN qty_closed ELSE qty_current END,
+                           qty_current=0,
+                           updated_at=now()
+                     WHERE exchange_id=%(ex)s AND account_id=%(acc)s AND symbol_id=%(sym)s AND pos_uid=%(pos_uid)s
+                    """,
+                    {'ex': int(self.exchange_id), 'acc': int(self.account_id), 'sym': int(symbol_id), 'pos_uid': pos_uid_old},
+                )
+
+            open_live_symbol_keys.add((int(symbol_id), symbol_key))
+            log.info(
+                '[TL][HEDGE_PROMOTE] promoted surviving hedge to LIVE main %s %s old_pos_uid=%s new_pos_uid=%s qty=%.8f entry=%.8f',
+                symbol_key,
+                hedge_side,
+                pos_uid_old,
+                promoted_pos_uid,
+                float(hedge_qty),
+                float(entry),
+            )
+            return True
+        except Exception:
+            log.exception('[TL][HEDGE_PROMOTE] failed for %s %s pos_uid=%s', symbol, str((hedge_pos or {}).get('side') or ''), str((hedge_pos or {}).get('pos_uid') or ''))
+            return False
+
     def _ensure_live_hedge_binding(self, *, base_pos: dict, symbol: str, symbol_id: int, hedge_ps: str, hedge_amt: float, hedge_entry: float, mark: float) -> str | None:
         """Ensure there is an OPEN live_hedge mirror row and hedge_links binding for an already-open hedge leg.
 
@@ -542,6 +731,343 @@ class TradeLiquidationHedgeLogicMixin:
             return True
         except Exception:
             log.exception('[TL][MAIN_PARTIAL_TP] unexpected error for %s %s', symbol, main_side)
+            return False
+
+    def _ensure_immediate_hedge_protection(self, *, base_pos: dict, symbol: str, symbol_id: int, hedge_ps: str, hedge_amt: float, hedge_entry: float, mark: float, allow_trailing: bool = True, allow_sl: bool = True) -> None:
+        """Immediately place hedge SL / hedge trailing after hedge open or re-open.
+
+        This closes the one-cycle gap where a just-opened hedge leg had no protection until
+        the next hedge manager pass or recovery loop.
+        """
+        try:
+            if float(hedge_amt or 0.0) <= 0.0:
+                return
+            if not self._has_open_position_live(symbol, str(hedge_ps).upper()):
+                return
+        except Exception:
+            return
+
+        try:
+            self._ensure_live_hedge_binding(
+                base_pos=base_pos,
+                symbol=str(symbol).upper(),
+                symbol_id=int(symbol_id),
+                hedge_ps=str(hedge_ps).upper(),
+                hedge_amt=float(hedge_amt or 0.0),
+                hedge_entry=float(hedge_entry or 0.0),
+                mark=float(mark or 0.0),
+            )
+        except Exception:
+            log.debug('[TL][HEDGE_PROTECT] ensure binding failed %s %s', symbol, hedge_ps, exc_info=True)
+
+        tok = _coid_token(str((base_pos or {}).get('pos_uid') or ''), n=20)
+
+        # --- Immediate HEDGE_TRL ---
+        try:
+            if bool(allow_trailing) and bool(getattr(self.p, 'hedge_trailing_enabled', False)):
+                cid_htrl = f'TL_{tok}_HEDGE_TRL'
+                ex_trl = self._find_known_algo_order_by_client_id(symbol, cid_htrl)
+                if ex_trl is None:
+                    close_side = 'BUY' if str(hedge_ps).upper() == 'SHORT' else 'SELL'
+                    ex_trl = self._find_semantic_open_algo(
+                        symbol,
+                        client_suffix='_HEDGE_TRL',
+                        position_side=str(hedge_ps).upper(),
+                        order_type='TRAILING_STOP_MARKET',
+                        side=close_side,
+                        close_position=False,
+                    )
+                if ex_trl is None:
+                    q = float(hedge_amt or 0.0)
+                    try:
+                        step = float(self._qty_step_for_symbol(symbol) or 0.0)
+                    except Exception:
+                        step = 0.0
+                    if step > 0.0:
+                        q = _round_qty_to_step(q, step, mode='down')
+                    if q > 0.0:
+                        act_pct = float(getattr(self.p, 'hedge_trailing_activation_pct', 1.5) or 1.5)
+                        trail_pct = float(getattr(self.p, 'hedge_trailing_trail_pct', 0.5) or 0.5)
+                        buf_pct = float(getattr(self.p, 'hedge_trailing_activation_buffer_pct', 0.25) or 0.25)
+                        work_type = str(getattr(self.p, 'hedge_trailing_working_type', 'MARK_PRICE') or 'MARK_PRICE').upper()
+                        try:
+                            tick_h = float(self._price_tick_for_symbol(symbol) or 0.0)
+                        except Exception:
+                            tick_h = 0.0
+                        hedge_entry_ref = float(hedge_entry or 0.0)
+                        if hedge_entry_ref <= 0.0:
+                            hedge_entry_ref = float(mark or 0.0)
+                        if hedge_entry_ref > 0.0:
+                            if str(hedge_ps).upper() == 'SHORT':
+                                activation = hedge_entry_ref * (1.0 - act_pct / 100.0)
+                                close_side = 'BUY'
+                                if float(mark or 0.0) > 0.0 and tick_h > 0.0:
+                                    max_act = float(mark) * (1.0 - buf_pct / 100.0)
+                                    if activation >= max_act:
+                                        activation = float(_round_price_to_tick(max_act - tick_h, tick_h, mode='down'))
+                            else:
+                                activation = hedge_entry_ref * (1.0 + act_pct / 100.0)
+                                close_side = 'SELL'
+                                if float(mark or 0.0) > 0.0 and tick_h > 0.0:
+                                    min_act = float(mark) * (1.0 + buf_pct / 100.0)
+                                    if activation <= min_act:
+                                        activation = float(_round_price_to_tick(min_act + tick_h, tick_h, mode='up'))
+                            if tick_h > 0.0:
+                                activation = float(_round_price_to_tick(activation, tick_h, mode=('down' if str(hedge_ps).upper() == 'SHORT' else 'up')))
+                                activation = float(_ensure_tp_trail_side(activation, hedge_entry_ref, tick_h, str(hedge_ps).upper(), kind='hedge_trail_activate'))
+                            resp = self._binance.new_order(
+                                symbol=symbol,
+                                side=close_side,
+                                type='TRAILING_STOP_MARKET',
+                                quantity=float(q),
+                                positionSide=str(hedge_ps).upper(),
+                                newClientOrderId=cid_htrl,
+                                activationPrice=float(activation),
+                                callbackRate=float(trail_pct),
+                                workingType=work_type,
+                            )
+                            try:
+                                self.store.upsert_algo_orders([{
+                                    'exchange_id': int(self.exchange_id),
+                                    'account_id': int(self.account_id),
+                                    'client_algo_id': str(cid_htrl),
+                                    'algo_id': str((resp or {}).get('algoId') or (resp or {}).get('orderId') or ''),
+                                    'symbol': str(symbol),
+                                    'side': str(close_side),
+                                    'position_side': str(hedge_ps).upper(),
+                                    'type': 'TRAILING_STOP_MARKET',
+                                    'quantity': float(q),
+                                    'trigger_price': float(activation),
+                                    'working_type': str(work_type),
+                                    'status': 'OPEN',
+                                    'strategy_id': str(self.STRATEGY_ID),
+                                    'pos_uid': str((base_pos or {}).get('pos_uid') or ''),
+                                    'raw_json': dict(resp or {}, **{'kind': 'HEDGE_TRL', 'placed_immediately': True}),
+                                }])
+                            except Exception:
+                                pass
+                            try:
+                                self._upsert_order_shadow(
+                                    pos_uid=str((base_pos or {}).get('pos_uid') or ''),
+                                    order_id=(resp or {}).get('orderId'),
+                                    client_order_id=cid_htrl,
+                                    symbol_id=int(symbol_id),
+                                    side=close_side,
+                                    order_type='TRAILING_STOP_MARKET',
+                                    status='NEW',
+                                    qty=float(q),
+                                    price=float(activation),
+                                    reduce_only=True,
+                                )
+                            except Exception:
+                                pass
+                            try:
+                                self._mark_local_algo_open(
+                                    cid_htrl,
+                                    symbol=symbol,
+                                    position_side=str(hedge_ps).upper(),
+                                    order_type='TRAILING_STOP_MARKET',
+                                    side=close_side,
+                                    quantity=float(q),
+                                    trigger_price=float(activation),
+                                    close_position=False,
+                                    pos_uid=str((base_pos or {}).get('pos_uid') or ''),
+                                )
+                            except Exception:
+                                pass
+                            log.info('[TL][HEDGE_TRL][IMMEDIATE] placed %s %s qty=%.8f activation=%.8f cid=%s', symbol, str(hedge_ps).upper(), float(q), float(activation), cid_htrl)
+        except Exception:
+            log.exception('[TL][HEDGE_TRL][IMMEDIATE] failed for %s %s', symbol, hedge_ps)
+
+        # --- Immediate HEDGE_SL ---
+        try:
+            hedge_sl_pct = float(getattr(self.p, 'hedge_stop_loss_pct', 0.0) or 0.0)
+            if bool(allow_sl) and hedge_sl_pct > 0.0:
+                cid_hsl = f'TL_{tok}_HEDGE_SL'
+                sl_side = 'BUY' if str(hedge_ps).upper() == 'SHORT' else 'SELL'
+                ex_hsl = self._find_known_algo_order_by_client_id(symbol, cid_hsl)
+                if ex_hsl is None:
+                    ex_hsl = self._find_semantic_open_algo(
+                        symbol,
+                        client_suffix='_HEDGE_SL',
+                        position_side=str(hedge_ps).upper(),
+                        order_type='STOP_MARKET',
+                        side=sl_side,
+                        close_position=True,
+                    )
+                if ex_hsl is None:
+                    hedge_entry_use = float(hedge_entry or 0.0)
+                    if hedge_entry_use <= 0.0:
+                        hedge_entry_use = float(mark or 0.0)
+                    if hedge_entry_use > 0.0:
+                        if str(hedge_ps).upper() == 'SHORT':
+                            stop_px = hedge_entry_use * (1.0 + hedge_sl_pct / 100.0)
+                        else:
+                            stop_px = hedge_entry_use * (1.0 - hedge_sl_pct / 100.0)
+                        sl_working_type = str(
+                            getattr(self.p, 'hedge_stop_loss_working_type', None)
+                            or getattr(self.p, 'hedge_trailing_working_type', None)
+                            or getattr(self.p, 'working_type', 'MARK_PRICE')
+                            or 'MARK_PRICE'
+                        ).upper()
+                        try:
+                            tick_safe = float(self._price_tick_for_symbol(symbol) or 0.0)
+                        except Exception:
+                            tick_safe = 0.0
+                        try:
+                            sl_buf = float(getattr(self.p, 'hedge_stop_loss_trigger_buffer_pct', 0.35) or 0.35)
+                        except Exception:
+                            sl_buf = 0.35
+                        safe_trig = float(stop_px)
+                        if float(mark or 0.0) > 0.0 and tick_safe > 0.0:
+                            if str(hedge_ps).upper() == 'SHORT':
+                                safe_trig = float(self._safe_price_above_mark(safe_trig, float(mark), tick_safe, sl_buf))
+                            else:
+                                safe_trig = float(self._safe_price_below_mark(safe_trig, float(mark), tick_safe, sl_buf))
+                        resp_sl = self._binance.new_algo_order(
+                            symbol=symbol,
+                            side=sl_side,
+                            type='STOP_MARKET',
+                            closePosition=True,
+                            workingType=sl_working_type,
+                            positionSide=str(hedge_ps).upper(),
+                            algoType='CONDITIONAL',
+                            clientAlgoId=cid_hsl,
+                            triggerPrice=self._fmt_price(symbol, safe_trig),
+                        )
+                        try:
+                            self._upsert_algo_order_shadow(resp_sl, pos_uid=str((base_pos or {}).get('pos_uid') or ''), strategy_id='trade_liquidation')
+                        except Exception:
+                            pass
+                        try:
+                            self._mark_local_algo_open(
+                                cid_hsl,
+                                symbol=symbol,
+                                position_side=str(hedge_ps).upper(),
+                                order_type='STOP_MARKET',
+                                side=sl_side,
+                                quantity=float(hedge_amt),
+                                trigger_price=float(safe_trig),
+                                close_position=True,
+                                pos_uid=str((base_pos or {}).get('pos_uid') or ''),
+                            )
+                        except Exception:
+                            pass
+                        log.info('[TL][HEDGE_SL][IMMEDIATE] placed %s %s qty=%.8f stop=%.8f cid=%s', symbol, str(hedge_ps).upper(), float(hedge_amt), float(safe_trig), cid_hsl)
+        except Exception:
+            log.exception('[TL][HEDGE_SL][IMMEDIATE] failed for %s %s', symbol, hedge_ps)
+
+    def _maybe_add_main_on_hedge_price_diff(self, *, p: dict, symbol: str, symbol_id: int, main_side: str, main_ps: str, main_amt: float, main_entry: float, hedge_ps: str, hedge_amt: float, hedge_entry: float, hedge_last_open_ts: float) -> bool:
+        """Optionally add to MAIN when hedge entry is far from main entry by configured percent.
+
+        The add is executed at most once per hedge open/reopen cycle (tracked by hedge.last_open_ts).
+        """
+        try:
+            if not bool(getattr(self.p, 'main_add_on_hedge_price_diff_enabled', False)):
+                return False
+            diff_limit_pct = abs(float(getattr(self.p, 'main_add_on_hedge_price_diff_pct', 20.0) or 0.0))
+            lot_koff = float(getattr(self.p, 'main_add_on_hedge_price_diff_koff_lot', 2.0) or 0.0)
+            if diff_limit_pct <= 0.0 or lot_koff <= 0.0:
+                return False
+            main_entry = abs(float(main_entry or 0.0))
+            hedge_entry = abs(float(hedge_entry or 0.0))
+            main_amt = abs(float(main_amt or 0.0))
+            hedge_amt = abs(float(hedge_amt or 0.0))
+            if main_entry <= 0.0 or hedge_entry <= 0.0 or main_amt <= 0.0 or hedge_amt <= 0.0:
+                return False
+
+            diff_pct = abs(hedge_entry - main_entry) / main_entry * 100.0
+            if diff_pct < diff_limit_pct:
+                return False
+
+            raw_meta = p.get('raw_meta')
+            try:
+                if isinstance(raw_meta, str):
+                    raw_meta = json.loads(raw_meta) if raw_meta.strip() else {}
+            except Exception:
+                raw_meta = {}
+            if not isinstance(raw_meta, dict):
+                raw_meta = {}
+            hedge_meta = raw_meta.get('hedge') if isinstance(raw_meta.get('hedge'), dict) else {}
+            add_meta = hedge_meta.get('main_add_on_entry_diff') if isinstance(hedge_meta.get('main_add_on_entry_diff'), dict) else {}
+
+            prev_open_ts = float(add_meta.get('last_open_ts') or 0.0) if add_meta else 0.0
+            prev_hedge_entry = float(add_meta.get('hedge_entry') or 0.0) if add_meta else 0.0
+            if hedge_last_open_ts > 0.0 and prev_open_ts >= hedge_last_open_ts:
+                return False
+            if hedge_last_open_ts <= 0.0 and prev_hedge_entry > 0.0 and abs(prev_hedge_entry - hedge_entry) <= max(hedge_entry * 1e-9, 1e-12):
+                return False
+
+            try:
+                if not hasattr(self, '_hedge_entry_diff_add_guard') or not isinstance(self._hedge_entry_diff_add_guard, dict):
+                    self._hedge_entry_diff_add_guard = {}
+                gkey = f"{str(p.get('pos_uid') or '')}:{str(hedge_ps).upper()}:{round(float(hedge_last_open_ts or 0.0), 3)}:{round(float(hedge_entry), 12)}"
+                last_ts = float(self._hedge_entry_diff_add_guard.get(gkey) or 0.0)
+                if last_ts > 0.0 and (time.time() - last_ts) < 30.0:
+                    return False
+                self._hedge_entry_diff_add_guard[gkey] = float(time.time())
+            except Exception:
+                pass
+
+            qty_step = float(self._qty_step_for_symbol(symbol) or 0.0) or 0.0
+            add_qty = float(main_amt) * float(lot_koff)
+            if qty_step > 0.0:
+                add_qty = _round_qty_to_step(add_qty, qty_step, mode='down')
+            if add_qty <= 0.0 or (qty_step > 0.0 and add_qty < qty_step):
+                return False
+
+            add_side = 'BUY' if str(main_side).upper() == 'LONG' else 'SELL'
+            resp = self._binance.new_order(
+                symbol=str(symbol).upper(),
+                side=add_side,
+                type='MARKET',
+                quantity=float(add_qty),
+                positionSide=str(main_ps).upper(),
+            )
+
+            try:
+                if getattr(self, '_pl_has_raw_meta', False):
+                    import json as _json
+                    meta = {
+                        'hedge': {
+                            'main_add_on_entry_diff': {
+                                'enabled': True,
+                                'last_ts': float(time.time()),
+                                'last_open_ts': float(hedge_last_open_ts or 0.0),
+                                'main_entry': float(main_entry),
+                                'hedge_entry': float(hedge_entry),
+                                'diff_pct': float(diff_pct),
+                                'diff_limit_pct': float(diff_limit_pct),
+                                'koff_lot': float(lot_koff),
+                                'last_qty': float(add_qty),
+                                'last_order_id': str(resp.get('orderId') or resp.get('order_id') or ''),
+                                'hedge_side': str(hedge_ps).upper(),
+                                'main_side': str(main_ps).upper(),
+                            }
+                        }
+                    }
+                    self.store.execute(
+                        """
+                        UPDATE position_ledger
+                        SET raw_meta = COALESCE(raw_meta,'{}'::jsonb) || %(meta)s::jsonb,
+                            updated_at = now()
+                        WHERE exchange_id=%(ex)s AND account_id=%(acc)s AND pos_uid=%(pos_uid)s AND status='OPEN';
+                        """,
+                        {
+                            'meta': _json.dumps(meta),
+                            'ex': int(self.exchange_id),
+                            'acc': int(self.account_id),
+                            'pos_uid': str(p.get('pos_uid')),
+                        },
+                    )
+            except Exception:
+                pass
+
+            log.info('[TL][HEDGE_DIFF_ADD] placed %s main_side=%s hedge_side=%s main_entry=%.8f hedge_entry=%.8f diff_pct=%.4f limit_pct=%.4f add_qty=%.8f koff=%.4f',
+                     str(symbol).upper(), str(main_ps).upper(), str(hedge_ps).upper(), float(main_entry), float(hedge_entry), float(diff_pct), float(diff_limit_pct), float(add_qty), float(lot_koff))
+            return True
+        except Exception:
+            log.exception('[TL][HEDGE_DIFF_ADD] failed for %s main_side=%s hedge_side=%s', str(symbol).upper(), str(main_ps).upper(), str(hedge_ps).upper())
             return False
 
     def _live_manage_hedge_funding_guard(self, *, p: dict, symbol: str, main_side: str, hedge_ps: str, hedge_amt: float, mark: float) -> bool:
@@ -1485,6 +2011,17 @@ class TradeLiquidationHedgeLogicMixin:
         checked = opened = closed = skipped = 0
         sym_map = self._symbols_map()
         _seen_main_rows = set()
+        _open_live_symbol_keys = set()
+        try:
+            for _lp in led:
+                if str(_lp.get('source') or 'live').lower().strip() != 'live':
+                    continue
+                _sid = int(_lp.get('symbol_id') or 0)
+                _sym = (sym_map.get(_sid) or '').upper().strip()
+                if _sid > 0 and _sym:
+                    _open_live_symbol_keys.add((_sid, _sym))
+        except Exception:
+            pass
 
         for p in led:
             checked += 1
@@ -1512,9 +2049,25 @@ class TradeLiquidationHedgeLogicMixin:
             # after hedge reopen/recovery (for example ETHUSDT LONG in the user's logs).
             if src_kind == "live_hedge":
                 # Auxiliary hedge mirror rows must not drive hedge-of-a-hedge logic.
-                # But if such a row is still OPEN while the opposite leg is already
-                # absent on exchange, proactively close the stale mirror here so the
-                # next invariant pass can manage the surviving real leg as the main one.
+                # If the original main leg has disappeared but this hedge leg survived,
+                # safely re-create it as a new LIVE main row and retire the mirror row.
+                promoted = False
+                try:
+                    promoted = bool(self._promote_surviving_hedge_to_main_safe(
+                        hedge_pos=p,
+                        symbol=symbol,
+                        symbol_id=symbol_id,
+                        pr_map=pr_map,
+                        open_live_symbol_keys=_open_live_symbol_keys,
+                    ))
+                except Exception:
+                    promoted = False
+                if promoted:
+                    opened += 1
+                    closed += 1
+                    skipped += 1
+                    continue
+                # If the hedge leg itself is already gone on exchange, close the stale mirror row.
                 try:
                     hedge_ps_aux = str(main_side).upper()
                     hedge_pos_aux = pr_map.get((symbol, hedge_ps_aux))
@@ -1755,6 +2308,24 @@ class TradeLiquidationHedgeLogicMixin:
                 hedge_upnl = _calc_upnl(hedge_side, hedge_entry_use, float(hedge_amt), hedge_upnl_ex)
 
             combined_upnl = float(main_upnl) + float(hedge_upnl)
+
+            try:
+                if pl_status == 'OPEN' and float(hedge_amt or 0.0) > 0.0 and float(main_amt or qty or 0.0) > 0.0:
+                    self._maybe_add_main_on_hedge_price_diff(
+                        p=p,
+                        symbol=symbol,
+                        symbol_id=int(symbol_id),
+                        main_side=str(main_side).upper(),
+                        main_ps=str(main_ps).upper(),
+                        main_amt=float(main_amt or qty or 0.0),
+                        main_entry=float(main_entry_use or entry or 0.0),
+                        hedge_ps=str(hedge_ps).upper(),
+                        hedge_amt=float(hedge_amt or 0.0),
+                        hedge_entry=float(hedge_entry_use or hedge_entry or 0.0),
+                        hedge_last_open_ts=float(hedge_last_open_ts or 0.0),
+                    )
+            except Exception:
+                pass
 
             # Profit optimizer for MAIN: partial TP before managing hedge exits/trl.
             try:
@@ -2747,18 +3318,21 @@ class TradeLiquidationHedgeLogicMixin:
                         if abs(new_anchor_px - anchor_px) > 1e-12:
                             try:
                                 if getattr(self, "_pl_has_raw_meta", False):
-                                    import json as _json
-                                    meta = {"hedge": {"reopen_anchor_px": float(new_anchor_px)}}
                                     uqm = """
                                     UPDATE position_ledger
-                                    SET raw_meta = COALESCE(raw_meta,'{}'::jsonb) || %(meta)s::jsonb,
+                                    SET raw_meta = jsonb_set(
+                                            COALESCE(raw_meta,'{}'::jsonb),
+                                            '{hedge,reopen_anchor_px}',
+                                            to_jsonb(%(anchor_px)s::double precision),
+                                            true
+                                        ),
                                         updated_at = now()
                                     WHERE exchange_id=%(ex)s AND account_id=%(acc)s AND pos_uid=%(pos_uid)s AND status='OPEN';
                                     """
                                     self.store.execute(
                                         uqm,
                                         {
-                                            "meta": _json.dumps(meta),
+                                            "anchor_px": float(new_anchor_px),
                                             "ex": int(self.exchange_id),
                                             "acc": int(self.account_id),
                                             "pos_uid": str(p.get("pos_uid")),
@@ -2875,6 +3449,41 @@ class TradeLiquidationHedgeLogicMixin:
                         pass
                     log.info("[TL][HEDGE] opened %s %s qty=%.8f (main=%s qty=%.8f) mark=%.6f sl=%.6f ema_open=%s ema_close=%s",
                              symbol, hedge_ps, float(hedge_qty), main_side, float(qty), float(mark), float(sl_price), str(ema_dir_open), str(ema_dir_close))
+
+                    # Immediately protect a freshly opened / reopened hedge leg in the same cycle.
+                    # Previously SL + HEDGE_TRL were only attached on the next manager pass,
+                    # leaving a timing window right after market entry.
+                    try:
+                        hedge_entry_now = 0.0
+                        try:
+                            hedge_entry_now = abs(float((resp or {}).get('avgPrice') or (resp or {}).get('price') or 0.0))
+                        except Exception:
+                            hedge_entry_now = 0.0
+                        if hedge_entry_now <= 0.0:
+                            try:
+                                refreshed = self._rest_snapshot_get('position_risk') or []
+                                for rr in refreshed if isinstance(refreshed, list) else []:
+                                    if str(rr.get('symbol') or '').upper() != str(symbol).upper():
+                                        continue
+                                    if str(rr.get('positionSide') or '').upper() != str(hedge_ps).upper():
+                                        continue
+                                    hedge_entry_now = abs(float(rr.get('entryPrice') or rr.get('avgEntryPrice') or 0.0))
+                                    break
+                            except Exception:
+                                hedge_entry_now = 0.0
+                        if hedge_entry_now <= 0.0:
+                            hedge_entry_now = float(mark or 0.0)
+                        self._ensure_immediate_hedge_protection(
+                            base_pos=p,
+                            symbol=str(symbol).upper(),
+                            symbol_id=int(symbol_id),
+                            hedge_ps=str(hedge_ps).upper(),
+                            hedge_amt=float(hedge_qty),
+                            hedge_entry=float(hedge_entry_now),
+                            mark=float(mark or 0.0),
+                        )
+                    except Exception:
+                        log.exception('[TL][HEDGE] immediate protection failed %s %s base_pos_uid=%s', symbol, hedge_ps, str(p.get('pos_uid') or ''))
                 except Exception as e:
                     log.exception("[TL][HEDGE] failed to open hedge for %s: %s", symbol, e)
                     skipped += 1

@@ -1,0 +1,284 @@
+# ============================================================
+# Pump Screener Config — conservative profile
+# Сделан по аналогии с conservative-профилем OI:
+# меньше сигналов, выше требования к ликвидности, подтверждению и score.
+# ============================================================
+restart_interval_minutes: 1
+
+screeners:
+  - name: "scr_pump_binance"
+    enabled: true
+    runner: "scr_pump_binance"
+    exchange: "binance"
+    market_type: "futures"
+    version: "0.2-conservative"
+
+    intervals: ["5m", "15m", "1h"]
+
+    universe:
+      enabled: true
+      quote_asset: "USDT"
+      futures_only: true
+      active_only: true
+      max_symbols: 400
+      symbols_whitelist: []
+      symbols_blacklist: []
+      min_price: 0.0000001
+      max_price: 1000
+      min_tick_size: 0.0
+
+    runtime:
+      signal_mode: "both"
+      max_signal_age_minutes: 15
+      cooldown_minutes: 45
+      max_signals_per_cycle: 12
+      sort_by: "score"
+      descending: true
+      require_fresh_last_bar: true
+      use_closed_bar_only: true
+      enable_debug_logs: true
+      debug_top: 3
+
+    windows:
+      scan_lookback_bars: 140
+      base_lookback_bars: 28
+      confirm_lookback_bars: 7
+      oi_lookback_bars: 14
+      cvd_lookback_bars: 14
+      funding_lookback_points: 1
+      atr_lookback_bars: 14
+
+    liquidity:
+      min_quote_volume_24h: 12000000
+      min_base_quote_volume: 450000
+      min_last_bar_quote_volume: 150000
+      min_notional_oi: 5000000
+      max_spread_bps: 25
+      skip_low_liquidity: true
+
+    base_quality:
+      enabled: true
+      base_range_max_pct: 6.0
+      base_noise_max_pct: 3.0
+      base_trend_abs_max_pct: 3.5
+      base_volume_max_mult: 1.8
+      base_green_red_imbalance_max: 0.60
+      require_calm_base: true
+
+    volume_filters:
+      enabled: true
+      min_volume_mult: 1.45
+      min_volume_spike_mult: 2.0
+      min_volume_acceleration: 1.10
+      require_volume_confirmation: true
+      use_median_base_volume: true
+      max_anomaly_volume_mult: 9.0
+
+    buy:
+      enabled: true
+      enable_early: true
+      enable_confirmed: true
+      window_minutes: 15
+      min_price_change_pct: 2.1
+      min_price_change_atr: 0.9
+      max_price_extension_pct: 6.5
+      min_green_candles: 3
+      require_last_bar_green: true
+      require_close_near_high: true
+      min_volume_mult: 1.55
+      min_volume_spike_mult: 2.10
+      min_volume_acceleration: 1.12
+      min_oi_delta_pct: 0.45
+      min_oi_value_delta_pct: 0.50
+      min_cvd_delta_pct: 0.10
+      require_oi_confirmation: true
+      require_cvd_confirmation: true
+      oi_up_ratio_min: 0.65
+      oi_drawdown_from_peak_min_pct: -0.25
+      breakout_lookback_bars: 24
+      require_breakout: true
+      breakout_buffer_pct: 0.20
+      allow_retest_entry: false
+      min_signal_score: 50
+      early_min_signal_score: 44
+      confirmed_min_signal_score: 58
+
+    sell:
+      enabled: true
+      enable_early: true
+      enable_confirmed: true
+      window_minutes: 24
+      min_pump_pct: 3.2
+      min_pump_atr: 1.1
+      confirm_lookforward_bars: 3
+      reversal_from_peak_pct: 0.55
+      min_red_body_pct: 0.22
+      min_upper_wick_pct: 0.10
+      require_red_confirm: true
+      require_lower_high: true
+      require_close_below_prev_close: true
+      confirm_close_position_max: 0.45
+      min_volume_mult: 1.35
+      min_volume_spike_mult: 1.75
+      require_volume_confirmation: true
+      max_oi_delta_pct: 0.10
+      max_cvd_delta_pct: 0.05
+      allow_flat_oi: false
+      require_oi_exhaustion: true
+      require_cvd_weakness: true
+      min_signal_score: 52
+      early_min_signal_score: 46
+      confirmed_min_signal_score: 60
+
+    trend_filters:
+      enabled: true
+      trend_method: "both"
+      trend_mode: "hard"
+      confirm_trend_bars: 3
+      slope_bars: 4
+      oi_eps_pct: 0.02
+      cvd_eps_pct: 0.02
+      buy_oi_slope_min_bps: 2.5
+      buy_cvd_slope_min_bps: 1.5
+      sell_oi_slope_max_bps: 0.5
+      sell_cvd_slope_max_bps: 0.25
+
+    funding:
+      enabled: true
+      mode: "hard"
+      buy_max_funding_pct: 0.010
+      sell_min_funding_pct: 0.002
+      sell_prefer_positive_funding: true
+      extreme_positive_funding_pct: 0.025
+      extreme_negative_funding_pct: -0.025
+
+    scoring:
+      enabled: true
+      clamp_each_component_0_100: true
+      normalize_total_to_100: true
+      weight_price: 0.24
+      weight_volume: 0.22
+      weight_oi: 0.22
+      weight_cvd: 0.10
+      weight_structure: 0.15
+      weight_funding: 0.04
+      weight_base_quality: 0.03
+      weak_score_threshold: 40
+      medium_score_threshold: 55
+      strong_score_threshold: 70
+      very_strong_score_threshold: 82
+
+    overheating:
+      enabled: true
+      max_price_extension_pct: 9.0
+      max_oi_spike_pct: 6.5
+      max_volume_spike_mult: 6.0
+      reject_vertical_moves: true
+      vertical_move_atr_threshold: 2.4
+
+    anti_noise:
+      enabled: true
+      min_body_to_range_ratio: 0.28
+      max_wick_to_body_ratio: 3.5
+      max_gap_pct: 2.0
+      reject_erratic_series: true
+      erratic_range_threshold_pct: 10.0
+
+    optimizer:
+      enabled: false
+      profile_name: "pump_conservative"
+      store_metrics: true
+      objective: "profit_factor"
+      min_trades: 20
+      min_win_rate_pct: 40
+      min_avg_pnl_pct: 0.12
+      penalty_for_low_sample: true
+
+    per_interval_overrides:
+      "5m":
+        runtime:
+          max_signal_age_minutes: 8
+          cooldown_minutes: 30
+        windows:
+          scan_lookback_bars: 110
+          base_lookback_bars: 22
+          confirm_lookback_bars: 5
+          oi_lookback_bars: 10
+          cvd_lookback_bars: 10
+        buy:
+          window_minutes: 6
+          min_price_change_pct: 1.8
+          min_price_change_atr: 0.75
+          min_green_candles: 3
+          min_volume_mult: 1.45
+          min_volume_spike_mult: 1.95
+          min_oi_delta_pct: 0.35
+          min_oi_value_delta_pct: 0.40
+          min_signal_score: 48
+          early_min_signal_score: 42
+          confirmed_min_signal_score: 56
+        sell:
+          window_minutes: 10
+          min_pump_pct: 2.6
+          reversal_from_peak_pct: 0.40
+          min_signal_score: 50
+          early_min_signal_score: 44
+          confirmed_min_signal_score: 58
+
+      "15m":
+        runtime:
+          max_signal_age_minutes: 15
+          cooldown_minutes: 45
+        buy:
+          window_minutes: 15
+          min_price_change_pct: 2.1
+          min_price_change_atr: 0.90
+          min_signal_score: 50
+          early_min_signal_score: 44
+          confirmed_min_signal_score: 58
+        sell:
+          window_minutes: 24
+          min_pump_pct: 3.2
+          reversal_from_peak_pct: 0.55
+          min_signal_score: 52
+          early_min_signal_score: 46
+          confirmed_min_signal_score: 60
+
+      "1h":
+        runtime:
+          max_signal_age_minutes: 90
+          cooldown_minutes: 120
+        windows:
+          scan_lookback_bars: 160
+          base_lookback_bars: 32
+          confirm_lookback_bars: 8
+          oi_lookback_bars: 16
+          cvd_lookback_bars: 16
+        liquidity:
+          min_quote_volume_24h: 18000000
+          min_base_quote_volume: 800000
+          min_last_bar_quote_volume: 250000
+          min_notional_oi: 9000000
+        buy:
+          window_minutes: 60
+          min_price_change_pct: 3.0
+          min_price_change_atr: 1.10
+          max_price_extension_pct: 5.5
+          min_green_candles: 2
+          min_volume_mult: 1.65
+          min_volume_spike_mult: 2.30
+          min_oi_delta_pct: 0.70
+          min_oi_value_delta_pct: 0.80
+          min_cvd_delta_pct: 0.15
+          min_signal_score: 56
+          early_min_signal_score: 50
+          confirmed_min_signal_score: 64
+        sell:
+          window_minutes: 90
+          min_pump_pct: 4.5
+          min_pump_atr: 1.25
+          reversal_from_peak_pct: 0.80
+          min_red_body_pct: 0.30
+          min_signal_score: 58
+          early_min_signal_score: 52
+          confirmed_min_signal_score: 66

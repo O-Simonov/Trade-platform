@@ -1,0 +1,59 @@
+﻿==============================================================================================
+
+$env:TRADE_LIQUIDATION_CONFIG="config/trade_liquidation.yaml"
+$env:LOG_LEVEL="INFO"
+python -m src.platform.run_trade_liquidation
+
+================================================================================================
+
+$env:PUMP_SCREENERS_CONFIG="config/screener_pump.yaml"
+$env:LOG_LEVEL="INFO"
+python -m src.platform.run_screener_pump
+
+================================================================================================
+
+$env:OI_SCREENERS_CONFIG="config/screener_oi.yaml"
+$env:LOG_LEVEL="INFO"
+python -m src.platform.run_screener_oi
+
+================================================================================================
+
+$env:SCREENERS_LIQUIDATION_CONFIG="config/screeners_liquidation.yaml"
+$env:LOG_LEVEL="INFO"
+python -m src.platform.run_screeners_liquidation
+
+================================================================================================
+
+$env:INSTANCES_CONFIG="config/balance_instances.yaml"
+$env:LOG_LEVEL="INFO"
+python -m src.platform.run_balance
+
+================================================================================================
+
+$env:MARKETDATA_CONFIG="config/market_data_slow.yaml"
+$env:MARKETDATA_INSTANCE="SLOW"
+$env:LOG_LEVEL="INFO"
+
+python -m src.platform.run_market_data
+
+==============================================================================================
+
+$env:MARKETDATA_CONFIG="config/market_data_fast_5m.yaml"
+$env:MARKETDATA_INSTANCE="FAST"
+$env:LOG_LEVEL="INFO"
+
+python -m src.platform.run_market_data
+
+================================================================================================
+$env:PG_DSN="host=localhost port=5432 dbname=trade_platform user=postgres sslmode=prefer connect_timeout=10"
+python -m src.platform.cli.migrate
+================================================================================================
+explorer .\artifacts\screener_plots
+================================================================================================
+$env:OI_SCREENERS_CONFIG="config/screener_oi_conservative.yaml"
+$env:LOG_LEVEL="INFO"
+python -m src.platform.run_screener_oi
+
+$env:OI_SCREENERS_CONFIG="config/screener_oi_ready.yaml"
+$env:LOG_LEVEL="INFO"
+python -m src.platform.run_screener_oi

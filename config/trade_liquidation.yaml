@@ -213,7 +213,7 @@ traders:
       client_order_id_prefix: TL                    # Префикс clientOrderId
       enable_stop_loss: true                        # Включить постановку SL
       defer_stop_loss_until_last_add: true          # Не ставить обычный SL сразу, пока не будут выполнены все доборы; на main trailing это больше не влияет
-      sl_after_last_add_distance_pct: 2.0           # Дистанция SL после последнего добора, если включён отложенный SL
+      sl_after_last_add_distance_pct: 5.0           # Дистанция SL после последнего добора, если включён отложенный SL
 
       # ======================================================
       # Main trailing stop

@@ -680,25 +680,37 @@ class TradeLiquidationOrderBuilderMixin:
         return None
 
     def _safe_price_above_mark(self, price: float, mark: float, tick: float, buffer_pct: float = 0.2) -> float:
-        """Force price to be ABOVE current mark by buffer_pct (percent)."""
+        """Force price to be safely ABOVE current mark by buffer_pct (percent)."""
         p = float(price or 0.0)
         m = float(mark or 0.0)
-        buf = max(0.0, float(buffer_pct or 0.0) / 100.0)
-        if m > 0 and buf > 0:
-            p = max(p, m * (1.0 + buf))
-        if tick and tick > 0:
-            p = _round_price_to_tick(p, float(tick), mode="up")
+        t = float(tick or 0.0)
+        # Keep at least 0.20% away from mark; cheap symbols often need a bit more than 1 tick.
+        buf = max(float(buffer_pct or 0.0) / 100.0, 0.0020)
+        if m > 0:
+            floor = m * (1.0 + buf)
+            p = max(p, floor)
+            if t > 0:
+                p = max(p, floor + t)
+                p = _round_price_to_tick(p, t, mode="up")
+        elif t > 0:
+            p = _round_price_to_tick(p, t, mode="up")
         return float(p)
 
     def _safe_price_below_mark(self, price: float, mark: float, tick: float, buffer_pct: float = 0.2) -> float:
-        """Force price to be BELOW current mark by buffer_pct (percent)."""
+        """Force price to be safely BELOW current mark by buffer_pct (percent)."""
         p = float(price or 0.0)
         m = float(mark or 0.0)
-        buf = max(0.0, float(buffer_pct or 0.0) / 100.0)
-        if m > 0 and buf > 0:
-            p = min(p, m * (1.0 - buf))
-        if tick and tick > 0:
-            p = _round_price_to_tick(p, float(tick), mode="down")
+        t = float(tick or 0.0)
+        # Keep at least 0.20% away from mark; cheap symbols often need a bit more than 1 tick.
+        buf = max(float(buffer_pct or 0.0) / 100.0, 0.0020)
+        if m > 0:
+            ceil = m * (1.0 - buf)
+            p = min(p if p > 0 else ceil, ceil)
+            if t > 0:
+                p = min(p, ceil - t)
+                p = _round_price_to_tick(p, t, mode="down")
+        elif t > 0:
+            p = _round_price_to_tick(p, t, mode="down")
         return float(p)
 
     def _live_refresh_scale_in_count(self, *, pos_uid: str, prefix: str, sym: str, pos_side: str) -> int:

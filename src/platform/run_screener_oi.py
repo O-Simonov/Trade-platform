@@ -165,6 +165,54 @@ def _fetch_existing_signal_pairs(
     return out
 
 
+def _allocate_day_seqs_batch(
+    store: PostgreSQLStorage,
+    *,
+    exchange_id: int,
+    screener_id: int,
+    signals: List[ScreenerSignal],
+) -> Dict[Tuple[int, date], List[int]]:
+    if not signals:
+        return {}
+
+    grouped: Dict[Tuple[int, date], int] = {}
+    for s in signals:
+        key = (int(s.symbol_id), s.signal_ts.date())
+        grouped[key] = grouped.get(key, 0) + 1
+
+    items = sorted(grouped.items(), key=lambda kv: (kv[0][0], kv[0][1]))
+    values_sql = ",".join(["(%s,%s,%s,%s,%s)"] * len(items))
+    sql = f"""
+    WITH req(exchange_id, symbol_id, screener_id, signal_day, inc) AS (
+        VALUES {values_sql}
+    ), upsert AS (
+        INSERT INTO public.signals_day_seq (exchange_id, symbol_id, screener_id, signal_day, last_seq)
+        SELECT exchange_id, symbol_id, screener_id, signal_day, inc
+        FROM req
+        ON CONFLICT (exchange_id, symbol_id, screener_id, signal_day)
+        DO UPDATE SET last_seq = public.signals_day_seq.last_seq + EXCLUDED.last_seq
+        RETURNING symbol_id, signal_day, last_seq
+    )
+    SELECT symbol_id, signal_day, last_seq
+    FROM upsert
+    """
+    params: List[Any] = []
+    for (symbol_id, signal_day), inc in items:
+        params.extend([int(exchange_id), int(symbol_id), int(screener_id), signal_day, int(inc)])
+
+    ranges: Dict[Tuple[int, date], List[int]] = {}
+    with store.pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            for symbol_id, signal_day, last_seq in cur.fetchall() or []:
+                key = (int(symbol_id), signal_day)
+                inc = grouped[key]
+                start_seq = int(last_seq) - int(inc) + 1
+                ranges[key] = list(range(start_seq, int(last_seq) + 1))
+        conn.commit()
+    return ranges
+
+
 def _insert_signals_safe(store: PostgreSQLStorage, rows: List[Dict[str, Any]]) -> int:
     if not rows:
         return 0
@@ -218,8 +266,9 @@ def _build_signal_line(s: ScreenerSignal) -> str:
     pr_ret = ctx.get("price_trigger_ret_pct")
     fund = ctx.get("funding_pct")
 
+    label = str(ctx.get("signal_label") or ctx.get("signal_profile") or s.side).upper()
     return (
-        f"{s.symbol} {s.side}  entry={_fmt_f(s.entry_price, 6)}  "
+        f"{s.symbol} {label}  entry={_fmt_f(s.entry_price, 6)}  "
         f"SL={_fmt_f(s.stop_loss, 6)}  TP={_fmt_f(s.take_profit, 6)}\n"
         f"  OI={_fmt_f(oi_ret, 2)}%/{ctx.get('trigger_minutes','?')}m  "
         f"Vol x{_fmt_f(vol_mult, 2)}  Price={_fmt_f(pr_ret, 2)}%  Funding={_fmt_f(fund, 4)}%"
@@ -387,14 +436,17 @@ def run_once(store: PostgreSQLStorage, screener_cfg: dict) -> None:
             total_new = len(new_signals)
 
             rows: List[Dict[str, Any]] = []
+            day_seq_ranges = _allocate_day_seqs_batch(
+                store,
+                exchange_id=exchange_id,
+                screener_id=screener_id,
+                signals=new_signals,
+            )
             for s in new_signals:
                 signal_day = s.signal_ts.date()
-                day_seq = store.next_signal_seq(
-                    exchange_id=exchange_id,
-                    symbol_id=s.symbol_id,
-                    screener_id=screener_id,
-                    signal_day=signal_day,
-                )
+                seq_key = (int(s.symbol_id), signal_day)
+                seq_list = day_seq_ranges.get(seq_key) or [1]
+                day_seq = seq_list.pop(0)
 
                 rows.append(
                     {
@@ -424,6 +476,8 @@ def run_once(store: PostgreSQLStorage, screener_cfg: dict) -> None:
 
             if inserted > 0 and (tg_send_messages or tg_send_plots):
                 targets = _resolve_telegram_targets(params)
+                plot_candles_cache: Dict[Tuple[int, str, str], List[Dict[str, Any]]] = {}
+                plot_oi_cache: Dict[Tuple[int, str, str], List[Dict[str, Any]]] = {}
 
                 if tg_send_messages:
                     msg = _build_telegram_message(name=name, interval=interval, signals=new_signals)
@@ -449,25 +503,32 @@ def run_once(store: PostgreSQLStorage, screener_cfg: dict) -> None:
 
                         center = s.signal_ts
                         lookback = max(50, int(params_i.get("plot_lookback_bars", plot_lookback_bars)))
-                        candles = store.fetch_candles_window(
-                            exchange_id=int(exchange_id),
-                            symbol_id=int(s.symbol_id),
-                            interval=str(interval),
-                            center_ts=center,
-                            lookback=lookback,
-                            lookforward=0,
-                        ) or []
+                        cache_key = (int(s.symbol_id), str(interval), center.isoformat())
+                        candles = plot_candles_cache.get(cache_key)
+                        if candles is None:
+                            candles = store.fetch_candles_window(
+                                exchange_id=int(exchange_id),
+                                symbol_id=int(s.symbol_id),
+                                interval=str(interval),
+                                center_ts=center,
+                                lookback=lookback,
+                                lookforward=0,
+                            ) or []
+                            plot_candles_cache[cache_key] = candles
 
                         start_ts = center - td * lookback
                         end_ts = center + td * 2
-                        oi_rows = _fetch_oi_series(
-                            store,
-                            exchange_id=exchange_id,
-                            symbol_id=int(s.symbol_id),
-                            interval=interval,
-                            start_ts=start_ts,
-                            end_ts=end_ts,
-                        )
+                        oi_rows = plot_oi_cache.get(cache_key)
+                        if oi_rows is None:
+                            oi_rows = _fetch_oi_series(
+                                store,
+                                exchange_id=exchange_id,
+                                symbol_id=int(s.symbol_id),
+                                interval=interval,
+                                start_ts=start_ts,
+                                end_ts=end_ts,
+                            )
+                            plot_oi_cache[cache_key] = oi_rows
                         oi_series = []
                         for r in oi_rows:
                             ts = r.get("ts")

@@ -444,6 +444,7 @@ def save_pump_plot(
     base_lookback_bars: Optional[int] = None,
     # retention
     keep_plots_days: Optional[int] = None,
+    screener_name: Optional[str] = None,
 ) -> None:
     if not candles:
         return
@@ -598,7 +599,11 @@ def save_pump_plot(
         if x_e is not None:
             _draw_entry(ax_price, signal_ts=x_e, entry_price=ep, side=side)
 
-    ax_price.set_title(f"{symbol} | {timeframe} | {side_u} | ΔP={_fmt_pct(price_change_pct)}%")
+    title_parts = []
+    if screener_name:
+        title_parts.append(str(screener_name))
+    title_parts.extend([str(symbol), str(timeframe), str(side_u), f"ΔP={_fmt_pct(price_change_pct)}%"] )
+    ax_price.set_title(" | ".join(title_parts))
     ax_price.grid(True, alpha=0.15)
 
     # -------------------------
@@ -693,6 +698,7 @@ def save_pump_signal_plot(
     base_avg_price: Optional[float] = None,
     base_lookback_bars: Optional[int] = None,
     keep_plots_days: Optional[int] = None,
+    screener_name: Optional[str] = None,
 ) -> None:
     save_pump_plot(
         out_path=out_path,
@@ -715,4 +721,5 @@ def save_pump_signal_plot(
         base_avg_price=base_avg_price,
         base_lookback_bars=base_lookback_bars,
         keep_plots_days=keep_plots_days,
+        screener_name=screener_name,
     )

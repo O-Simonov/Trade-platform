@@ -28,6 +28,10 @@ _INTERVAL_SEC: Dict[str, int] = {
 
 _ALLOWED_INTERVALS = set(_INTERVAL_SEC.keys())
 
+# Binance openInterestHist supports only a limited recent history window.
+# Keep a small safety margin under the documented limit to avoid HTTP 400 / code -1130.
+_OI_HIST_MAX_LOOKBACK_DAYS = 29
+
 
 # -------------------------
 # helpers
@@ -43,6 +47,39 @@ def _ms(dt: datetime) -> int:
 
 def _dt_from_ms(ms: int) -> datetime:
     return datetime.fromtimestamp(int(ms) / 1000.0, tz=timezone.utc)
+
+
+def _clamp_oi_hist_window(
+    *,
+    start_time_ms: Optional[int],
+    end_time_ms: Optional[int],
+    now_dt: Optional[datetime] = None,
+) -> Tuple[Optional[int], Optional[int]]:
+    """
+    Clamp openInterestHist window to the recent history horizon accepted by Binance.
+
+    Binance may reject too old startTime with HTTP 400 / code -1130.
+    We keep a small safety margin and ensure start < end when both are present.
+    """
+    now_dt = now_dt or _utcnow()
+    min_allowed_dt = now_dt - timedelta(days=_OI_HIST_MAX_LOOKBACK_DAYS)
+    min_allowed_ms = _ms(min_allowed_dt)
+
+    st = int(start_time_ms) if start_time_ms is not None else None
+    et = int(end_time_ms) if end_time_ms is not None else None
+
+    if st is not None and st < min_allowed_ms:
+        st = min_allowed_ms
+
+    # If endTime is older than the allowed horizon, clamp it too.
+    if et is not None and et < min_allowed_ms:
+        et = min_allowed_ms
+
+    # Invalid or empty window -> drop startTime and rely on recent tail by limit/endTime.
+    if st is not None and et is not None and st >= et:
+        st = None
+
+    return st, et
 
 
 def _safe_float(x: Any) -> float:
@@ -473,43 +510,74 @@ class BinanceOpenInterestCollector:
     ) -> List[dict]:
         """
         Expected endpoint: GET /futures/data/openInterestHist
+
+        Safety:
+        - clamp too old startTime/endTime to Binance-supported recent horizon
+        - fallback without startTime on HTTP 400 / code -1130
         """
         self._rate_acquire()
 
-        # Most common naming in connectors: open_interest_hist / get_open_interest_hist
-        if hasattr(self.rest, "get_open_interest_hist"):
-            return self.rest.get_open_interest_hist(
-                symbol=symbol,
-                period=interval,
-                limit=int(limit),
-                endTime=end_time_ms,
-                startTime=start_time_ms,
-            ) or []
+        start_time_ms, end_time_ms = _clamp_oi_hist_window(
+            start_time_ms=start_time_ms,
+            end_time_ms=end_time_ms,
+        )
 
-        if hasattr(self.rest, "open_interest_hist"):
-            return self.rest.open_interest_hist(
-                symbol=symbol,
-                period=interval,
-                limit=int(limit),
-                endTime=end_time_ms,
-                startTime=start_time_ms,
-            ) or []
-
-        # Try a generic call style if user wrapped REST:
-        if hasattr(self.rest, "open_interest"):
-            try:
-                return self.rest.open_interest(
+        def _call(*, st_ms: Optional[int], et_ms: Optional[int]) -> List[dict]:
+            # Most common naming in connectors: open_interest_hist / get_open_interest_hist
+            if hasattr(self.rest, "get_open_interest_hist"):
+                return self.rest.get_open_interest_hist(
                     symbol=symbol,
                     period=interval,
                     limit=int(limit),
-                    endTime=end_time_ms,
-                    startTime=start_time_ms,
+                    endTime=et_ms,
+                    startTime=st_ms,
                 ) or []
-            except TypeError:
-                # probably "present open interest" endpoint, not statistics
-                raise RuntimeError("REST.open_interest exists but doesn't support statistics params (period/startTime/endTime)")
 
-        raise RuntimeError("REST has no open interest history method")
+            if hasattr(self.rest, "open_interest_hist"):
+                return self.rest.open_interest_hist(
+                    symbol=symbol,
+                    period=interval,
+                    limit=int(limit),
+                    endTime=et_ms,
+                    startTime=st_ms,
+                ) or []
+
+            # Try a generic call style if user wrapped REST:
+            if hasattr(self.rest, "open_interest"):
+                try:
+                    return self.rest.open_interest(
+                        symbol=symbol,
+                        period=interval,
+                        limit=int(limit),
+                        endTime=et_ms,
+                        startTime=st_ms,
+                    ) or []
+                except TypeError:
+                    # probably "present open interest" endpoint, not statistics
+                    raise RuntimeError("REST.open_interest exists but doesn't support statistics params (period/startTime/endTime)")
+
+            raise RuntimeError("REST has no open interest history method")
+
+        try:
+            return _call(st_ms=start_time_ms, et_ms=end_time_ms)
+        except Exception as e:
+            payload = getattr(e, "payload", None) or {}
+            msg = str(payload.get("msg") or e)
+            code = payload.get("code")
+            is_invalid_start = (code == -1130) or ("starttime" in msg.lower() and "invalid" in msg.lower())
+
+            # Fallback: request the recent tail without startTime. This lets the collector
+            # recover from stale watermarks and gradually advance them into the valid window.
+            if is_invalid_start and start_time_ms is not None:
+                self.logger.warning(
+                    "[OI] invalid startTime fallback sym=%s interval=%s start_ms=%s end_ms=%s",
+                    symbol,
+                    interval,
+                    start_time_ms,
+                    end_time_ms,
+                )
+                return _call(st_ms=None, et_ms=end_time_ms)
+            raise
 
     def _symbol_name(self, symbol_id: int) -> Optional[str]:
         sym = self._symbol_id_to_symbol.get(int(symbol_id))

@@ -117,6 +117,28 @@ def _safe_float(v: Any, default: float = 0.0) -> float:
 def _as_float(v: Any, default: float = 0.0) -> float:
     return _safe_float(v, default)
 
+
+def _cap_qty_by_wallet_notional(*, qty: float, wallet_balance_usdt: float, price: float, cap_pct_wallet: float, qty_step: float = 0.0, leverage: float = 1.0) -> float:
+    """Cap quantity by wallet notional percentage with optional leverage multiplier.
+
+    Effective max notional = wallet_balance_usdt * leverage * (cap_pct_wallet / 100).
+    Returns original qty when cap is disabled.
+    """
+    q = _safe_float(qty, 0.0)
+    wallet = _safe_float(wallet_balance_usdt, 0.0)
+    px = _safe_float(price, 0.0)
+    cap_pct = _safe_float(cap_pct_wallet, 0.0)
+    lev = max(1.0, _safe_float(leverage, 1.0))
+    if q <= 0.0 or wallet <= 0.0 or px <= 0.0 or cap_pct <= 0.0:
+        return q
+    max_notional = wallet * lev * (cap_pct / 100.0)
+    if max_notional <= 0.0:
+        return q
+    max_qty = max_notional / px
+    if qty_step and qty_step > 0:
+        max_qty = _round_qty_to_step(max_qty, qty_step, mode="down")
+    return min(q, max(0.0, float(max_qty)))
+
 def _as_int(v: Any, default: Optional[int] = None) -> Optional[int]:
     try:
         if v in (None, ""):
@@ -282,6 +304,9 @@ class TradeLiquidationParams:
     # --- position limits
     max_open_positions: int = 5
     max_position_notional_pct_wallet: float = 50.0  # anti-overload cap per position
+    averaging_add_max_notional_pct_wallet: float = 0.0  # 0=OFF; caps one averaging add notional vs wallet*leverage
+    main_position_max_notional_pct_wallet: float = 0.0  # 0=OFF; caps total MAIN leg notional vs wallet*leverage after adds
+    hedge_position_max_notional_pct_wallet: float = 0.0  # 0=OFF; caps total HEDGE leg notional vs wallet*leverage
 
     # --- risk / SLTP
     risk_wallet_pct: float = 1.0
@@ -552,6 +577,9 @@ class TradeLiquidationParams:
         params["account_id"] = _as_int(params.get("account_id"), None)
 
         params["max_open_positions"] = int(_as_int(params.get("max_open_positions"), cls().max_open_positions) or cls().max_open_positions)
+        params["averaging_add_max_notional_pct_wallet"] = float(_as_float(params.get("averaging_add_max_notional_pct_wallet", cls().averaging_add_max_notional_pct_wallet), cls().averaging_add_max_notional_pct_wallet) or 0.0)
+        params["main_position_max_notional_pct_wallet"] = float(_as_float(params.get("main_position_max_notional_pct_wallet", cls().main_position_max_notional_pct_wallet), cls().main_position_max_notional_pct_wallet) or 0.0)
+        params["hedge_position_max_notional_pct_wallet"] = float(_as_float(params.get("hedge_position_max_notional_pct_wallet", cls().hedge_position_max_notional_pct_wallet), cls().hedge_position_max_notional_pct_wallet) or 0.0)
         params["max_signal_age_minutes"] = int(_as_int(params.get("max_signal_age_minutes"), cls().max_signal_age_minutes) or cls().max_signal_age_minutes)
         params["per_symbol_cooldown_minutes"] = int(_as_int(params.get("per_symbol_cooldown_minutes"), cls().per_symbol_cooldown_minutes) or cls().per_symbol_cooldown_minutes)
 
@@ -747,4 +775,5 @@ __all__ = [
     "_ensure_paper_tables",
     "_has_column",
     "_tl_norm_list",
+    "_cap_qty_by_wallet_notional",
 ]

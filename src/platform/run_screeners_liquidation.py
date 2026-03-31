@@ -6,9 +6,10 @@ import os
 import re
 import shutil
 import time
+from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, DefaultDict, Dict, List, Optional, Sequence, Set, Tuple
 
 import yaml
 from psycopg.errors import UniqueViolation
@@ -19,11 +20,7 @@ from src.platform.config.env import (
     get_pg_dsn,
     require,
 )
-from src.platform.core.utils.candles import (
-    aggregate_candles,
-    interval_to_timedelta,
-    slice_window,
-)
+from src.platform.core.utils.candles import interval_to_timedelta
 from src.platform.data.storage.postgres.pool import create_pool
 from src.platform.data.storage.postgres.storage import PostgreSQLStorage
 from src.platform.notifications.telegram import (
@@ -274,6 +271,271 @@ def _build_interval_liq_pairs(params: Dict[str, Any]) -> List[Tuple[str, Optiona
     return out
 
 
+def _ts_key(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    return dt.replace(microsecond=0)
+
+
+def _parse_interval_td(interval: str) -> timedelta:
+    s = str(interval).strip().lower()
+    if s.endswith("m"):
+        return timedelta(minutes=int(s[:-1]))
+    if s.endswith("h"):
+        return timedelta(hours=int(s[:-1]))
+    if s.endswith("d"):
+        return timedelta(days=int(s[:-1]))
+    return timedelta(hours=1)
+
+
+def _preload_candles_live(
+    store: PostgreSQLStorage,
+    *,
+    exchange_id: int,
+    symbol_ids: Sequence[int],
+    intervals: Sequence[str],
+    start_ts: datetime,
+    end_ts: datetime,
+) -> Tuple[Dict[Tuple[int, str], List[Dict[str, Any]]], Dict[Tuple[int, str], List[datetime]]]:
+    if not symbol_ids or not intervals:
+        return {}, {}
+    q = """
+        SELECT symbol_id, interval, open_time AS ts, open, high, low, close, volume, quote_volume
+        FROM candles
+        WHERE exchange_id = %s
+          AND symbol_id = ANY(%s)
+          AND interval = ANY(%s)
+          AND open_time >= %s
+          AND open_time <= %s
+        ORDER BY symbol_id ASC, interval ASC, open_time ASC
+    """
+    out: DefaultDict[Tuple[int, str], List[Dict[str, Any]]] = defaultdict(list)
+    with store.pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(q, (int(exchange_id), list(symbol_ids), list(intervals), start_ts, end_ts))
+            for symbol_id, interval, ts, open_, high, low, close, volume, quote_volume in cur.fetchall():
+                key = (int(symbol_id), str(interval))
+                out[key].append({
+                    "ts": _ts_key(ts),
+                    "open": float(open_ or 0.0),
+                    "high": float(high or 0.0),
+                    "low": float(low or 0.0),
+                    "close": float(close or 0.0),
+                    "volume": float(volume or 0.0),
+                    "quote_volume": float(quote_volume or 0.0),
+                })
+    ts_index = {k: [row["ts"] for row in v] for k, v in out.items()}
+    return dict(out), ts_index
+
+
+def _preload_funding_live(
+    store: PostgreSQLStorage,
+    *,
+    exchange_id: int,
+    symbol_ids: Sequence[int],
+    start_ts: datetime,
+    end_ts: datetime,
+) -> Tuple[Dict[int, List[Tuple[datetime, float]]], Dict[int, List[datetime]]]:
+    if not symbol_ids:
+        return {}, {}
+    q = """
+        SELECT symbol_id, funding_time, funding_rate
+        FROM funding
+        WHERE exchange_id = %s
+          AND symbol_id = ANY(%s)
+          AND funding_time >= %s
+          AND funding_time <= %s
+        ORDER BY symbol_id ASC, funding_time ASC
+    """
+    out: DefaultDict[int, List[Tuple[datetime, float]]] = defaultdict(list)
+    with store.pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(q, (int(exchange_id), list(symbol_ids), start_ts, end_ts))
+            for symbol_id, funding_time, funding_rate in cur.fetchall():
+                out[int(symbol_id)].append((_ts_key(funding_time), float(funding_rate or 0.0)))
+    idx = {sid: [ts for ts, _ in series] for sid, series in out.items()}
+    return dict(out), idx
+
+
+def _preload_liquidations_live(
+    store: PostgreSQLStorage,
+    *,
+    exchange_id: int,
+    symbol_ids: Sequence[int],
+    start_ts: datetime,
+    end_ts: datetime,
+    interval: str,
+) -> Dict[Tuple[int, datetime], Dict[str, float]]:
+    if not symbol_ids:
+        return {}
+    q = """
+        SELECT symbol_id, bucket_ts, long_notional, short_notional
+        FROM liquidation_1m
+        WHERE exchange_id = %s
+          AND symbol_id = ANY(%s)
+          AND bucket_ts >= %s
+          AND bucket_ts <= %s
+        ORDER BY symbol_id ASC, bucket_ts ASC
+    """
+    delta = _parse_interval_td(interval)
+    sec = int(max(delta.total_seconds(), 60.0))
+    out: DefaultDict[Tuple[int, datetime], Dict[str, float]] = defaultdict(lambda: {"long": 0.0, "short": 0.0, "total": 0.0})
+    with store.pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(q, (int(exchange_id), list(symbol_ids), start_ts, end_ts))
+            for symbol_id, bucket_ts, long_n, short_n in cur.fetchall():
+                ts = _ts_key(bucket_ts)
+                epoch = int(ts.timestamp())
+                floored = datetime.fromtimestamp(epoch - (epoch % sec), tz=timezone.utc)
+                key = (int(symbol_id), floored)
+                rec = out[key]
+                long_v = float(long_n or 0.0)
+                short_v = float(short_n or 0.0)
+                rec["long"] += long_v
+                rec["short"] += short_v
+                rec["total"] += long_v + short_v
+    return dict(out)
+
+
+def _build_liq_histories_live(
+    *,
+    liq_by_symbol_bucket: Dict[Tuple[int, datetime], Dict[str, float]],
+    interval: str,
+    lookback: int,
+) -> Dict[Tuple[int, str, datetime, int], List[float]]:
+    lookback = max(0, int(lookback))
+    if lookback <= 1:
+        return {}
+    delta = _parse_interval_td(interval)
+    by_symbol: DefaultDict[int, Dict[datetime, float]] = defaultdict(dict)
+    for (symbol_id, ts), rec in liq_by_symbol_bucket.items():
+        by_symbol[int(symbol_id)][ts] = float(rec.get("total") or 0.0)
+    out: Dict[Tuple[int, str, datetime, int], List[float]] = {}
+    for symbol_id, bucket_map in by_symbol.items():
+        for ts in sorted(bucket_map.keys()):
+            series: List[float] = []
+            cur = ts - delta * (lookback - 1)
+            for _ in range(lookback):
+                series.append(float(bucket_map.get(cur, 0.0)))
+                cur += delta
+            out[(int(symbol_id), str(interval), ts, lookback)] = series
+    return out
+
+
+def _preload_current_prices_live(
+    store: PostgreSQLStorage,
+    *,
+    exchange_id: int,
+    symbol_ids: Sequence[int],
+    interval: str,
+    as_of_ts: Optional[datetime],
+) -> Dict[int, float]:
+    if not symbol_ids:
+        return {}
+    if as_of_ts is None:
+        q = """
+            SELECT DISTINCT ON (symbol_id) symbol_id, last_price
+            FROM public.ticker_24h
+            WHERE exchange_id = %s
+              AND symbol_id = ANY(%s)
+            ORDER BY symbol_id ASC, close_time DESC
+        """
+        with store.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(q, (int(exchange_id), list(symbol_ids)))
+                return {int(symbol_id): float(last_price) for symbol_id, last_price in cur.fetchall() if last_price is not None}
+
+    q = """
+        SELECT DISTINCT ON (symbol_id) symbol_id, close
+        FROM candles
+        WHERE exchange_id = %s
+          AND symbol_id = ANY(%s)
+          AND interval = %s
+          AND open_time <= %s
+        ORDER BY symbol_id ASC, open_time DESC
+    """
+    with store.pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(q, (int(exchange_id), list(symbol_ids), str(interval), _ensure_dt_utc(as_of_ts) or _utc_now()))
+            return {int(symbol_id): float(close) for symbol_id, close in cur.fetchall() if close is not None}
+
+
+def _build_runtime_context_live(
+    store: PostgreSQLStorage,
+    *,
+    exchange_id: int,
+    symbols: List[Dict[str, Any]],
+    interval: str,
+    params_i: Dict[str, Any],
+) -> Dict[str, Any]:
+    symbol_ids = [int(x["symbol_id"]) for x in symbols]
+    if not symbol_ids:
+        return {"symbols": []}
+
+    as_of_ts = _ensure_dt_utc(params_i.get("as_of_ts"))
+    needed_intervals = {str(interval)}
+    if bool(params_i.get("require_htf_level_overlap")):
+        needed_intervals.add(str(params_i.get("htf_level_interval") or "15m"))
+
+    period_levels = int(params_i.get("period_levels") or 0)
+    volume_avg_window = int(params_i.get("volume_avg_window") or 0)
+    confirm_lookforward = int(params_i.get("confirm_lookforward") or 0)
+    max_anchor_candidates = int(params_i.get("max_anchor_candidates") or 1)
+    lookback_bars = max(320, period_levels + volume_avg_window + confirm_lookforward + max_anchor_candidates + 90)
+    candle_pad = _parse_interval_td(interval) * lookback_bars
+    end_ts = as_of_ts or _utc_now()
+    start_ts = end_ts - candle_pad
+
+    candles_by_symbol_interval, candle_ts_index = _preload_candles_live(
+        store,
+        exchange_id=exchange_id,
+        symbol_ids=symbol_ids,
+        intervals=sorted(needed_intervals),
+        start_ts=start_ts,
+        end_ts=end_ts,
+    )
+    funding_by_symbol, funding_ts_index = _preload_funding_live(
+        store,
+        exchange_id=exchange_id,
+        symbol_ids=symbol_ids,
+        start_ts=end_ts - timedelta(days=14),
+        end_ts=end_ts + timedelta(days=1),
+    )
+    liq_by_symbol_bucket = _preload_liquidations_live(
+        store,
+        exchange_id=exchange_id,
+        symbol_ids=symbol_ids,
+        start_ts=start_ts,
+        end_ts=end_ts + _parse_interval_td(interval),
+        interval=interval,
+    )
+    liq_history_by_symbol_interval = _build_liq_histories_live(
+        liq_by_symbol_bucket=liq_by_symbol_bucket,
+        interval=interval,
+        lookback=max(0, int(params_i.get("liq_relative_window") or 0)),
+    )
+    current_price_by_symbol = _preload_current_prices_live(
+        store,
+        exchange_id=exchange_id,
+        symbol_ids=symbol_ids,
+        interval=str(interval),
+        as_of_ts=as_of_ts,
+    )
+    return {
+        "symbols": symbols,
+        "candles_by_symbol_interval": candles_by_symbol_interval,
+        "candle_ts_index": candle_ts_index,
+        "funding_by_symbol": funding_by_symbol,
+        "funding_ts_index": funding_ts_index,
+        "liq_by_symbol_bucket": liq_by_symbol_bucket,
+        "liq_history_by_symbol_interval": liq_history_by_symbol_interval,
+        "current_price_by_symbol": current_price_by_symbol,
+        "run_mode": str(params_i.get("run_mode") or "full"),
+    }
+
+
 # -----------------------------
 # Telegram helpers
 # -----------------------------
@@ -509,6 +771,7 @@ def main() -> None:
 
                 screener_id = store.ensure_screener(name=name, version=version)
                 scr = screener_registry[name]()
+                symbols = scr._fetch_symbols(storage=store, exchange_id=int(exchange_id))
 
                 for idx, (interval, liq_limit) in enumerate(pairs):
                     params_i = dict(params)
@@ -524,26 +787,43 @@ def main() -> None:
                     if liq_limit is not None:
                         params_i["volume_liquid_limit"] = float(liq_limit)
 
-                    vcp = params.get("volume_change_pct")
-                    if isinstance(vcp, list):
-                        vlist = _normalize_float_list(vcp)
+                    vsk = params.get("volume_spike_k")
+                    if isinstance(vsk, list):
+                        vlist = _normalize_float_list(vsk)
                         if vlist:
                             pick = float(vlist[idx]) if idx < len(vlist) else float(vlist[-1])
-                            params_i["volume_change_pct"] = pick
-                    elif isinstance(vcp, dict):
+                            params_i["volume_spike_k"] = pick
+                    elif isinstance(vsk, dict):
                         key = str(interval)
-                        if key in vcp:
+                        if key in vsk:
                             try:
-                                params_i["volume_change_pct"] = float(vcp.get(key))
+                                params_i["volume_spike_k"] = float(vsk.get(key))
                             except (ValueError, TypeError):
                                 pass
+                    elif "volume_spike_k" not in params_i and "volume_change_pct" in params_i:
+                        try:
+                            legacy_pct = float(params_i.get("volume_change_pct") or 0.0)
+                            params_i["volume_spike_k"] = (1.0 + legacy_pct / 100.0) if legacy_pct > 0 else 0.0
+                        except (ValueError, TypeError):
+                            pass
 
-                    signals = scr.run(
-                        storage=store,
+                    runtime_ctx = _build_runtime_context_live(
+                        store,
                         exchange_id=int(exchange_id),
+                        symbols=symbols,
                         interval=str(interval),
-                        params=params_i,
+                        params_i=params_i,
                     )
+                    scr.set_runtime_context(runtime_ctx)
+                    try:
+                        signals = scr.run(
+                            storage=store,
+                            exchange_id=int(exchange_id),
+                            interval=str(interval),
+                            params=params_i,
+                        )
+                    finally:
+                        scr.clear_runtime_context()
                     if not signals:
                         continue
 
@@ -731,49 +1011,14 @@ def main() -> None:
                         for sig in new_signals[: max(1, max_plots)]:
                             center_ts = sig.signal_ts
 
-                            candles = []
-                            live_enabled = bool(params_i.get("live_candles_enabled", True))
-                            live_prefer_agg = bool(params_i.get("live_prefer_agg", True))
-                            live_base_interval = str(params_i.get("live_base_interval", "15m"))
-                            live_extra_base_bars = int(params_i.get("live_extra_base_bars", 64) or 64)
-
-                            if live_enabled and live_prefer_agg and live_base_interval and live_base_interval != interval:
-                                base_td = interval_to_timedelta(live_base_interval)
-                                tgt_td = interval_to_timedelta(interval)
-                                base_sec = int(base_td.total_seconds())
-                                tgt_sec = int(tgt_td.total_seconds())
-                                if base_sec > 0 and tgt_sec > 0 and (tgt_sec % base_sec == 0):
-                                    ratio = max(1, int(tgt_sec // base_sec))
-                                    base_lb = int(lookback) * ratio + int(live_extra_base_bars)
-                                    base_fw = int(look_fwd) * ratio + max(0, int(live_extra_base_bars // 2))
-
-                                    base_candles = store.fetch_candles_window(
-                                        exchange_id=exchange_id,
-                                        symbol_id=sig.symbol_id,
-                                        interval=live_base_interval,
-                                        center_ts=center_ts,
-                                        lookback=base_lb,
-                                        lookforward=base_fw,
-                                    )
-                                    if base_candles:
-                                        agg = aggregate_candles(base_candles, target_interval=interval)
-                                        candles = slice_window(
-                                            agg,
-                                            center_ts=center_ts,
-                                            interval=interval,
-                                            lookback=int(lookback),
-                                            lookforward=int(look_fwd),
-                                        )
-
-                            if not candles:
-                                candles = store.fetch_candles_window(
-                                    exchange_id=exchange_id,
-                                    symbol_id=sig.symbol_id,
-                                    interval=interval,
-                                    center_ts=center_ts,
-                                    lookback=int(lookback),
-                                    lookforward=int(look_fwd),
-                                )
+                            candles = store.fetch_candles_window(
+                                exchange_id=exchange_id,
+                                symbol_id=sig.symbol_id,
+                                interval=interval,
+                                center_ts=center_ts,
+                                lookback=int(lookback),
+                                lookforward=int(look_fwd),
+                            )
 
                             if not candles:
                                 continue
@@ -817,7 +1062,7 @@ def main() -> None:
                                 liq_long_usdt=ctx_plot.get("liq_long_usdt"),
                                 volume_avg=ctx_plot.get("avg_vol"),
                                 volume_anchor=ctx_plot.get("volume"),
-                                volume_change_pct=ctx_plot.get("volume_change_pct"),
+                                volume_change_pct=ctx_plot.get("volume_spike_k"),
                                 volume_threshold=ctx_plot.get("volume_threshold"),
                                 anchor_ts=ctx_plot.get("anchor_ts"),
                             )

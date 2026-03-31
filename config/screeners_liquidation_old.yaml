@@ -16,7 +16,7 @@ screeners:
       # Мин. объём ликвидаций в anchor-свече (USDT). Маппинг по intervals:
       #   5m→20000, 15m→30000, 1h→50000
       # Если не проходит — сигнал по символу игнорируется.
-      volume_liquid_limit: [10000]
+      volume_liquid_limit: [20000]
 
       # Требуемое доминирование ликвидаций в %:
       #   SELL: short_liq >= long_liq * (1 + pct/100)
@@ -84,7 +84,7 @@ screeners:
       # Требуемый коэффициент всплеска объёма в последних touch_lookback_candles:
       # recent_volume_peak >= avg_volume * K
       # 0 или <=0 => отключить объёмный фильтр для этого TF.
-      volume_spike_k: [1.9]
+      volume_spike_k: [3.0]
       liq_relative_window: 24             # Окно истории по ликвидациям для относительного фильтра
       liq_relative_k: 1.8                 # Anchor liquidation должен быть >= avg_history * K
 
@@ -113,7 +113,7 @@ screeners:
       # Funding (опционально)
       # ---------------------------
       enable_funding: true
-      kof_fund: 0.0001                     # Порог funding (в %). 0.0001% => 0.000001 (доля)
+      kof_fund: 0.001                     # Порог funding (в %). 0.001% => 0.00001 (доля)
       # ---------------------------
       # ✅ Графики
       # ---------------------------
@@ -129,7 +129,7 @@ screeners:
       # Дебаг
       # ---------------------------
       debug: true
-      debug_top: 20
+      debug_top: 10
 
       # ✅ TELEGRAM
       telegram_enabled: true
@@ -141,4 +141,4 @@ screeners:
       telegram_send_plots: true
       telegram_plot_mode: "photo"         # "photo" | "document"
       telegram_max_plot_signals: 50
-      telegram_send_plot_followup_text: false
+      telegram_send_plot_followup_text: true

@@ -544,6 +544,30 @@ class TradeLiquidationHedgeLogicMixin:
             raw_qty = min(raw_qty, max_allowed)
             eff_koff = raw_qty / base_qty if base_qty > 0 else 0.0
 
+        hedge_cap_pct = float(getattr(self.p, 'hedge_position_max_notional_pct_wallet', 0.0) or 0.0)
+        if hedge_cap_pct > 0.0:
+            wallet_live = _safe_float(self._rest_snapshot_get('wallet_balance_usdt'), 0.0)
+            if wallet_live <= 0.0:
+                wallet_live = _safe_float(self._wallet_balance_usdt(), 0.0)
+            ref_px = abs(float(mark_price or ref_price or 0.0))
+            if wallet_live > 0.0 and ref_px > 0.0:
+                try:
+                    qty_step = float(self._qty_step_for_symbol(symbol) or 0.0)
+                except Exception:
+                    qty_step = 0.0
+                capped_qty = _cap_qty_by_wallet_notional(
+                    qty=float(raw_qty),
+                    wallet_balance_usdt=float(wallet_live),
+                    price=float(ref_px),
+                    cap_pct_wallet=float(hedge_cap_pct),
+                    qty_step=float(qty_step or 0.0),
+                    leverage=float(getattr(self.p, 'leverage', 1.0) or 1.0),
+                )
+                if capped_qty < float(raw_qty):
+                    log.info('[trade_liquidation][LIMIT] capped HEDGE %s %s qty %.8f -> %.8f by hedge_position_max_notional_pct_wallet=%.4f', str(symbol).upper(), str(hedge_side).upper(), float(raw_qty), float(capped_qty), float(hedge_cap_pct))
+                raw_qty = float(capped_qty)
+                eff_koff = raw_qty / base_qty if base_qty > 0 else 0.0
+
         return float(raw_qty), float(eff_koff), float(funding_pct)
 
     def _live_reduce_hedge_market(self, *, symbol: str, hedge_ps: str, qty: float, reason: str = "UNWIND") -> bool:
@@ -1013,6 +1037,38 @@ class TradeLiquidationHedgeLogicMixin:
             add_qty = float(main_amt) * float(lot_koff)
             if qty_step > 0.0:
                 add_qty = _round_qty_to_step(add_qty, qty_step, mode='down')
+
+            wallet_live = _safe_float(self._rest_snapshot_get('wallet_balance_usdt'), 0.0)
+            if wallet_live <= 0.0:
+                wallet_live = _safe_float(self._wallet_balance_usdt(), 0.0)
+            add_ref_price = float(main_entry or hedge_entry or 0.0)
+            add_cap_pct = float(getattr(self.p, 'averaging_add_max_notional_pct_wallet', 0.0) or 0.0)
+            if add_cap_pct > 0.0 and wallet_live > 0.0 and add_ref_price > 0.0:
+                capped_add_qty = _cap_qty_by_wallet_notional(
+                    qty=float(add_qty),
+                    wallet_balance_usdt=float(wallet_live),
+                    price=float(add_ref_price),
+                    cap_pct_wallet=float(add_cap_pct),
+                    qty_step=float(qty_step or 0.0),
+                )
+                if capped_add_qty < float(add_qty):
+                    log.info('[trade_liquidation][LIMIT] capped MAIN_ADD_ON_HEDGE_DIFF %s %s qty %.8f -> %.8f by averaging_add_max_notional_pct_wallet=%.4f', str(symbol).upper(), str(main_ps).upper(), float(add_qty), float(capped_add_qty), float(add_cap_pct))
+                add_qty = float(capped_add_qty)
+            main_total_cap_pct = float(getattr(self.p, 'main_position_max_notional_pct_wallet', 0.0) or 0.0)
+            if main_total_cap_pct > 0.0 and wallet_live > 0.0 and add_ref_price > 0.0:
+                max_total_qty = _cap_qty_by_wallet_notional(
+                    qty=float(main_amt) + float(add_qty),
+                    wallet_balance_usdt=float(wallet_live),
+                    price=float(add_ref_price),
+                    cap_pct_wallet=float(main_total_cap_pct),
+                    qty_step=float(qty_step or 0.0),
+                )
+                allowed_add_qty = max(0.0, float(max_total_qty) - float(main_amt))
+                if qty_step > 0.0:
+                    allowed_add_qty = _round_qty_to_step(allowed_add_qty, qty_step, mode='down')
+                if allowed_add_qty < float(add_qty):
+                    log.info('[trade_liquidation][LIMIT] capped MAIN_ADD_ON_HEDGE_DIFF total %s %s qty %.8f -> %.8f by main_position_max_notional_pct_wallet=%.4f', str(symbol).upper(), str(main_ps).upper(), float(add_qty), float(allowed_add_qty), float(main_total_cap_pct))
+                add_qty = float(max(0.0, allowed_add_qty))
             if add_qty <= 0.0 or (qty_step > 0.0 and add_qty < qty_step):
                 return False
 

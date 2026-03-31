@@ -17,22 +17,18 @@
 #     реализации 1-в-1, но они заложены правильно и пригодятся при доработке.
 # ============================================================
 
-# Как часто перезапускать полный цикл скринера в минутах.
-restart_interval_minutes: 1
-
 screeners:
   - name: "scr_pump_binance"
     enabled: true                      # Включен ли этот скринер.
     runner: "scr_pump_binance"         # Имя python-раннера / класса / модуля скринера.
     exchange: "binance"                # Биржа для скринера.
-    market_type: "futures"             # Тип рынка: perpetual / futures.
-    version: "0.2"                     # Версия конфигурации
+    market_type: "perpetual"           # Тип рынка: perpetual / futures.
 
     # --------------------------------------------------------
     # Интервалы, на которых скринер будет искать сигналы.
-    # 5m = быстрые ранние сигналы
+    # 5m  = быстрые ранние сигналы
     # 15m = более стабильные
-    # 1h = более редкие, но потенциально качественные
+    # 1h  = более редкие, но потенциально качественные
     # --------------------------------------------------------
     intervals:
       - "5m"
@@ -50,8 +46,8 @@ screeners:
       max_symbols: 600                 # Максимум символов за один цикл.
       symbols_whitelist: []            # Если заполнить - скринить только эти символы.
       symbols_blacklist: []            # Исключить конкретные символы.
-      min_price: 0.0000001             # Минимальная цена инструмента
-      max_price: 1000                  # Максимальная цена инструмента
+      min_price: 0.0005                # Минимальная цена инструмента.
+      max_price: 20000                 # Максимальная цена инструмента.
       min_tick_size: 0.0               # Мин. допустимый tick size. 0 = не фильтровать.
 
     # --------------------------------------------------------
@@ -132,8 +128,8 @@ screeners:
       min_price_change_pct: 1.8        # Минимальный рост цены для BUY-паттерна.
       min_price_change_atr: 0.7        # Минимальная сила движения в ATR.
       max_price_extension_pct: 8.0     # Не брать слишком перерастянутый импульс.
-      min_green_candles: 3             # Минимум зелёных свечей в импульсе.
-      require_last_bar_green: true    # Требовать ли, чтобы последняя свеча была зелёной.
+      min_green_candles: 2             # Минимум зелёных свечей в импульсе.
+      require_last_bar_green: false    # Требовать ли, чтобы последняя свеча была зелёной.
       require_close_near_high: false   # Требовать ли закрытие у верхней части свечи.
 
       # Объём BUY
@@ -142,24 +138,24 @@ screeners:
       min_volume_acceleration: 1.08    # Минимальное ускорение объёма на BUY.
 
       # OI / CVD BUY
-      min_oi_delta_pct: 0.25           # Минимальный рост OI в %.
+      min_oi_delta_pct: 0.35           # Минимальный рост OI в %.
       min_oi_value_delta_pct: 0.30     # Минимальный рост OI в денежном выражении.
-      min_cvd_delta_pct: 0.05          # Минимальный рост CVD.
+      min_cvd_delta_pct: 0.10          # Минимальный рост CVD.
       require_oi_confirmation: true    # Требовать ли подтверждение OI.
-      require_cvd_confirmation: true   # Требовать ли подтверждение CVD.
+      require_cvd_confirmation: false  # Требовать ли подтверждение CVD.
       oi_up_ratio_min: 0.55            # Доля ап-свечей OI внутри окна.
       oi_drawdown_from_peak_min_pct: -0.45 # Допустимая просадка OI от локального пика.
 
       # Структурное подтверждение BUY
       breakout_lookback_bars: 20       # Окно для проверки локального breakout.
-      require_breakout: true           # Требовать ли явный breakout над локальным диапазоном.
+      require_breakout: false          # Требовать ли явный breakout над локальным диапазоном.
       breakout_buffer_pct: 0.15        # Буфер breakout над локальным high.
       allow_retest_entry: true         # Разрешить сигнал после retest вместо чистого breakout.
 
       # Score BUY
-      min_signal_score: 38             # Минимальный score BUY-сигнала.
-      early_min_signal_score: 32       # Минимальный score для early BUY.
-      confirmed_min_signal_score: 44   # Минимальный score для confirmed BUY.
+      min_signal_score: 42             # Минимальный score BUY-сигнала.
+      early_min_signal_score: 36       # Минимальный score для early BUY.
+      confirmed_min_signal_score: 48   # Минимальный score для confirmed BUY.
 
     # --------------------------------------------------------
     # SELL-профиль
@@ -179,8 +175,8 @@ screeners:
       min_red_body_pct: 0.20           # Минимальный размер красного тела свечи подтверждения.
       min_upper_wick_pct: 0.25         # Минимальный верхний фитиль как признак rejection.
       require_red_confirm: true        # Требовать красную свечу подтверждения.
-      require_lower_high: true         # Требовать formation lower high.
-      require_close_below_prev_close: true # Требовать закрытие ниже предыдущего close.
+      require_lower_high: false        # Требовать formation lower high.
+      require_close_below_prev_close: false # Требовать закрытие ниже предыдущего close.
       confirm_close_position_max: 0.55 # Насколько низко в свече должен быть close при SELL-confirm.
 
       # Объём SELL
@@ -192,8 +188,8 @@ screeners:
       max_oi_delta_pct: 0.20           # Максимально допустимый дальнейший рост OI; выше = SELL слабее.
       max_cvd_delta_pct: 0.10          # Максимальный допустимый рост CVD.
       allow_flat_oi: true              # Разрешить флэтовый OI для SELL.
-      require_oi_exhaustion: true      # Требовать ли явное истощение OI.
-      require_cvd_weakness: true       # Требовать ли слабость CVD.
+      require_oi_exhaustion: false     # Требовать ли явное истощение OI.
+      require_cvd_weakness: false      # Требовать ли слабость CVD.
 
       # Score SELL
       min_signal_score: 44             # Минимальный score SELL-сигнала.
@@ -206,7 +202,7 @@ screeners:
     # --------------------------------------------------------
     trend_filters:
       enabled: true                    # Включить анализ тренда OI/CVD.
-      trend_method: "slope"            # Метод оценки тренда: ratio / slope / steps.
+      trend_method: "ratio"            # Метод оценки тренда: ratio / slope / steps.
       trend_mode: "soft"               # soft = влияет на score, hard = обязателен, off = выключить.
       confirm_trend_bars: 3            # Сколько последних баров проверять на подтверждение.
       slope_bars: 4                    # Окно расчёта slope.
@@ -320,11 +316,11 @@ screeners:
           min_price_change_atr: 0.60   # Чуть мягче ATR-порог.
           min_volume_mult: 1.30        # Объёмный фильтр мягче.
           min_volume_spike_mult: 1.65  # Spike ниже, чем на старших ТФ.
-          min_oi_delta_pct: 0.18       # OI-порог мягче.
+          min_oi_delta_pct: 0.25       # OI-порог мягче.
           min_oi_value_delta_pct: 0.20 # Денежный OI-порог мягче.
-          min_signal_score: 34         # Общий порог score ниже.
-          early_min_signal_score: 30   # Early BUY для 5m.
-          confirmed_min_signal_score: 40 # Confirmed BUY для 5m.
+          min_signal_score: 38         # Общий порог score ниже.
+          early_min_signal_score: 34   # Early BUY для 5m.
+          confirmed_min_signal_score: 44 # Confirmed BUY для 5m.
 
         sell:
           window_minutes: 8            # Быстрый поиск локального pump/reversal.
@@ -355,11 +351,11 @@ screeners:
           min_price_change_atr: 0.70   # ATR подтверждение.
           min_volume_mult: 1.35        # Объёмное подтверждение.
           min_volume_spike_mult: 1.80  # Spike объёма.
-          min_oi_delta_pct: 0.25       # OI подтверждение.
+          min_oi_delta_pct: 0.35       # OI подтверждение.
           min_oi_value_delta_pct: 0.30 # Денежный OI.
-          min_signal_score: 38         # Основной score.
-          early_min_signal_score: 32   # Early.
-          confirmed_min_signal_score: 44 # Confirmed.
+          min_signal_score: 42         # Основной score.
+          early_min_signal_score: 36   # Early.
+          confirmed_min_signal_score: 48 # Confirmed.
 
         sell:
           window_minutes: 20           # Стандартный sell window.
@@ -390,11 +386,11 @@ screeners:
           min_price_change_atr: 1.00   # ATR-порог выше.
           min_volume_mult: 1.50        # Более строгий volume filter.
           min_volume_spike_mult: 2.10  # Более строгий spike.
-          min_oi_delta_pct: 0.45       # OI должен расти увереннее.
+          min_oi_delta_pct: 0.60       # OI должен расти увереннее.
           min_oi_value_delta_pct: 0.55 # Денежный OI строже.
-          min_signal_score: 46         # Общий score на 1h выше.
-          early_min_signal_score: 39   # Early на 1h.
-          confirmed_min_signal_score: 54 # Confirmed на 1h.
+          min_signal_score: 50         # Общий score на 1h выше.
+          early_min_signal_score: 43   # Early на 1h.
+          confirmed_min_signal_score: 58 # Confirmed на 1h.
 
         sell:
           window_minutes: 90           # Для 1h разворот формируется дольше.
@@ -408,46 +404,35 @@ screeners:
           confirmed_min_signal_score: 60 # Confirmed на 1h.
 
     # --------------------------------------------------------
-    # Legacy flat params still used by current runtime
-    # ВАЖНО: эти поля пока реально читаются runner-ом напрямую.
-    # Поэтому держим их явно, чтобы не полагаться на дефолты.
-    # --------------------------------------------------------
-    exchange_id: 1                    # ID биржи в БД/системе.
-
-    stop_loss_pct: 2.0               # Используется для расчёта SL в сигналах.
-    take_profit_pct: 6.0             # Используется для расчёта TP в сигналах.
-
-    keep_plots_days: 2               # Реально используется при очистке старых PNG.
-    plots_dir: "artifacts/screener_plots"   # Папка сохранения графиков.
-    plot_lookback: 180               # Сколько свечей слева показывать на графике.
-    plot_lookforward: 30             # Сколько свечей справа показывать на графике.
-
-    telegram_enabled: true           # Глобальный флаг отправки в Telegram.
-    telegram_timezone: "Europe/Moscow"
-    telegram_extras_enabled: true
-    telegram_max_friends: 5
-    telegram_send_text: true
-    telegram_mode: "batch"
-    telegram_max_signals: 50
-    telegram_send_plots: true
-    telegram_plot_mode: "photo"
-    telegram_max_plot_signals: 30
-
-    debug: true                      # Legacy debug-флаг для совместимости.
-    debug_top: 20                    # Сейчас реально влияет на объём debug top-логов.
-
-    # --------------------------------------------------------
     # Alerting / telegram / routing
     # --------------------------------------------------------
     alerts:
       enabled: true                    # Включить отправку сигналов.
       channel: "telegram"              # Канал доставки сигналов.
+      send_only_new: true              # Отправлять только новые сигналы.
+      include_score: true              # Добавлять score в сообщение.
+      include_context_stats: true      # Добавлять контекст: volume/OI/CVD/funding.
+      include_interval: true           # Добавлять таймфрейм.
+      include_profile: true            # Добавлять тип сигнала: early / confirmed.
+      include_debug_metrics: false     # Добавлять ли debug-метрики в алерт.
+      max_alerts_per_cycle: 10         # Ограничение количества алертов за цикл.
+
     # --------------------------------------------------------
     # Построение графиков
     # Графики дорогие по времени, поэтому лучше ограничивать.
     # --------------------------------------------------------
     plots:
       enabled: true                    # Строить ли графики.
+      plot_only_for_sent_signals: true # Строить графики только для реально отправленных сигналов.
+      plot_only_top_scored: true       # Строить только для топовых по score сигналов.
+      plot_top_n: 8                    # Максимум графиков за цикл.
+      include_oi_panel: true           # Добавлять панель OI.
+      include_cvd_panel: true          # Добавлять панель CVD.
+      include_volume_panel: true       # Добавлять объём.
+      include_funding_annotation: true # Подписывать funding на графике.
+      image_format: "png"              # Формат изображения.
+      dpi: 120                         # Качество / размер графика.
+      compress_images: true            # Сжимать изображения для более быстрой отправки.
 
     # --------------------------------------------------------
     # Storage / persistence

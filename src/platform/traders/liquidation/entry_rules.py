@@ -191,7 +191,9 @@ class TradeLiquidationEntryRulesMixin:
             return False
 
         notional = risk_usdt / _pct_to_mult(sl_pct)
-        cap = wallet_balance_usdt * _pct_to_mult(self.p.max_position_notional_pct_wallet)
+        entry_cap_pct = float(getattr(self.p, "max_position_notional_pct_wallet", 0.0) or 0.0)
+        lev = max(1.0, _safe_float(getattr(self.p, "leverage", 1.0), 1.0))
+        cap = wallet_balance_usdt * lev * _pct_to_mult(entry_cap_pct)
         if cap > 0:
             notional = min(notional, cap)
 
@@ -926,6 +928,38 @@ class TradeLiquidationEntryRulesMixin:
                         # compute add qty via multiplier: new_qty = cur_qty * mult => add = cur*(mult-1)
                         add_qty = float(qty) * (mult - 1.0)
                         add_qty = _round_qty_to_step(add_qty, qty_step, mode="down")
+
+                        wallet_live = _safe_float(self._rest_snapshot_get("wallet_balance_usdt"), 0.0)
+                        if wallet_live <= 0:
+                            wallet_live = _safe_float(self._wallet_balance_usdt(), 0.0)
+                        add_ref_price = float(level or entry_ref or entry_estimate or 0.0)
+                        add_cap_pct = float(getattr(self.p, "averaging_add_max_notional_pct_wallet", 0.0) or 0.0)
+                        if add_cap_pct > 0.0 and wallet_live > 0.0 and add_ref_price > 0.0:
+                            capped_add_qty = _cap_qty_by_wallet_notional(
+                                qty=float(add_qty),
+                                wallet_balance_usdt=float(wallet_live),
+                                price=float(add_ref_price),
+                                cap_pct_wallet=float(add_cap_pct),
+                                qty_step=float(qty_step or 0.0),
+                            )
+                            if capped_add_qty < float(add_qty):
+                                log.info("[trade_liquidation][LIMIT] capped ENTRY ADD1 %s %s qty %.8f -> %.8f by averaging_add_max_notional_pct_wallet=%.4f", symbol, ledger_side, float(add_qty), float(capped_add_qty), float(add_cap_pct))
+                            add_qty = float(capped_add_qty)
+                        main_total_cap_pct = float(getattr(self.p, "main_position_max_notional_pct_wallet", 0.0) or 0.0)
+                        if main_total_cap_pct > 0.0 and wallet_live > 0.0 and add_ref_price > 0.0:
+                            max_total_qty = _cap_qty_by_wallet_notional(
+                                qty=float(qty) + float(add_qty),
+                                wallet_balance_usdt=float(wallet_live),
+                                price=float(add_ref_price),
+                                cap_pct_wallet=float(main_total_cap_pct),
+                                qty_step=float(qty_step or 0.0),
+                            )
+                            allowed_add_qty = max(0.0, float(max_total_qty) - float(qty))
+                            if qty_step > 0.0:
+                                allowed_add_qty = _round_qty_to_step(allowed_add_qty, qty_step, mode="down")
+                            if allowed_add_qty < float(add_qty):
+                                log.info("[trade_liquidation][LIMIT] capped ENTRY ADD1 total %s %s qty %.8f -> %.8f by main_position_max_notional_pct_wallet=%.4f", symbol, ledger_side, float(add_qty), float(allowed_add_qty), float(main_total_cap_pct))
+                            add_qty = float(max(0.0, allowed_add_qty))
                         if add_qty >= float(qty_step):
                             cid_add = f"{prefix}_{tok}_ADD1"
                             # Use TAKE_PROFIT_MARKET as conditional entry: BUY triggers when mark <= stopPrice; SELL triggers when mark >= stopPrice
@@ -945,12 +979,25 @@ class TradeLiquidationEntryRulesMixin:
                                 stop_px = self._safe_price_above_mark(float(stop_px), float(mark_add), float(tick_size), extra_buf)
 
                             def _place_add(i: int):
-                                # On retry, push trigger one more tick away from mark
+                                # Recompute trigger on every retry from a fresh mark and widen the safety buffer.
                                 px = float(stop_px)
-                                if i > 0 and float(tick_size or 0.0) > 0:
-                                    _tick = float(tick_size or 0.0)
+                                try:
+                                    fresh_mark = float(self._get_mark_price(symbol, position_side if hedge_mode else None) or 0.0)
+                                except Exception:
+                                    fresh_mark = 0.0
+                                _tick = float(tick_size or 0.0)
+                                # Base buffer from config plus retry widening; for very cheap symbols Binance often
+                                # rejects triggers that are technically valid but too close to the current MARK_PRICE.
+                                retry_buf = float(extra_buf) + max(0, int(i)) * 0.20
+                                if fresh_mark > 0.0:
+                                    if add_side == "BUY":
+                                        px = self._safe_price_below_mark(float(level), fresh_mark, _tick, retry_buf)
+                                    else:
+                                        px = self._safe_price_above_mark(float(level), fresh_mark, _tick, retry_buf)
+                                if i > 0 and _tick > 0:
+                                    # One more tick away from mark for each retry even after the safe-price adjustment.
                                     px = px - _tick * i if add_side == "BUY" else px + _tick * i
-                                    px = _round_price_to_tick(px, float(tick_size or 0.0), mode="down" if add_side == "BUY" else "up")
+                                    px = _round_price_to_tick(px, _tick, mode="down" if add_side == "BUY" else "up")
                                 return self._binance.new_order(
                                     symbol=symbol,
                                     side=add_side,

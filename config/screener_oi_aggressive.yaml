@@ -1,0 +1,183 @@
+# config/screener_oi_aggressive.yaml
+# Агрессивная версия:
+# Цель — как можно быстрее получить BUY-сигналы и проверить механику.
+# Подходит для отладки и первичного запуска.
+# Минус: будет больше слабых и шумных сигналов.
+
+restart_interval_minutes: 1
+
+screeners:
+  - name: scr_oi_binance
+    enabled: true
+    version: "0.5-aggressive"
+
+    params:
+      exchange_id: 1
+      intervals: ["5m", "15m", "1h"]
+
+      min_price: 0.0000001
+      max_price: 1000
+      max_symbols: 0
+      signal_mode: "both"
+
+      # Глобальные дефолты
+      min_base_quote_volume: 120000.0      # Минимальный средний объём базы
+      min_oi_value: 600000.0               # Минимальный OI value
+      buy_min_oi_last_rise_pct: 0.45       # Минимальный рост OI на последнем участке
+      max_oi_drawdown_from_peak_pct: 2.1   # Разрешённая просадка OI от локального пика
+      min_signal_score: 36.0               # Общий минимальный score
+
+      use_atr_normalization: true
+      atr_period: 14
+      buy_price_rise_atr_mult: 0.10        # Минимальный рост цены в ATR
+      buy_price_max_rise_atr_mult: 2.8     # Максимум ATR роста
+
+      base_minutes: 240
+      trigger_minutes: 20
+
+      per_interval_overrides:
+        "5m":
+          base_minutes: 240
+          trigger_minutes: 20
+          max_signal_age_minutes: 30
+          plot_lookback_bars: 220
+
+          min_base_quote_volume: 140000
+          min_oi_value: 700000
+          buy_min_oi_last_rise_pct: 0.35
+          max_oi_drawdown_from_peak_pct: 2.2
+          min_signal_score: 34.0
+          early_buy_min_signal_score: 30.0
+
+          buy_allow_downtrend_base: true
+          buy_require_volume_spike: false
+          buy_oi_rise_pct: 0.7
+          oi_value_confirm_pct: 0.5
+          buy_volume_mult: 1.05
+          buy_volume_spike_mult: 1.50
+          buy_price_rise_pct: 0.0
+          buy_price_max_rise_pct: 4.0
+          buy_min_green_candles: 1
+          buy_require_last_green: false
+          buy_price_rise_atr_mult: 0.0
+          buy_price_max_rise_atr_mult: 2.8
+
+          sell_oi_drop_one_candle_pct: 1.4
+          sell_oi_drop_window_pct: 1.7
+          sell_price_drop_last_pct: 0.7
+          sell_reversal_from_max_pct: 0.8
+          sell_volume_spike_mult: 1.7
+          sell_volume_drop_ratio: 0.75
+
+        "15m":
+          base_minutes: 720
+          trigger_minutes: 60
+          max_signal_age_minutes: 45
+          plot_lookback_bars: 180
+
+          min_base_quote_volume: 180000
+          min_oi_value: 900000
+          buy_min_oi_last_rise_pct: 0.35
+          max_oi_drawdown_from_peak_pct: 2.0
+          min_signal_score: 34.0
+          early_buy_min_signal_score: 30.0
+
+          buy_allow_downtrend_base: true
+          buy_require_volume_spike: false
+          buy_oi_rise_pct: 0.7
+          oi_value_confirm_pct: 0.5
+          buy_volume_mult: 1.00
+          buy_volume_spike_mult: 1.30
+          buy_price_rise_pct: 0.0
+          buy_price_max_rise_pct: 4.0
+          buy_min_green_candles: 1
+          buy_require_last_green: false
+          buy_price_rise_atr_mult: 0.0
+          buy_price_max_rise_atr_mult: 2.8
+
+          sell_oi_drop_one_candle_pct: 1.1
+          sell_oi_drop_window_pct: 1.5
+          sell_price_drop_last_pct: 0.7
+          sell_reversal_from_max_pct: 0.8
+          sell_volume_spike_mult: 1.5
+          sell_volume_drop_ratio: 0.76
+
+        "1h":
+          base_minutes: 720
+          trigger_minutes: 120
+          max_signal_age_minutes: 120
+          plot_lookback_bars: 140
+
+          min_base_quote_volume: 250000
+          min_oi_value: 1300000
+          buy_min_oi_last_rise_pct: 0.30
+          max_oi_drawdown_from_peak_pct: 2.3
+          min_signal_score: 33.0
+          early_buy_min_signal_score: 29.0
+
+          buy_allow_downtrend_base: true
+          buy_require_volume_spike: false
+          buy_oi_rise_pct: 0.6
+          oi_value_confirm_pct: 0.4
+          buy_volume_mult: 1.00
+          buy_volume_spike_mult: 1.20
+          buy_price_rise_pct: 0.0
+          buy_price_max_rise_pct: 4.5
+          buy_min_green_candles: 1
+          buy_require_last_green: false
+          buy_price_rise_atr_mult: 0.0
+          buy_price_max_rise_atr_mult: 2.8
+
+          sell_oi_drop_one_candle_pct: 1.0
+          sell_oi_drop_window_pct: 1.4
+          sell_price_drop_last_pct: 0.6
+          sell_reversal_from_max_pct: 0.7
+          sell_volume_spike_mult: 1.4
+          sell_volume_drop_ratio: 0.78
+
+      price_sideways_max_pct: 10.5         # Максимальный диапазон "базы"
+      price_downtrend_min_pct: 0.2         # Порог слабого даунтренда
+      base_volume_max_mult: 7.5            # Насколько шумную базу допускаем
+
+      buy_min_green_candles: 1
+      buy_require_last_green: false
+
+      enable_confirmed_buy: true
+      enable_early_buy: true
+      early_buy_min_green_candles: 1
+      early_buy_require_last_green: false
+      early_buy_volume_mult_ratio: 0.75
+      early_buy_volume_spike_ratio: 0.70
+      early_buy_price_rise_pct_ratio: 0.40
+      early_buy_price_rise_atr_mult_ratio: 0.40
+      early_buy_min_signal_score: 32.0
+
+      oi_calc_key: "open_interest"
+      oi_plot_key: "open_interest_value"
+
+      enable_funding: true
+      buy_funding_max_pct: 0.05            # Funding-фильтр сильно смягчён
+      buy_require_funding_decreasing: false
+
+      sell_enable_funding: true
+      sell_funding_min_pct: 0.0
+
+      stop_loss_pct: 2.0
+      take_profit_pct: 6.0
+
+      max_signal_age_minutes: 30
+
+      plots_enabled: true
+      plots_dir: "artifacts/screener_plots"
+      plot_lookback_bars: 220
+      keep_plots_days: 2
+
+      telegram_send_messages: true
+      telegram_send_plots: true
+      telegram_silent: false
+
+      telegram_extras_enabled: true
+      telegram_max_friends: 5
+
+      debug: true
+      debug_top: 20

@@ -211,6 +211,62 @@ class HistoryOptimizer:
         except Exception:
             pass
 
+    def _load_replay_timestamps(self, *, start: datetime, end: datetime, interval: str) -> List[datetime]:
+        sql = """
+            SELECT DISTINCT open_time AS ts
+            FROM candles
+            WHERE exchange_id = %s
+              AND interval = %s
+              AND open_time >= %s
+              AND open_time <= %s
+            ORDER BY ts
+        """
+        out: List[datetime] = []
+        with self.storage.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (int(self.exchange_id), str(interval), start, end))
+                for (ts,) in (cur.fetchall() or []):
+                    out.append(ts)
+        return out
+
+    def _generate_signals_for_range(
+        self,
+        *,
+        start: datetime,
+        end: datetime,
+        interval: str,
+        screener_params: Dict[str, Any],
+    ) -> List[Any]:
+        timestamps = self._load_replay_timestamps(start=start, end=end, interval=interval)
+        if not timestamps:
+            return []
+
+        generated: List[Any] = []
+        seen: set[tuple[int, datetime, str]] = set()
+        for as_of in timestamps:
+            params = dict(screener_params)
+            params["exchange_id"] = self.exchange_id
+            params["interval"] = interval
+            params["intervals"] = [interval]
+            params["replay_as_of_ts"] = as_of
+
+            batch = self.screener.run(
+                storage=self.storage,
+                exchange_id=self.exchange_id,
+                interval=interval,
+                params=params,
+            )
+            for s in batch:
+                if s.signal_ts < start or s.signal_ts > end:
+                    continue
+                key = (int(s.symbol_id), s.signal_ts, str(s.side).upper())
+                if key in seen:
+                    continue
+                seen.add(key)
+                generated.append(s)
+        generated.sort(key=lambda s: (s.signal_ts, s.symbol))
+        return generated
+
     def run_case(
         self,
         *,
@@ -219,16 +275,11 @@ class HistoryOptimizer:
         interval: str,
         screener_params: Dict[str, Any],
     ) -> Tuple[int, BacktestSummary]:
-        params = dict(screener_params)
-        params["exchange_id"] = self.exchange_id
-        params["interval"] = interval
-        params["intervals"] = [interval]
-
-        generated = self.screener.run(
-            storage=self.storage,
-            exchange_id=self.exchange_id,
+        generated = self._generate_signals_for_range(
+            start=start,
+            end=end,
             interval=interval,
-            params=params,
+            screener_params=screener_params,
         )
         signal_events = self._to_signal_events(generated, interval=interval)
         signal_provider = GeneratedSignalProvider(signal_events)
@@ -444,6 +495,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--enable-funding", default="true")
     p.add_argument("--buy-require-funding-decreasing", default="true,false")
     p.add_argument("--buy-funding-max-pct", default="-0.02,-0.01,-0.001,-0.0001")
+    p.add_argument("--min-base-quote-volume", default="150000,250000,400000")
+    p.add_argument("--min-oi-value", default="500000,1500000,2500000")
+    p.add_argument("--buy-min-oi-last-rise-pct", default="0.8,1.2,1.5")
+    p.add_argument("--max-oi-drawdown-from-peak-pct", default="0.8,1.0,1.2")
+    p.add_argument("--min-signal-score", default="50,55,60")
+    p.add_argument("--use-atr-normalization", default="true")
+    p.add_argument("--atr-period", default="14")
+    p.add_argument("--buy-price-rise-atr-mult", default="0.7,0.8,0.9")
+    p.add_argument("--buy-price-max-rise-atr-mult", default="1.8,2.2,2.8")
     return p
 
 
@@ -519,6 +579,15 @@ def main() -> None:
             "enable_funding": parse_num_list(args.enable_funding),
             "buy_require_funding_decreasing": parse_num_list(args.buy_require_funding_decreasing),
             "buy_funding_max_pct": parse_num_list(args.buy_funding_max_pct),
+            "min_base_quote_volume": parse_num_list(args.min_base_quote_volume),
+            "min_oi_value": parse_num_list(args.min_oi_value),
+            "buy_min_oi_last_rise_pct": parse_num_list(args.buy_min_oi_last_rise_pct),
+            "max_oi_drawdown_from_peak_pct": parse_num_list(args.max_oi_drawdown_from_peak_pct),
+            "min_signal_score": parse_num_list(args.min_signal_score),
+            "use_atr_normalization": parse_num_list(args.use_atr_normalization),
+            "atr_period": parse_num_list(args.atr_period),
+            "buy_price_rise_atr_mult": parse_num_list(args.buy_price_rise_atr_mult),
+            "buy_price_max_rise_atr_mult": parse_num_list(args.buy_price_max_rise_atr_mult),
         }
 
         # fix accidental key spelling from old edits

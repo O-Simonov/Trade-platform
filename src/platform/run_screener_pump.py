@@ -18,7 +18,7 @@ from src.platform.config.env import (
 )
 from src.platform.data.storage.postgres.pool import create_pool
 from src.platform.data.storage.postgres.storage import PostgreSQLStorage
-from src.platform.screeners.scr_pump_binance import ScrPumpBinance
+from src.platform.screeners.scr_pump_binance import ScrPumpBinance, PumpConfig
 from src.platform.notifications import telegram as tg
 from src.platform.core.utils.candles import interval_to_timedelta
 
@@ -121,6 +121,55 @@ def _fetch_existing_signal_pairs(
             for r in cur.fetchall():
                 out.add((int(r[0]), r[1]))
 
+    return out
+
+
+def _allocate_day_seqs_batch(
+    store: PostgreSQLStorage,
+    *,
+    exchange_id: int,
+    screener_id: int,
+    items: List[Tuple[int, date]],
+) -> Dict[Tuple[int, date], List[int]]:
+    if not items:
+        return {}
+
+    grouped: Dict[Tuple[int, date], int] = {}
+    for symbol_id, signal_day in items:
+        key = (int(symbol_id), signal_day)
+        grouped[key] = grouped.get(key, 0) + 1
+
+    ordered = sorted(grouped.items(), key=lambda kv: (kv[0][0], kv[0][1]))
+    values_sql = ",".join(["(%s,%s,%s,%s,%s)"] * len(ordered))
+    sql = f"""
+    WITH req(exchange_id, symbol_id, screener_id, signal_day, inc) AS (
+        VALUES {values_sql}
+    ), upsert AS (
+        INSERT INTO public.signals_day_seq (exchange_id, symbol_id, screener_id, signal_day, last_seq)
+        SELECT exchange_id, symbol_id, screener_id, signal_day, inc
+        FROM req
+        ON CONFLICT (exchange_id, symbol_id, screener_id, signal_day)
+        DO UPDATE SET last_seq = public.signals_day_seq.last_seq + EXCLUDED.last_seq
+        RETURNING symbol_id, signal_day, last_seq
+    )
+    SELECT symbol_id, signal_day, last_seq
+    FROM upsert
+    """
+
+    params: List[Any] = []
+    for (symbol_id, signal_day), inc in ordered:
+        params.extend([int(exchange_id), int(symbol_id), int(screener_id), signal_day, int(inc)])
+
+    out: Dict[Tuple[int, date], List[int]] = {}
+    with store.pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            for symbol_id, signal_day, last_seq in cur.fetchall() or []:
+                key = (int(symbol_id), signal_day)
+                inc = grouped[key]
+                start_seq = int(last_seq) - int(inc) + 1
+                out[key] = list(range(start_seq, int(last_seq) + 1))
+        conn.commit()
     return out
 
 
@@ -472,31 +521,17 @@ def _send_telegram_plots_if_enabled(
         log.exception("Telegram plots send failed")
 
 
-def _pick_buy_sell_intervals(params: dict) -> Tuple[str, str]:
-    buy_itv = str(params.get("buy_interval") or "").strip()
-    sell_itv = str(params.get("sell_interval") or "").strip()
+def _resolve_intervals(raw_params: dict) -> List[str]:
+    cfg = PumpConfig.from_cfg(raw_params)
+    intervals = [str(x).strip() for x in (cfg.intervals or []) if str(x).strip()]
+    if not intervals:
+        intervals = [str(raw_params.get("interval") or "5m").strip()]
+    return intervals
 
-    if buy_itv and sell_itv:
-        return buy_itv, sell_itv
 
-    intervals = params.get("intervals")
-    if not isinstance(intervals, list):
-        intervals = [params.get("interval", "5m")]
-
-    itvs = [str(x).strip() for x in intervals if str(x).strip()]
-    if not itvs:
-        itvs = ["5m", "15m"]
-
-    def _dur(s: str) -> float:
-        try:
-            return interval_to_timedelta(s).total_seconds()
-        except Exception:
-            return 1e18
-
-    itvs_sorted = sorted(itvs, key=_dur)
-    buy_itv = buy_itv or itvs_sorted[0]
-    sell_itv = sell_itv or itvs_sorted[-1]
-    return buy_itv, sell_itv
+def _apply_interval_overrides(raw_params: dict, interval: str) -> dict:
+    cfg = PumpConfig.from_cfg(raw_params).for_interval(interval)
+    return cfg.as_flat_params()
 
 
 def _filter_fresh_signals(
@@ -609,7 +644,14 @@ def main() -> None:
                 enabled = bool(item.get("enabled", False))
                 name = str(item.get("name", "")).strip()
                 version = str(item.get("version", "0.1"))
-                params: Dict[str, Any] = dict(item.get("params") or {})
+                params: Dict[str, Any] = dict(item)
+                params.pop("enabled", None)
+                params.pop("version", None)
+                if isinstance(item.get("params"), dict):
+                    base_params = dict(item.get("params") or {})
+                    merged = dict(params)
+                    merged.update(base_params)
+                    params = merged
 
                 if not enabled:
                     log.info("Skip screener=%s (disabled)", name)
@@ -621,24 +663,20 @@ def main() -> None:
                     log.warning("Skip screener=%s (not implemented yet)", name)
                     continue
 
-                exchange_id = int(params.get("exchange_id", 1))
-
-                buy_interval, sell_interval = _pick_buy_sell_intervals(params)
+                cfg_obj = PumpConfig.from_cfg(params)
+                exchange_id = int(getattr(cfg_obj, "exchange_id", params.get("exchange_id", 1)) or 1)
+                intervals = _resolve_intervals(params)
 
                 log.info("------------------------------------------------------------")
-                log.info("Run screener=%s v=%s BUY=%s SELL=%s", name, version, buy_interval, sell_interval)
+                log.info("Run screener=%s v=%s intervals=%s", name, version, ",".join(intervals))
 
                 screener_id = store.ensure_screener(name=name, version=version)
                 scr = screener_registry[name]()
 
-                modes: List[Tuple[str, str]] = [("buy", buy_interval), ("sell", sell_interval)]
-
-                for mode, interval in modes:
-                    log.info("  -> mode=%s interval=%s", mode.upper(), interval)
-
-                    params_i: Dict[str, Any] = dict(params)
-                    params_i["interval"] = interval
-                    params_i["signal_mode"] = mode
+                for interval in intervals:
+                    params_i: Dict[str, Any] = _apply_interval_overrides(params, interval)
+                    mode = str(params_i.get("signal_mode") or "both").lower()
+                    log.info("  -> interval=%s mode=%s", interval, mode.upper())
 
                     now_ts = _utc_now()
 
@@ -692,6 +730,13 @@ def main() -> None:
                     sl_pct_cfg = params_i.get("stop_loss_pct")
                     tp_pct_cfg = params_i.get("take_profit_pct")
 
+                    day_seq_ranges = _allocate_day_seqs_batch(
+                        store,
+                        exchange_id=int(exchange_id),
+                        screener_id=int(screener_id),
+                        items=[(int(s.symbol_id), s.signal_ts.date()) for s in new_signals],
+                    )
+
                     for s in new_signals:
                         signal_day = s.signal_ts.date()
                         ctx = dict(s.context or {})
@@ -713,12 +758,9 @@ def main() -> None:
                         ctx["funding_time_left_sec"] = f_left_sec
                         ctx["funding_is_estimated"] = bool(f.get("is_estimated", False))
 
-                        day_seq = store.next_signal_seq(
-                            exchange_id=exchange_id,
-                            symbol_id=int(s.symbol_id),
-                            screener_id=int(screener_id),
-                            signal_day=signal_day,
-                        )
+                        seq_key = (int(s.symbol_id), signal_day)
+                        seq_list = day_seq_ranges.get(seq_key) or [1]
+                        day_seq = int(seq_list.pop(0))
                         ctx["day_seq"] = int(day_seq)
 
                         rows.append(
@@ -810,24 +852,40 @@ def main() -> None:
                         if telegram_send_plots and telegram_max_plot_signals > 0:
                             sigs_for_plots = sigs_for_plots[: max(1, telegram_max_plot_signals)]
 
+                        if params_i.get("oi_interval") or params_i.get("cvd_interval"):
+                            log.info(
+                                "Pump plot intervals forced to candle interval=%s (oi_interval/cvd_interval config is ignored for consistency)",
+                                interval,
+                            )
+
                         saved = 0
                         plot_items_for_tg: List[Tuple[str, Dict[str, Any]]] = []
 
-                        oi_itv = str(params_i.get("oi_interval") or "5m").strip() or "5m"
-                        cvd_itv = str(params_i.get("cvd_interval") or "5m").strip() or "5m"
+                        # For pump plots OI/CVD must be taken from DB in the same interval
+                        # as the signal candles. Using separate oi_interval/cvd_interval here
+                        # makes the chart inconsistent with the screener calculations.
+                        oi_itv = str(interval)
+                        cvd_itv = str(interval)
+                        candles_cache: Dict[Tuple[int, str], List[Dict[str, Any]]] = {}
+                        oi_cache: Dict[Tuple[int, str], List[Dict[str, Any]]] = {}
+                        cvd_cache: Dict[Tuple[int, str], List[Dict[str, Any]]] = {}
 
                         for s in sigs_for_plots:
                             try:
                                 center_ts = s.signal_ts
 
-                                candles = store.fetch_candles_window(
-                                    exchange_id=exchange_id,
-                                    symbol_id=s.symbol_id,
-                                    interval=interval,
-                                    center_ts=center_ts,
-                                    lookback=lookback,
-                                    lookforward=forward_bars,
-                                )
+                                candles_key = (int(s.symbol_id), int(center_ts.timestamp()))
+                                candles = candles_cache.get(candles_key)
+                                if candles is None:
+                                    candles = store.fetch_candles_window(
+                                        exchange_id=exchange_id,
+                                        symbol_id=s.symbol_id,
+                                        interval=interval,
+                                        center_ts=center_ts,
+                                        lookback=lookback,
+                                        lookforward=forward_bars,
+                                    )
+                                    candles_cache[candles_key] = candles or []
                                 if not candles:
                                     log.warning("No candles for plot: %s %s %s", s.symbol, interval, s.signal_ts)
                                     continue
@@ -835,31 +893,46 @@ def main() -> None:
                                 enable_oi = bool(params_i.get("enable_oi", True))
                                 enable_cvd = bool(params_i.get("enable_cvd", True))
 
+                                # Same-interval plots: OI/CVD use the same timeframe as candles,
+                                # so window sizes are the same in bars and in visible time span.
+                                oi_lookback = int(lookback)
+                                oi_lookforward = int(forward_bars)
+                                cvd_lookback = int(lookback)
+                                cvd_lookforward = int(forward_bars)
+
                                 oi_series = None
                                 if enable_oi:
                                     try:
-                                        oi_series = store.fetch_open_interest_window(
-                                            exchange_id=exchange_id,
-                                            symbol_id=s.symbol_id,
-                                            interval=oi_itv,
-                                            center_ts=center_ts,
-                                            lookback=max(200, lookback),
-                                            lookforward=max(10, int(forward_bars)),
-                                        )
+                                        oi_key = (int(s.symbol_id), int(center_ts.timestamp()), str(oi_itv), int(oi_lookback), int(oi_lookforward))
+                                        oi_series = oi_cache.get(oi_key)
+                                        if oi_series is None:
+                                            oi_series = store.fetch_open_interest_window(
+                                                exchange_id=exchange_id,
+                                                symbol_id=s.symbol_id,
+                                                interval=oi_itv,
+                                                center_ts=center_ts,
+                                                lookback=oi_lookback,
+                                                lookforward=oi_lookforward,
+                                            )
+                                            oi_cache[oi_key] = oi_series or []
                                     except Exception:
                                         oi_series = None
 
                                 cvd_series = None
                                 if enable_cvd:
                                     try:
-                                        cvd_series = store.fetch_cvd_window(
-                                            exchange_id=exchange_id,
-                                            symbol_id=s.symbol_id,
-                                            interval=cvd_itv,
-                                            center_ts=center_ts,
-                                            lookback=max(200, lookback),
-                                            lookforward=max(10, int(forward_bars)),
-                                        )
+                                        cvd_key = (int(s.symbol_id), int(center_ts.timestamp()), str(cvd_itv), int(cvd_lookback), int(cvd_lookforward))
+                                        cvd_series = cvd_cache.get(cvd_key)
+                                        if cvd_series is None:
+                                            cvd_series = store.fetch_cvd_window(
+                                                exchange_id=exchange_id,
+                                                symbol_id=s.symbol_id,
+                                                interval=cvd_itv,
+                                                center_ts=center_ts,
+                                                lookback=cvd_lookback,
+                                                lookforward=cvd_lookforward,
+                                            )
+                                            cvd_cache[cvd_key] = cvd_series or []
                                     except Exception:
                                         cvd_series = None
 
@@ -903,6 +976,7 @@ def main() -> None:
                                     base_avg_price=base_avg_price,
                                     base_lookback_bars=base_lookback_bars,
                                     keep_plots_days=params_i.get("keep_plots_days"),
+                                    screener_name=name,
                                 )
 
                                 saved += 1

@@ -240,6 +240,7 @@ traders:
       averaging_enabled: true                       # Разрешить доборы
       averaging_max_adds: 2                         # Максимум доборов
       averaging_add_position_multiplier: 2.0        # Во сколько раз увеличивать позицию при ADD1
+      averaging_add_pct_of_position: 100.0          # Какой % от текущей позиции добирать на ADD2+
 
       # Построение уровней для доборов
       averaging_levels_tf: 4h                       # Таймфрейм, по которому строятся уровни для усреднения

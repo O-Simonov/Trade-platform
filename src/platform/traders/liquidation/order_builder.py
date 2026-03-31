@@ -2166,12 +2166,7 @@ class TradeLiquidationOrderBuilderMixin:
         if pos_qty <= 0:
             return False
 
-        add_pct = _dec(str(getattr(self.p, "averaging_add_pct_of_position", 35.0) or 35.0)) / _dec("100")
-        add_qty = pos_qty * add_pct
-        if add_qty <= 0:
-            return False
-        if qty_step and qty_step > 0:
-            add_qty = _round_qty_to_step(add_qty, qty_step, mode="down")
+        add_qty, qty_source = self._calc_averaging_add_qty(pos_qty=pos_qty, next_n=next_n, sym=sym)
         if add_qty <= 0:
             return False
 
@@ -2190,6 +2185,8 @@ class TradeLiquidationOrderBuilderMixin:
             newClientOrderId=want_cid,
             positionSide=position_side,
         )
+
+        log.info("[AVG] %s %s ADD%d qty=%.8f source=%s pos_qty=%.8f", sym, str(side).upper(), int(next_n), float(add_qty), str(qty_source), float(pos_qty))
 
         try:
             resp = self._binance.new_order(**params)

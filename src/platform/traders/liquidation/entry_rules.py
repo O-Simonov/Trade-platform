@@ -925,9 +925,8 @@ class TradeLiquidationEntryRulesMixin:
                                 level = entry_ref * (1.0 + (dist_limit_pct / 100.0))
 
                     if level > 0:
-                        # compute add qty via multiplier: new_qty = cur_qty * mult => add = cur*(mult-1)
-                        add_qty = float(qty) * (mult - 1.0)
-                        add_qty = _round_qty_to_step(add_qty, qty_step, mode="down")
+                        add_qty_dec, qty_source = self._calc_averaging_add_qty(pos_qty=qty, next_n=1, sym=symbol)
+                        add_qty = float(add_qty_dec)
 
                         wallet_live = _safe_float(self._rest_snapshot_get("wallet_balance_usdt"), 0.0)
                         if wallet_live <= 0:

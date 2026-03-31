@@ -453,6 +453,7 @@ class TradeLiquidationParams:
     # --- averaging/levels (paper only for now)
     averaging_enabled: bool = True
     averaging_add_notional_usdt: float = 0.0
+    averaging_add_position_multiplier: float = 2.0
     averaging_add_pct_of_position: float = 35.0
     averaging_max_additions: int = 1
     averaging_cooldown_minutes: int = 20

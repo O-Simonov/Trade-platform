@@ -2861,20 +2861,13 @@ class TradeLiquidation(
             # NOTE: _round_to_step uses keyword-only arg `rounding` (not `mode`).
             add_price = _round_to_step(add_price, tick, rounding=("floor" if add_side == "BUY" else "ceiling"))
 
-        # Qty sizing: default = position qty / max_adds, unless averaging_add_qty_pct is specified
-        max_adds = int(self._cfg_max_adds() or 1)
-        add_qty_pct = Decimal(str(getattr(self.p, "averaging_add_qty_pct", 0) or 0))
-        if add_qty_pct > 0:
-            add_qty = pos_qty * (add_qty_pct / Decimal("100"))
-        else:
-            add_qty = (pos_qty / Decimal(str(max_adds))) if max_adds > 0 else pos_qty
-
+        add_qty, qty_source = self._calc_averaging_add_qty(pos_qty=pos_qty, next_n=1, sym=sym_u)
         qty_step = self._qty_step_for_symbol(sym_u) or Decimal("0")
-        if qty_step and qty_step > 0:
-            add_qty = _round_qty_to_step(add_qty, qty_step, mode="down")
 
         if add_qty <= 0:
             return
+
+        log.info("[AVG] %s %s ADD1 qty=%.8f source=%s pos_qty=%.8f recovery=1", sym_u, str(side_u).upper(), float(add_qty), str(qty_source), float(pos_qty))
 
         # Ensure ADD trigger price is on the correct side of current mark price to avoid immediate-trigger (Binance -2021).
         # For LONG we add with BUY when price falls; for SHORT we add with SELL when price rises.

@@ -14,7 +14,44 @@ class TradeLiquidationFiltersMixin:
     def _is_immediate_trigger_error(e: Exception) -> bool:
         s = str(e) if e is not None else ""
         s_l = s.lower()
-        return ("immediately trigger" in s_l) or ("\"code\":-2021" in s_l) or ("code=-2021" in s_l)
+        return ("immediately trigger" in s_l) or ('"code":-2021' in s_l) or ("code=-2021" in s_l)
+
+    def _calc_averaging_add_qty(self, *, pos_qty: Any, next_n: int, sym: str) -> tuple[Decimal, str]:
+        """Unified sizing for averaging adds.
+
+        ADD1 uses averaging_add_position_multiplier.
+        ADD2+ use averaging_add_pct_of_position.
+        Legacy averaging_add_qty_pct acts as an explicit override when > 0.
+        """
+        pos_qty_dec = _dec(pos_qty or 0)
+        if pos_qty_dec <= 0:
+            return Decimal("0"), "none"
+
+        qty_source = "none"
+        add_qty = Decimal("0")
+
+        legacy_add_qty_pct = _dec(getattr(self.p, "averaging_add_qty_pct", 0) or 0)
+        if legacy_add_qty_pct > 0:
+            add_qty = pos_qty_dec * (legacy_add_qty_pct / Decimal("100"))
+            qty_source = "legacy_qty_pct_override"
+        elif int(next_n or 0) <= 1:
+            mult = _dec(getattr(self.p, "averaging_add_position_multiplier", 1.0) or 1.0)
+            if mult < Decimal("1"):
+                mult = Decimal("1")
+            add_qty = pos_qty_dec * (mult - Decimal("1"))
+            qty_source = "multiplier"
+        else:
+            add_pct = _dec(getattr(self.p, "averaging_add_pct_of_position", 35.0) or 35.0) / Decimal("100")
+            add_qty = pos_qty_dec * add_pct
+            qty_source = "pct_of_position"
+
+        qty_step = _dec(self._qty_step_for_symbol(sym) or 0)
+        if add_qty > 0 and qty_step > 0:
+            add_qty = _dec(_round_qty_to_step(add_qty, qty_step, mode="down"))
+
+        if add_qty <= 0:
+            return Decimal("0"), qty_source
+        return add_qty, qty_source
 
     def _is_our_position_by_uid(self, pos_uid: str, open_orders_all: Any, raw_meta: Any) -> bool:
         """Heuristic: is this position created/managed by this trader.

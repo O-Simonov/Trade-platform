@@ -617,7 +617,8 @@ def save_pump_plot(
             if ts is None:
                 continue
             xs_dt.append(ts)
-            ys.append(_safe_float(r.get("open_interest"), 0.0))
+            val = r.get("open_interest")
+            ys.append(float(val) if val is not None else float("nan"))
 
         if xs_dt and ys and len(xs_dt) == len(ys):
             ax_oi.plot(mdates.date2num(xs_dt), ys)

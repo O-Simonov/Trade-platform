@@ -92,7 +92,7 @@ traders:
       # --- Hedge sizing с учетом funding
       hedge_funding_kof_limit: 0.6                  # Порог funding в %, после которого разрешается корректировка размера hedge
       hedge_koff_funding_boost: 1.6                 # Усиление hedge_koff при выгодном funding
-      hedge_koff: 0.6                               # Базовый множитель размера hedge относительно main
+      hedge_koff: 1.0                               # Базовый множитель размера hedge относительно main
       hedge_max_ratio: 2.0                          # Жесткий потолок размера hedge относительно main
 
       hedge_trigger_buffer_pct: 0.8                 # Буфер для триггера открытия hedge

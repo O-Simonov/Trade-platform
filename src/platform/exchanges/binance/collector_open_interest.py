@@ -219,6 +219,17 @@ class OIRateLimit:
 
 
 @dataclass
+class OIRepair:
+    enabled: bool = True
+    every_sec: int = 900
+    lookback_hours: int = 72
+    max_symbols_per_cycle: int = 25
+    max_ranges_per_symbol: int = 4
+    min_gap_points: int = 1
+    only_if_not_polling_behind: bool = True
+
+
+@dataclass
 class OIConfig:
     enabled: bool = True
 
@@ -253,6 +264,7 @@ class OIConfig:
     dynamic_budget: OIDynamicBudget = field(default_factory=OIDynamicBudget)
     adaptive: OIAdaptive = field(default_factory=OIAdaptive)
     rate_limit: OIRateLimit = field(default_factory=OIRateLimit)
+    repair: OIRepair = field(default_factory=OIRepair)
 
     # legacy (kept for backward compatibility)
     poll_sec: float = 60.0
@@ -324,6 +336,17 @@ class OIConfig:
             burst=int(rl_cfg.get("burst", 30)),
             backoff_min_sec=float(rl_cfg.get("backoff_min_sec", 1.0)),
             backoff_max_sec=float(rl_cfg.get("backoff_max_sec", 30.0)),
+        )
+
+        repair_cfg = cfg.get("repair") or {}
+        c.repair = OIRepair(
+            enabled=bool(repair_cfg.get("enabled", True)),
+            every_sec=int(repair_cfg.get("every_sec", 900)),
+            lookback_hours=int(repair_cfg.get("lookback_hours", 72)),
+            max_symbols_per_cycle=int(repair_cfg.get("max_symbols_per_cycle", 25)),
+            max_ranges_per_symbol=int(repair_cfg.get("max_ranges_per_symbol", 4)),
+            min_gap_points=int(repair_cfg.get("min_gap_points", 1)),
+            only_if_not_polling_behind=bool(repair_cfg.get("only_if_not_polling_behind", True)),
         )
 
         # legacy
@@ -788,7 +811,7 @@ class BinanceOpenInterestCollector:
                         "exchange_id": self.exchange_id,
                         "symbol_id": int(symbol_id),
                         "interval": str(interval),
-                        "ts": _dt_from_ms(ts_ms),
+                        "ts": _floor_ts(_dt_from_ms(ts_ms), interval),
                         "open_interest": _safe_float(it.get("sumOpenInterest") or it.get("openInterest")),
                         "open_interest_value": _safe_float(it.get("sumOpenInterestValue") or it.get("openInterestValue")),
                         "source": "rest_seed",
@@ -876,7 +899,7 @@ class BinanceOpenInterestCollector:
                 ts_ms = int(it.get("timestamp") or it.get("time") or 0)
                 if not ts_ms:
                     continue
-                ts = _dt_from_ms(ts_ms)
+                ts = _floor_ts(_dt_from_ms(ts_ms), interval)
                 if ts > end_dt:
                     continue
                 rows.append(
@@ -968,6 +991,277 @@ class BinanceOpenInterestCollector:
 
         return up
 
+
+    # ---------------------------
+    # repair missing OI against candle timestamps
+    # ---------------------------
+
+    def _storage_fetch_all(self, query: str, params: Sequence[Any]) -> List[dict]:
+        methods = [
+            "fetch_all_dict",
+            "fetch_all",
+            "query_all",
+            "query",
+            "select_all",
+        ]
+        for name in methods:
+            fn = getattr(self.storage, name, None)
+            if callable(fn):
+                try:
+                    rows = fn(query, params)
+                    if rows is None:
+                        return []
+                    out: List[dict] = []
+                    for r in rows:
+                        if isinstance(r, dict):
+                            out.append(r)
+                        elif hasattr(r, "_mapping"):
+                            out.append(dict(r._mapping))
+                        else:
+                            try:
+                                out.append(dict(r))
+                            except Exception:
+                                pass
+                    return out
+                except TypeError:
+                    try:
+                        rows = fn(query=query, params=params)
+                        if rows is None:
+                            return []
+                        out: List[dict] = []
+                        for r in rows:
+                            if isinstance(r, dict):
+                                out.append(r)
+                            elif hasattr(r, "_mapping"):
+                                out.append(dict(r._mapping))
+                            else:
+                                try:
+                                    out.append(dict(r))
+                                except Exception:
+                                    pass
+                        return out
+                    except Exception:
+                        continue
+                except Exception:
+                    continue
+        return []
+
+    def _list_missing_oi_ranges(self, *, interval: str, lookback_hours: int, max_symbols: int) -> List[dict]:
+        if hasattr(self.storage, "list_open_interest_gaps"):
+            try:
+                rows = self.storage.list_open_interest_gaps(
+                    exchange_id=self.exchange_id,
+                    interval=interval,
+                    lookback_hours=int(lookback_hours),
+                    max_symbols=int(max_symbols),
+                ) or []
+                return [dict(r) if not isinstance(r, dict) else r for r in rows]
+            except Exception:
+                self.logger.exception("[OI][REPAIR] list_open_interest_gaps failed interval=%s", interval)
+
+        sql = """
+        WITH c AS (
+            SELECT
+                c.symbol_id,
+                c.open_time
+            FROM candles c
+            WHERE c.exchange_id = %s
+              AND c.interval = %s
+              AND c.open_time >= now() - make_interval(hours => %s)
+        ),
+        gaps AS (
+            SELECT
+                c.symbol_id,
+                c.open_time
+            FROM c
+            LEFT JOIN open_interest oi
+              ON oi.exchange_id = %s
+             AND oi.symbol_id = c.symbol_id
+             AND oi.interval = %s
+             AND oi.ts = c.open_time
+            WHERE oi.ts IS NULL
+        ),
+        ranked AS (
+            SELECT
+                g.symbol_id,
+                MIN(g.open_time) AS start_ts,
+                MAX(g.open_time) AS end_ts,
+                COUNT(*) AS gap_points
+            FROM gaps g
+            GROUP BY g.symbol_id
+        )
+        SELECT
+            r.symbol_id,
+            s.symbol,
+            r.start_ts,
+            r.end_ts,
+            r.gap_points
+        FROM ranked r
+        JOIN symbols s
+          ON s.symbol_id = r.symbol_id
+         AND s.exchange_id = %s
+        ORDER BY r.gap_points DESC, r.end_ts DESC
+        LIMIT %s
+        """
+        return self._storage_fetch_all(
+            sql,
+            [self.exchange_id, interval, int(lookback_hours), self.exchange_id, interval, self.exchange_id, int(max_symbols)],
+        )
+
+    def _repair_symbol_interval_range(
+        self,
+        *,
+        symbol_id: int,
+        symbol: str,
+        interval: str,
+        start_ts: datetime,
+        end_ts: datetime,
+        max_pages: int,
+    ) -> int:
+        start_ts = _floor_ts(start_ts, interval)
+        end_ts = _floor_ts(end_ts, interval)
+        if end_ts < start_ts:
+            return 0
+
+        sec = int(_INTERVAL_SEC.get(interval, 60))
+        cur_end_ms = _ms(end_ts)
+        start_ms = _ms(start_ts)
+        upserts_total = 0
+        pages = 0
+
+        while not self.stop_event.is_set() and pages < max(1, int(max_pages)):
+            pages += 1
+            try:
+                data = self._fetch_hist(
+                    symbol=symbol,
+                    interval=interval,
+                    limit=int(self.cfg.poll_limit_max),
+                    start_time_ms=start_ms,
+                    end_time_ms=cur_end_ms,
+                )
+            except Exception as e:
+                s = str(e)
+                if _is_rate_limit_error_text(s):
+                    self._note_rate_limit(symbol_id, interval, reason=s[:160])
+                else:
+                    self.logger.exception("[OI][REPAIR] REST error symbol=%s interval=%s", symbol, interval)
+                break
+
+            if not data:
+                break
+
+            rows: List[Dict[str, Any]] = []
+            ts_list: List[int] = []
+            for it in data:
+                ts_ms = int(it.get("timestamp") or it.get("time") or 0)
+                if not ts_ms:
+                    continue
+                ts = _floor_ts(_dt_from_ms(ts_ms), interval)
+                if ts < start_ts or ts > end_ts:
+                    continue
+                rows.append(
+                    {
+                        "exchange_id": self.exchange_id,
+                        "symbol_id": int(symbol_id),
+                        "interval": str(interval),
+                        "ts": ts,
+                        "open_interest": _safe_float(it.get("sumOpenInterest") or it.get("openInterest")),
+                        "open_interest_value": _safe_float(it.get("sumOpenInterestValue") or it.get("openInterestValue")),
+                        "source": "rest_repair",
+                    }
+                )
+                ts_list.append(ts_ms)
+
+            if rows:
+                rows.sort(key=lambda x: x["ts"])
+                upserts_total += self._upsert_rows(rows)
+                best_ts = rows[-1]["ts"]
+                prev = self._wm.setdefault(interval, {}).get(symbol_id)
+                if (prev is None) or (best_ts > prev):
+                    self._wm[interval][symbol_id] = best_ts
+                self._note_success()
+
+            if not ts_list:
+                break
+
+            oldest = min(ts_list)
+            if oldest <= start_ms or oldest >= cur_end_ms:
+                break
+            cur_end_ms = oldest - 1
+
+        return int(upserts_total)
+
+    def _run_repair_cycle(self) -> int:
+        if not self.cfg.repair.enabled:
+            return 0
+
+        total_upserts = 0
+        for interval in self.cfg.intervals:
+            ranges = self._list_missing_oi_ranges(
+                interval=interval,
+                lookback_hours=int(self.cfg.repair.lookback_hours),
+                max_symbols=int(self.cfg.repair.max_symbols_per_cycle),
+            )
+            if not ranges:
+                continue
+
+            processed = 0
+            for row in ranges:
+                if self.stop_event.is_set():
+                    break
+                if processed >= int(self.cfg.repair.max_symbols_per_cycle):
+                    break
+
+                try:
+                    symbol_id = int(row.get("symbol_id"))
+                except Exception:
+                    continue
+                symbol = str(row.get("symbol") or self._symbol_name(symbol_id) or "").upper()
+                if not symbol:
+                    continue
+
+                if self.cfg.repair.only_if_not_polling_behind:
+                    wm = self._wm.setdefault(interval, {}).get(symbol_id)
+                    now_dt = _floor_ts(_utcnow() - timedelta(seconds=self.cfg.safety_lag_sec), interval)
+                    sec = int(_INTERVAL_SEC.get(interval, 60))
+                    if wm is not None and (now_dt - wm).total_seconds() > sec * 4:
+                        continue
+
+                start_ts = row.get("start_ts")
+                end_ts = row.get("end_ts")
+                if not isinstance(start_ts, datetime):
+                    start_ts = _normalize_wm_value(start_ts)
+                if not isinstance(end_ts, datetime):
+                    end_ts = _normalize_wm_value(end_ts)
+                if start_ts is None or end_ts is None:
+                    continue
+
+                gap_points = int(row.get("gap_points") or 0)
+                if gap_points < int(self.cfg.repair.min_gap_points):
+                    continue
+
+                up = self._repair_symbol_interval_range(
+                    symbol_id=symbol_id,
+                    symbol=symbol,
+                    interval=interval,
+                    start_ts=start_ts,
+                    end_ts=end_ts,
+                    max_pages=int(self.cfg.repair.max_ranges_per_symbol),
+                )
+                total_upserts += int(up)
+                processed += 1
+
+            if processed > 0:
+                self.logger.info(
+                    "[OI][REPAIR] interval=%s processed=%d upserts=%d lookback_hours=%d",
+                    interval,
+                    processed,
+                    total_upserts,
+                    int(self.cfg.repair.lookback_hours),
+                )
+
+        return int(total_upserts)
+
     # ---------------------------
     # symbol refresh
     # ---------------------------
@@ -1052,6 +1346,7 @@ class BinanceOpenInterestCollector:
         # init per-symbol schedule
         self._init_schedule_all()
 
+        next_repair_ts = time.time() + max(30, int(self.cfg.repair.every_sec))
         last_log = 0.0
         while not self.stop_event.is_set():
             self._refresh_symbols_if_needed()
@@ -1091,16 +1386,27 @@ class BinanceOpenInterestCollector:
                         if self._extra_sleep_sec > 0:
                             time.sleep(min(float(self.cfg.adaptive.post_tick_sleep_max_sec), float(self._extra_sleep_sec)))
 
-            if self.cfg.log_each_cycle and did_any:
+            if now_ts >= next_repair_ts:
+                try:
+                    repair_up = self._run_repair_cycle()
+                    if repair_up > 0:
+                        cycle_up += int(repair_up)
+                except Exception:
+                    self.logger.exception("[OI][REPAIR] cycle failed")
+                finally:
+                    next_repair_ts = time.time() + max(60, int(self.cfg.repair.every_sec))
+
+            if self.cfg.log_each_cycle and (did_any or cycle_up > 0):
                 # log not more often than every ~5s
                 if now_ts - last_log > 5.0:
                     last_log = now_ts
                     self.logger.info(
-                        "[OI] tick ok upserts=%d symbols=%d intervals=%s extra_sleep=%.2f",
+                        "[OI] tick ok upserts=%d symbols=%d intervals=%s extra_sleep=%.2f repair=%s",
                         cycle_up,
                         len(self._symbol_ids),
                         ",".join(self.cfg.intervals),
                         self._extra_sleep_sec,
+                        self.cfg.repair.enabled,
                     )
 
             if not did_any:

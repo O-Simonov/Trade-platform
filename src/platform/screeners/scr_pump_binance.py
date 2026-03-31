@@ -7,6 +7,8 @@ from dataclasses import dataclass, field, fields, is_dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
+import pandas as pd
+
 from src.platform.core.utils.candles import interval_to_timedelta
 from src.platform.data.storage.postgres.storage import PostgreSQLStorage
 
@@ -307,6 +309,98 @@ def _fetch_batch_candles(
             rec['ts'] = ts
         out.setdefault(sid, []).append(rec)
     return out
+
+
+
+
+def _prepare_confirmed_oi_window_rows(
+    series: List[Dict[str, Any]],
+    *,
+    end_ts: datetime,
+    need_points: int,
+    allow_missing_inside: int = 0,
+    value_key: str = "open_interest",
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """
+    Prepare a confirmed flow window from DB series.
+
+    Rules:
+    - keep only rows with ts <= requested end_ts
+    - drop tail rows with null target value
+    - require the last confirmed ts to match end_ts exactly; otherwise we treat
+      the latest candle bar as not yet confirmed for OI/CVD flow usage
+    - then take the last need_points confirmed rows
+    - if missing values remain inside the window above threshold -> invalid
+    """
+    diag: Dict[str, Any] = {
+        "ok": False,
+        "reason": "empty_series",
+        "rows_total": 0,
+        "rows_le_end": 0,
+        "rows_after_tail_trim": 0,
+        "tail_null_dropped": 0,
+        "need_points": int(max(0, need_points)),
+        "window_available": 0,
+        "missing_inside_window": 0,
+        "requested_end_ts": end_ts,
+        "confirmed_end_ts": None,
+    }
+    if not series:
+        return [], diag
+
+    end_ts2 = _as_dt(end_ts) or end_ts
+    rows = []
+    for r in _sort_series_by_ts(series):
+        ts = _as_dt(r.get("ts"))
+        if ts is None or ts > end_ts2:
+            continue
+        rec = dict(r)
+        rec["ts"] = ts
+        rows.append(rec)
+
+    diag["rows_total"] = int(len(series))
+    diag["rows_le_end"] = int(len(rows))
+    if not rows:
+        diag["reason"] = "no_rows_le_end"
+        return [], diag
+
+    last_valid_idx = None
+    for i in range(len(rows) - 1, -1, -1):
+        if _to_opt_float(rows[i].get(value_key)) is not None:
+            last_valid_idx = i
+            break
+
+    if last_valid_idx is None:
+        diag["reason"] = "all_values_null"
+        diag["tail_null_dropped"] = int(len(rows))
+        return [], diag
+
+    trimmed = rows[: last_valid_idx + 1]
+    diag["rows_after_tail_trim"] = int(len(trimmed))
+    diag["tail_null_dropped"] = int(len(rows) - len(trimmed))
+    confirmed_end_ts = _as_dt(trimmed[-1].get("ts"))
+    diag["confirmed_end_ts"] = confirmed_end_ts
+
+    if confirmed_end_ts != end_ts2:
+        diag["reason"] = "latest_bar_unconfirmed"
+        return [], diag
+
+    candidate = trimmed[-max(1, int(need_points)):]
+    diag["window_available"] = int(len(candidate))
+
+    if len(candidate) < max(1, int(need_points)):
+        diag["reason"] = "not_enough_confirmed_rows"
+        return candidate, diag
+
+    missing_inside = sum(1 for r in candidate if _to_opt_float(r.get(value_key)) is None)
+    diag["missing_inside_window"] = int(missing_inside)
+    if missing_inside > int(max(0, allow_missing_inside)):
+        diag["reason"] = "missing_inside_window"
+        return candidate, diag
+
+    diag["ok"] = True
+    diag["reason"] = ""
+    return candidate, diag
 
 
 def _fetch_batch_open_interest_latest(
@@ -871,12 +965,14 @@ class ScrPumpBinance:
 
     def _calc_flow_info(self, storage: PostgreSQLStorage, exchange_id: int, symbol_id: int, interval: str, start_ts: datetime, end_ts: datetime, cfg: PumpConfig, kind: str) -> Tuple[Optional[float], Optional[List[float]], Optional[str]]:
         """
-        Read OI/CVD strictly in the same interval as the signal candles.
+        Read OI/CVD strictly in the same interval as the signal candles and use
+        only confirmed bars for flow logic.
 
-        Important: do not fallback to 5m/15m/1h here. Mixing intervals makes
-        both calculations and diagnostics inconsistent with the candle timeframe.
-        If data for the requested interval is absent in DB, we return no flow data
-        and let higher-level logic decide how strict to be.
+        Key protection:
+        - no fallback to another interval
+        - if the latest bar is not confirmed for OI/CVD at exact candle ts, do not
+          silently reuse an older point for the current candle
+        - use the last confirmed contiguous window only
         """
         need_pts = self._need_points(cfg)
         try:
@@ -906,9 +1002,19 @@ class ScrPumpBinance:
                 value_key = "cvd_quote"
             if not series:
                 return None, None, str(interval)
-            series = _sort_series_by_ts(series)
-            bounds = _pick_series_bounds(series, start_ts=start_ts, end_ts=end_ts, value_key=value_key)
-            pts = _last_n_values(series, end_ts=end_ts, value_key=value_key, n=need_pts)
+
+            prepared_rows, diag = _prepare_confirmed_oi_window_rows(
+                series,
+                end_ts=end_ts,
+                need_points=need_pts,
+                allow_missing_inside=0,
+                value_key=value_key,
+            )
+            if not diag.get("ok"):
+                return None, None, str(interval)
+
+            bounds = _pick_series_bounds(prepared_rows, start_ts=start_ts, end_ts=end_ts, value_key=value_key)
+            pts = _last_n_values(prepared_rows, end_ts=end_ts, value_key=value_key, n=need_pts)
             delta_pct = None
             if bounds is not None:
                 a, b = bounds
@@ -1654,6 +1760,8 @@ class ScrPumpBinance:
                     if cfg.debug or cfg.runtime.enable_debug_logs:
                         flow_metrics = (cand.context or {}).get("flow_metrics") or {}
                         trend_diag = (cand.context or {}).get("trend") or {}
+                        if why in {"oi", "cvd", "oi_cvd", "flow_partial"} and not flow_metrics.get("oi_delta_pct") and side == "BUY":
+                            log.info("[PUMP][FLOW_SKIP_DATA] %s side=%s interval=%s reason=%s", symbol, side, interval, why)
                         log.info("[PUMP][FLOW_FAIL] %s side=%s reason=%s score=%.2f oi=%.4f/%.4f cvd=%.4f/%.4f flow=%s trend_failures=%s", symbol, side, why, float(cand.score or 0.0), float(flow_metrics.get("oi_delta_pct") or 0.0), float(flow_metrics.get("min_oi_delta_pct") or 0.0), float(flow_metrics.get("cvd_delta_pct") or 0.0), float(flow_metrics.get("min_cvd_delta_pct") or 0.0), flow_metrics.get("flow_confirmation" ) or (cand.context or {}).get("flow_confirmation"), trend_diag.get("trend_failures"))
                     continue
                 stats["flow_ok"] += 1

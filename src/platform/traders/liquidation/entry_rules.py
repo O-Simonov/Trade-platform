@@ -940,6 +940,7 @@ class TradeLiquidationEntryRulesMixin:
                                 price=float(add_ref_price),
                                 cap_pct_wallet=float(add_cap_pct),
                                 qty_step=float(qty_step or 0.0),
+                                leverage=float(getattr(self.p, "leverage", 1.0) or 1.0),
                             )
                             if capped_add_qty < float(add_qty):
                                 log.info("[trade_liquidation][LIMIT] capped ENTRY ADD1 %s %s qty %.8f -> %.8f by averaging_add_max_notional_pct_wallet=%.4f", symbol, ledger_side, float(add_qty), float(capped_add_qty), float(add_cap_pct))
@@ -952,6 +953,7 @@ class TradeLiquidationEntryRulesMixin:
                                 price=float(add_ref_price),
                                 cap_pct_wallet=float(main_total_cap_pct),
                                 qty_step=float(qty_step or 0.0),
+                                leverage=float(getattr(self.p, "leverage", 1.0) or 1.0),
                             )
                             allowed_add_qty = max(0.0, float(max_total_qty) - float(qty))
                             if qty_step > 0.0:

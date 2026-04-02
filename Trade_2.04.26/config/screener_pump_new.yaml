@@ -1,0 +1,454 @@
+# ============================================================
+# Pump Screener Config
+# Файл: config/screener_pump.yaml
+# Назначение:
+#   Конфиг для pump-скринера Binance futures/perpetual.
+#
+# Основная идея скринера:
+#   1) найти резкий импульс цены (pump / expansion),
+#   2) проверить подтверждение объёмом,
+#   3) проверить подтверждение OI / CVD / funding,
+#   4) присвоить score сигналу,
+#   5) отфильтровать мусор и оставить только качественные сигналы.
+#
+# ВАЖНО:
+#   - Этот конфиг уже подготовлен под будущий optimizer/replay.
+#   - Часть параметров может пока не использоваться в твоей текущей
+#     реализации 1-в-1, но они заложены правильно и пригодятся при доработке.
+# ============================================================
+
+screeners:
+  - name: "scr_pump_binance"
+    enabled: true                      # Включен ли этот скринер.
+    runner: "scr_pump_binance"         # Имя python-раннера / класса / модуля скринера.
+    exchange: "binance"                # Биржа для скринера.
+    market_type: "perpetual"           # Тип рынка: perpetual / futures.
+
+    # --------------------------------------------------------
+    # Интервалы, на которых скринер будет искать сигналы.
+    # 5m  = быстрые ранние сигналы
+    # 15m = более стабильные
+    # 1h  = более редкие, но потенциально качественные
+    # --------------------------------------------------------
+    intervals:
+      - "5m"
+      - "15m"
+      - "1h"
+
+    # --------------------------------------------------------
+    # Ограничения по Universe / Symbols
+    # --------------------------------------------------------
+    universe:
+      enabled: true                    # Использовать ли фильтрацию пула инструментов.
+      quote_asset: "USDT"              # Работать только с USDT-парами.
+      futures_only: true               # Брать только фьючерсные/перпетуальные инструменты.
+      active_only: true                # Исключать делистнутые/неактивные рынки.
+      max_symbols: 600                 # Максимум символов за один цикл.
+      symbols_whitelist: []            # Если заполнить - скринить только эти символы.
+      symbols_blacklist: []            # Исключить конкретные символы.
+      min_price: 0.0005                # Минимальная цена инструмента.
+      max_price: 20000                 # Максимальная цена инструмента.
+      min_tick_size: 0.0               # Мин. допустимый tick size. 0 = не фильтровать.
+
+    # --------------------------------------------------------
+    # Глобальные параметры запуска
+    # --------------------------------------------------------
+    runtime:
+      signal_mode: "both"              # Режим сигналов: buy / sell / both.
+      max_signal_age_minutes: 20       # Максимальный возраст сигнала, старше которого он не отправляется.
+      cooldown_minutes: 30             # Защита от повторной отправки похожих сигналов по одному символу.
+      max_signals_per_cycle: 20        # Ограничение количества сигналов за один цикл.
+      sort_by: "score"                 # Как сортировать найденные сигналы: score / pct / volume / oi.
+      descending: true                 # Сортировка по убыванию.
+      require_fresh_last_bar: true     # Требовать, чтобы последняя свеча была свежей.
+      use_closed_bar_only: true        # Использовать только закрытые свечи для большей стабильности.
+      enable_debug_logs: true          # Подробные debug/info логи по стадиям фильтрации.
+
+    # --------------------------------------------------------
+    # Исторические окна / lookback
+    # --------------------------------------------------------
+    windows:
+      scan_lookback_bars: 120          # Сколько последних свечей анализировать в поиске паттерна.
+      base_lookback_bars: 24           # База/накопление до импульса.
+      confirm_lookback_bars: 6         # Сколько свечей смотреть для подтверждения после триггера.
+      oi_lookback_bars: 12             # Окно анализа OI.
+      cvd_lookback_bars: 12            # Окно анализа CVD.
+      funding_lookback_points: 1       # Сколько последних funding значений учитывать.
+      atr_lookback_bars: 14            # Окно ATR для оценки силы движения.
+
+    # --------------------------------------------------------
+    # Ликвидность / качество рынка
+    # Отсекаем слишком тонкие и шумные инструменты.
+    # --------------------------------------------------------
+    liquidity:
+      min_quote_volume_24h: 5000000    # Минимальный суточный quote-volume по рынку.
+      min_base_quote_volume: 250000    # Минимальный медианный объём базы перед импульсом.
+      min_last_bar_quote_volume: 80000 # Минимальный объём последней свечи.
+      min_notional_oi: 3000000         # Минимальный OI в денежном выражении.
+      max_spread_bps: 35               # Максимальный допустимый спред в bps, если доступен.
+      skip_low_liquidity: true         # Жёстко отбрасывать низколиквидные инструменты.
+
+    # --------------------------------------------------------
+    # Фильтр качества базы
+    # Идея: хороший pump/squeeze чаще стартует из достаточно "спокойной" базы.
+    # --------------------------------------------------------
+    base_quality:
+      enabled: true                    # Включить фильтр качества базы.
+      base_range_max_pct: 8.0          # Максимальный диапазон базы (%), чтобы база не была слишком "разболтанной".
+      base_noise_max_pct: 4.0          # Максимальный шум внутри базы (%).
+      base_trend_abs_max_pct: 5.0      # Максимальный общий тренд базы по модулю (%).
+      base_volume_max_mult: 2.2        # База не должна уже быть перегрета объёмом.
+      base_green_red_imbalance_max: 0.75 # Дисбаланс зелёных/красных свечей в базе; защищает от уже идущего тренда.
+      require_calm_base: true          # Жёстко требовать "спокойную" базу.
+
+    # --------------------------------------------------------
+    # Общие volume-фильтры
+    # Volume — один из главных фильтров качества pump-сигнала.
+    # --------------------------------------------------------
+    volume_filters:
+      enabled: true                    # Включить объёмные фильтры.
+      min_volume_mult: 1.25            # Минимальный multiplier объёма к базовому среднему/медиане.
+      min_volume_spike_mult: 1.60      # Минимальный spike объёма на триггерной свече.
+      min_volume_acceleration: 1.05    # Ускорение объёма против предыдущих свечей.
+      require_volume_confirmation: true # Без подтверждения объёмом сигнал не проходит.
+      use_median_base_volume: true     # Использовать медиану базы вместо среднего для большей устойчивости.
+      max_anomaly_volume_mult: 12.0    # Если объём аномально огромный, можно помечать как перегретый.
+
+    # --------------------------------------------------------
+    # BUY-профиль
+    # Ищем импульс вверх с подтверждением потока.
+    # --------------------------------------------------------
+    buy:
+      enabled: true                    # Включить BUY-сигналы.
+      enable_early: true               # Ранние BUY-сигналы (менее жёсткие фильтры).
+      enable_confirmed: true           # Подтверждённые BUY-сигналы (более жёсткие фильтры).
+
+      # Базовая геометрия импульса
+      window_minutes: 15               # За какое время искать импульс вверх.
+      min_price_change_pct: 1.8        # Минимальный рост цены для BUY-паттерна.
+      min_price_change_atr: 0.7        # Минимальная сила движения в ATR.
+      max_price_extension_pct: 8.0     # Не брать слишком перерастянутый импульс.
+      min_green_candles: 2             # Минимум зелёных свечей в импульсе.
+      require_last_bar_green: false    # Требовать ли, чтобы последняя свеча была зелёной.
+      require_close_near_high: false   # Требовать ли закрытие у верхней части свечи.
+
+      # Объём BUY
+      min_volume_mult: 1.35            # Минимальный volume multiplier для BUY.
+      min_volume_spike_mult: 1.80      # Минимальный spike объёма на BUY.
+      min_volume_acceleration: 1.08    # Минимальное ускорение объёма на BUY.
+
+      # OI / CVD BUY
+      min_oi_delta_pct: 0.35           # Минимальный рост OI в %.
+      min_oi_value_delta_pct: 0.30     # Минимальный рост OI в денежном выражении.
+      min_cvd_delta_pct: 0.10          # Минимальный рост CVD.
+      require_oi_confirmation: true    # Требовать ли подтверждение OI.
+      require_cvd_confirmation: false  # Требовать ли подтверждение CVD.
+      oi_up_ratio_min: 0.55            # Доля ап-свечей OI внутри окна.
+      oi_drawdown_from_peak_min_pct: -0.45 # Допустимая просадка OI от локального пика.
+
+      # Структурное подтверждение BUY
+      breakout_lookback_bars: 20       # Окно для проверки локального breakout.
+      require_breakout: false          # Требовать ли явный breakout над локальным диапазоном.
+      breakout_buffer_pct: 0.15        # Буфер breakout над локальным high.
+      allow_retest_entry: true         # Разрешить сигнал после retest вместо чистого breakout.
+
+      # Score BUY
+      min_signal_score: 42             # Минимальный score BUY-сигнала.
+      early_min_signal_score: 36       # Минимальный score для early BUY.
+      confirmed_min_signal_score: 48   # Минимальный score для confirmed BUY.
+
+    # --------------------------------------------------------
+    # SELL-профиль
+    # Ищем локальный pump + признаки разворота / exhaustion.
+    # --------------------------------------------------------
+    sell:
+      enabled: true                    # Включить SELL-сигналы.
+      enable_early: true               # Ранние SELL-сигналы.
+      enable_confirmed: true           # Подтверждённые SELL-сигналы.
+
+      # Базовая логика pump -> reversal
+      window_minutes: 20               # За какое время искать pump и разворот.
+      min_pump_pct: 2.6                # Минимальный рост перед сигналом SELL.
+      min_pump_atr: 0.9                # Минимальная сила pump в ATR.
+      confirm_lookforward_bars: 3      # Сколько свечей ждать подтверждение разворота.
+      reversal_from_peak_pct: 0.35     # Минимальный откат от локального пика для SELL.
+      min_red_body_pct: 0.20           # Минимальный размер красного тела свечи подтверждения.
+      min_upper_wick_pct: 0.25         # Минимальный верхний фитиль как признак rejection.
+      require_red_confirm: true        # Требовать красную свечу подтверждения.
+      require_lower_high: false        # Требовать formation lower high.
+      require_close_below_prev_close: false # Требовать закрытие ниже предыдущего close.
+      confirm_close_position_max: 0.55 # Насколько низко в свече должен быть close при SELL-confirm.
+
+      # Объём SELL
+      min_volume_mult: 1.25            # Минимальный volume multiplier для SELL.
+      min_volume_spike_mult: 1.50      # Минимальный spike объёма для SELL.
+      require_volume_confirmation: true # Без объёма SELL не проходит.
+
+      # OI / CVD SELL
+      max_oi_delta_pct: 0.20           # Максимально допустимый дальнейший рост OI; выше = SELL слабее.
+      max_cvd_delta_pct: 0.10          # Максимальный допустимый рост CVD.
+      allow_flat_oi: true              # Разрешить флэтовый OI для SELL.
+      require_oi_exhaustion: false     # Требовать ли явное истощение OI.
+      require_cvd_weakness: false      # Требовать ли слабость CVD.
+
+      # Score SELL
+      min_signal_score: 44             # Минимальный score SELL-сигнала.
+      early_min_signal_score: 38       # Минимальный score для early SELL.
+      confirmed_min_signal_score: 50   # Минимальный score для confirmed SELL.
+
+    # --------------------------------------------------------
+    # OI / CVD trend-фильтры
+    # Нужны для отделения реального потока от шума.
+    # --------------------------------------------------------
+    trend_filters:
+      enabled: true                    # Включить анализ тренда OI/CVD.
+      trend_method: "ratio"            # Метод оценки тренда: ratio / slope / steps.
+      trend_mode: "soft"               # soft = влияет на score, hard = обязателен, off = выключить.
+      confirm_trend_bars: 3            # Сколько последних баров проверять на подтверждение.
+      slope_bars: 4                    # Окно расчёта slope.
+      oi_eps_pct: 0.02                 # Порог чувствительности OI.
+      cvd_eps_pct: 0.02                # Порог чувствительности CVD.
+
+      # BUY slope
+      buy_oi_slope_min_bps: 2.0        # Минимальный положительный slope OI для BUY.
+      buy_cvd_slope_min_bps: 1.0       # Минимальный положительный slope CVD для BUY.
+
+      # SELL slope
+      sell_oi_slope_max_bps: 1.0       # Для SELL OI не должен расти слишком сильно.
+      sell_cvd_slope_max_bps: 0.5      # Для SELL CVD не должен быть слишком сильным вверх.
+
+    # --------------------------------------------------------
+    # Funding filter
+    # Можно использовать либо как hard-filter, либо как soft penalty в score.
+    # --------------------------------------------------------
+    funding:
+      enabled: true                    # Включить funding-проверку.
+      mode: "soft"                     # hard / soft / off.
+      buy_max_funding_pct: 0.012       # Для BUY слишком высокий funding = риск перегрева.
+      sell_min_funding_pct: 0.000      # Для SELL положительный funding может быть плюсом.
+      sell_prefer_positive_funding: true # Для SELL положительный funding повышает качество шорт-сетапа.
+      extreme_positive_funding_pct: 0.03 # Слишком высокий positive funding = перегрев.
+      extreme_negative_funding_pct: -0.03 # Слишком высокий negative funding = риск контртренда.
+
+    # --------------------------------------------------------
+    # Score model
+    # Итоговый сигнал оценивается по нескольким компонентам.
+    # Потом сравнивается с min_signal_score.
+    # --------------------------------------------------------
+    scoring:
+      enabled: true                    # Включить итоговый score.
+      clamp_each_component_0_100: true # Ограничивать ли каждый компонент в диапазоне 0..100.
+      normalize_total_to_100: true     # Нормализовать ли итоговый score к 100.
+
+      # Веса score-компонентов
+      weight_price: 0.25               # Вес силы движения цены.
+      weight_volume: 0.20              # Вес подтверждения объёмом.
+      weight_oi: 0.20                  # Вес подтверждения OI.
+      weight_cvd: 0.10                 # Вес подтверждения CVD.
+      weight_structure: 0.15           # Вес качества структуры/паттерна.
+      weight_funding: 0.05             # Вес funding-составляющей.
+      weight_base_quality: 0.05        # Вес качества базы.
+
+      # Пороговые уровни качества
+      weak_score_threshold: 35         # Ниже — слабый сигнал.
+      medium_score_threshold: 50       # Средний сигнал.
+      strong_score_threshold: 65       # Сильный сигнал.
+      very_strong_score_threshold: 80  # Очень сильный сигнал.
+
+    # --------------------------------------------------------
+    # Фильтр перегретых / мусорных движений
+    # Защищает от поздних входов после уже "улетевшего" рынка.
+    # --------------------------------------------------------
+    overheating:
+      enabled: true                    # Включить фильтр перегрева.
+      max_price_extension_pct: 12.0    # Максимальное растяжение цены от базы.
+      max_oi_spike_pct: 8.0            # Слишком резкий рост OI может означать позднюю фазу.
+      max_volume_spike_mult: 8.0       # Слишком дикий объём — возможен финальный выброс.
+      reject_vertical_moves: true      # Отбрасывать почти вертикальные движения.
+      vertical_move_atr_threshold: 3.0 # Если move в ATR выше порога — считать вертикальным.
+
+    # --------------------------------------------------------
+    # Фильтры против шумовых и фейковых сигналов
+    # --------------------------------------------------------
+    anti_noise:
+      enabled: true                    # Включить anti-noise фильтры.
+      min_body_to_range_ratio: 0.20    # Слишком маленькое тело относительно диапазона = шум.
+      max_wick_to_body_ratio: 4.5      # Слишком большие фитили — рынок нестабилен.
+      max_gap_pct: 3.0                 # Если есть резкий gap между барами — можно отбрасывать.
+      reject_erratic_series: true      # Удалять хаотичные серии свечей.
+      erratic_range_threshold_pct: 15.0 # Порог "дерганости" ряда свечей.
+
+    # --------------------------------------------------------
+    # Опции подготовки к optimizer / replay
+    # Пока это конфигурационный задел под будущее.
+    # --------------------------------------------------------
+    optimizer:
+      enabled: false                   # Оптимизатор в обычном рантайме выключен.
+      profile_name: "pump_default"     # Имя профиля параметров для optimizer/replay.
+      store_metrics: true              # Сохранять метрики в результатах optimizer/replay.
+      objective: "profit_factor"       # Базовая целевая метрика optimizer.
+      min_trades: 20                   # Минимум сделок для валидности результата.
+      min_win_rate_pct: 35             # Минимальный допустимый winrate.
+      min_avg_pnl_pct: 0.10            # Минимальный средний pnl на сделку.
+      penalty_for_low_sample: true     # Штрафовать конфиги с маленьким числом сделок.
+
+    # --------------------------------------------------------
+    # Перекрытия параметров по таймфреймам
+    # Это один из самых важных блоков:
+    # один и тот же threshold для 5m и 1h почти всегда даёт плохие результаты.
+    # --------------------------------------------------------
+    per_interval_overrides:
+      "5m":
+        runtime:
+          max_signal_age_minutes: 10   # На 5m сигнал быстро стареет.
+          cooldown_minutes: 20         # Меньший cooldown для быстрых сетапов.
+
+        windows:
+          scan_lookback_bars: 100      # Для 5m достаточно чуть меньшего окна.
+          base_lookback_bars: 20       # База для 5m короче.
+          confirm_lookback_bars: 5     # Подтверждение короче.
+          oi_lookback_bars: 10         # Окно OI компактнее.
+          cvd_lookback_bars: 10        # Окно CVD компактнее.
+
+        buy:
+          window_minutes: 5            # Быстрый buy-импульс.
+          min_price_change_pct: 1.35   # На 5m порог ниже.
+          min_price_change_atr: 0.60   # Чуть мягче ATR-порог.
+          min_volume_mult: 1.30        # Объёмный фильтр мягче.
+          min_volume_spike_mult: 1.65  # Spike ниже, чем на старших ТФ.
+          min_oi_delta_pct: 0.25       # OI-порог мягче.
+          min_oi_value_delta_pct: 0.20 # Денежный OI-порог мягче.
+          min_signal_score: 38         # Общий порог score ниже.
+          early_min_signal_score: 34   # Early BUY для 5m.
+          confirmed_min_signal_score: 44 # Confirmed BUY для 5m.
+
+        sell:
+          window_minutes: 8            # Быстрый поиск локального pump/reversal.
+          min_pump_pct: 1.90           # На 5m локальный pump меньше.
+          reversal_from_peak_pct: 0.25 # Откат от пика меньше.
+          min_red_body_pct: 0.15       # Красное тело может быть меньше.
+          min_volume_mult: 1.20        # Чуть мягче объём на SELL.
+          min_volume_spike_mult: 1.40  # Spike мягче.
+          min_signal_score: 40         # Общий score SELL на 5m.
+          early_min_signal_score: 35   # Early SELL на 5m.
+          confirmed_min_signal_score: 46 # Confirmed SELL на 5m.
+
+      "15m":
+        runtime:
+          max_signal_age_minutes: 20   # На 15m сигнал живёт дольше.
+          cooldown_minutes: 30         # Средний cooldown.
+
+        windows:
+          scan_lookback_bars: 120      # Стандартное окно.
+          base_lookback_bars: 24       # Стандартная база.
+          confirm_lookback_bars: 6     # Стандартное подтверждение.
+          oi_lookback_bars: 12         # Стандартное OI окно.
+          cvd_lookback_bars: 12        # Стандартное CVD окно.
+
+        buy:
+          window_minutes: 15           # Стандартный buy window.
+          min_price_change_pct: 1.80   # Баланс чувствительности и качества.
+          min_price_change_atr: 0.70   # ATR подтверждение.
+          min_volume_mult: 1.35        # Объёмное подтверждение.
+          min_volume_spike_mult: 1.80  # Spike объёма.
+          min_oi_delta_pct: 0.35       # OI подтверждение.
+          min_oi_value_delta_pct: 0.30 # Денежный OI.
+          min_signal_score: 42         # Основной score.
+          early_min_signal_score: 36   # Early.
+          confirmed_min_signal_score: 48 # Confirmed.
+
+        sell:
+          window_minutes: 20           # Стандартный sell window.
+          min_pump_pct: 2.60           # Стандартный порог pump.
+          reversal_from_peak_pct: 0.35 # Стандартный откат от пика.
+          min_red_body_pct: 0.20       # Стандартный red body.
+          min_volume_mult: 1.25        # Стандартный volume filter.
+          min_volume_spike_mult: 1.50  # Стандартный spike.
+          min_signal_score: 44         # Основной score.
+          early_min_signal_score: 38   # Early.
+          confirmed_min_signal_score: 50 # Confirmed.
+
+      "1h":
+        runtime:
+          max_signal_age_minutes: 90   # На 1h сигнал стареет медленнее.
+          cooldown_minutes: 90         # Дольше cooldown, чтобы не спамить одним инструментом.
+
+        windows:
+          scan_lookback_bars: 180      # На 1h имеет смысл смотреть глубже.
+          base_lookback_bars: 30       # База длиннее.
+          confirm_lookback_bars: 8     # Подтверждение дольше.
+          oi_lookback_bars: 18         # OI window больше.
+          cvd_lookback_bars: 18        # CVD window больше.
+
+        buy:
+          window_minutes: 60           # Для 1h ищем более длинный импульс.
+          min_price_change_pct: 3.20   # На 1h нужен более сильный move.
+          min_price_change_atr: 1.00   # ATR-порог выше.
+          min_volume_mult: 1.50        # Более строгий volume filter.
+          min_volume_spike_mult: 2.10  # Более строгий spike.
+          min_oi_delta_pct: 0.60       # OI должен расти увереннее.
+          min_oi_value_delta_pct: 0.55 # Денежный OI строже.
+          min_signal_score: 50         # Общий score на 1h выше.
+          early_min_signal_score: 43   # Early на 1h.
+          confirmed_min_signal_score: 58 # Confirmed на 1h.
+
+        sell:
+          window_minutes: 90           # Для 1h разворот формируется дольше.
+          min_pump_pct: 4.50           # На 1h pump должен быть больше.
+          reversal_from_peak_pct: 0.60 # Более выраженный откат от пика.
+          min_red_body_pct: 0.30       # Требуем более явную reversal candle.
+          min_volume_mult: 1.40        # Объёмный фильтр строже.
+          min_volume_spike_mult: 1.80  # Spike строже.
+          min_signal_score: 52         # Общий SELL score выше.
+          early_min_signal_score: 45   # Early на 1h.
+          confirmed_min_signal_score: 60 # Confirmed на 1h.
+
+    # --------------------------------------------------------
+    # Alerting / telegram / routing
+    # --------------------------------------------------------
+    alerts:
+      enabled: true                    # Включить отправку сигналов.
+      channel: "telegram"              # Канал доставки сигналов.
+      send_only_new: true              # Отправлять только новые сигналы.
+      include_score: true              # Добавлять score в сообщение.
+      include_context_stats: true      # Добавлять контекст: volume/OI/CVD/funding.
+      include_interval: true           # Добавлять таймфрейм.
+      include_profile: true            # Добавлять тип сигнала: early / confirmed.
+      include_debug_metrics: false     # Добавлять ли debug-метрики в алерт.
+      max_alerts_per_cycle: 10         # Ограничение количества алертов за цикл.
+
+    # --------------------------------------------------------
+    # Построение графиков
+    # Графики дорогие по времени, поэтому лучше ограничивать.
+    # --------------------------------------------------------
+    plots:
+      enabled: true                    # Строить ли графики.
+      plot_only_for_sent_signals: true # Строить графики только для реально отправленных сигналов.
+      plot_only_top_scored: true       # Строить только для топовых по score сигналов.
+      plot_top_n: 8                    # Максимум графиков за цикл.
+      include_oi_panel: true           # Добавлять панель OI.
+      include_cvd_panel: true          # Добавлять панель CVD.
+      include_volume_panel: true       # Добавлять объём.
+      include_funding_annotation: true # Подписывать funding на графике.
+      image_format: "png"              # Формат изображения.
+      dpi: 120                         # Качество / размер графика.
+      compress_images: true            # Сжимать изображения для более быстрой отправки.
+
+    # --------------------------------------------------------
+    # Storage / persistence
+    # --------------------------------------------------------
+    storage:
+      enabled: true                    # Сохранять сигналы в БД.
+      store_candidates: false          # Сохранять ли промежуточных кандидатов.
+      store_rejections: false          # Сохранять ли причины отбраковки.
+      store_metrics: true              # Сохранять метрики по сигналу.
+      deduplicate_before_insert: true  # Проверять дубликаты перед вставкой.
+
+    # --------------------------------------------------------
+    # Совместимость / безопасный режим
+    # Эти параметры помогают мягко внедрять новый конфиг.
+    # --------------------------------------------------------
+    compatibility:
+      strict_mode: false               # Если true — падать при неизвестных/неиспользуемых полях.
+      allow_unused_fields: true        # Разрешать временно лишние поля, пока код не догнал конфиг.
+      fallback_to_legacy_logic: false  # Если true — позволить откат к старой логике при частичной интеграции.

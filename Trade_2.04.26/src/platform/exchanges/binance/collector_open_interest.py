@@ -1,0 +1,1455 @@
+# src/platform/exchanges/binance/collector_open_interest.py
+from __future__ import annotations
+
+import hashlib
+import logging
+import random
+import threading
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone, timedelta
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+log = logging.getLogger("src.platform.exchanges.binance.collector_open_interest")
+
+# Binance Open Interest Statistics periods (USDS-M Futures):
+# "5m","15m","30m","1h","2h","4h","6h","12h","1d"
+_INTERVAL_SEC: Dict[str, int] = {
+    "5m": 300,
+    "15m": 900,
+    "30m": 1800,
+    "1h": 3600,
+    "2h": 7200,
+    "4h": 14400,
+    "6h": 21600,
+    "12h": 43200,
+    "1d": 86400,
+}
+
+_ALLOWED_INTERVALS = set(_INTERVAL_SEC.keys())
+
+# Binance openInterestHist supports only a limited recent history window.
+# Keep a small safety margin under the documented limit to avoid HTTP 400 / code -1130.
+_OI_HIST_MAX_LOOKBACK_DAYS = 29
+
+
+# -------------------------
+# helpers
+# -------------------------
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _ms(dt: datetime) -> int:
+    return int(dt.timestamp() * 1000)
+
+
+def _dt_from_ms(ms: int) -> datetime:
+    return datetime.fromtimestamp(int(ms) / 1000.0, tz=timezone.utc)
+
+
+def _clamp_oi_hist_window(
+    *,
+    start_time_ms: Optional[int],
+    end_time_ms: Optional[int],
+    now_dt: Optional[datetime] = None,
+) -> Tuple[Optional[int], Optional[int]]:
+    """
+    Clamp openInterestHist window to the recent history horizon accepted by Binance.
+
+    Binance may reject too old startTime with HTTP 400 / code -1130.
+    We keep a small safety margin and ensure start < end when both are present.
+    """
+    now_dt = now_dt or _utcnow()
+    min_allowed_dt = now_dt - timedelta(days=_OI_HIST_MAX_LOOKBACK_DAYS)
+    min_allowed_ms = _ms(min_allowed_dt)
+
+    st = int(start_time_ms) if start_time_ms is not None else None
+    et = int(end_time_ms) if end_time_ms is not None else None
+
+    if st is not None and st < min_allowed_ms:
+        st = min_allowed_ms
+
+    # If endTime is older than the allowed horizon, clamp it too.
+    if et is not None and et < min_allowed_ms:
+        et = min_allowed_ms
+
+    # Invalid or empty window -> drop startTime and rely on recent tail by limit/endTime.
+    if st is not None and et is not None and st >= et:
+        st = None
+
+    return st, et
+
+
+def _safe_float(x: Any) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return 0.0
+
+
+def _floor_ts(dt: datetime, interval: str) -> datetime:
+    sec = _INTERVAL_SEC.get(str(interval))
+    if not sec:
+        return dt.replace(second=0, microsecond=0)
+    ts = int(dt.timestamp())
+    floored = (ts // sec) * sec
+    return datetime.fromtimestamp(floored, tz=timezone.utc)
+
+
+def _chunks(xs: Sequence[int], n: int) -> List[List[int]]:
+    n = max(1, int(n))
+    out: List[List[int]] = []
+    cur: List[int] = []
+    for x in xs:
+        cur.append(int(x))
+        if len(cur) >= n:
+            out.append(cur)
+            cur = []
+    if cur:
+        out.append(cur)
+    return out
+
+
+def _normalize_wm_value(v: Any) -> Optional[datetime]:
+    if v is None:
+        return None
+    if isinstance(v, datetime):
+        if v.tzinfo is None:
+            return v.replace(tzinfo=timezone.utc)
+        return v.astimezone(timezone.utc)
+    if isinstance(v, (int, float)):
+        x = float(v)
+        if x > 10_000_000_000:  # ms
+            return _dt_from_ms(int(x))
+        return datetime.fromtimestamp(int(x), tz=timezone.utc)
+    if isinstance(v, str):
+        try:
+            dt = datetime.fromisoformat(v.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        except Exception:
+            return None
+    return None
+
+
+def _jitter(sec: float) -> float:
+    s = float(max(0.0, sec))
+    if s <= 0:
+        return 0.0
+    return random.uniform(0.0, s)
+
+
+def _is_rate_limit_error_text(s: str) -> bool:
+    ss = (s or "").lower()
+    # Binance typical signals: HTTP 429, code -1003, sometimes "too many requests"
+    return ("429" in ss) or ("-1003" in ss) or ("too many request" in ss) or ("ip rate limit" in ss) or ("418" in ss)
+
+
+# -------------------------
+# rate limiter
+# -------------------------
+
+class _TokenBucket:
+    """
+    Simple token-bucket limiter for REST calls.
+    We treat each request as "1 token" (even though OI stats has weight 0, it still has IP limit).
+    """
+    def __init__(self, *, rate_per_sec: float, capacity: int) -> None:
+        self._rate = float(max(0.001, rate_per_sec))
+        self._cap = float(max(1, capacity))
+        self._tokens = float(self._cap)
+        self._ts = time.monotonic()
+        self._lock = threading.Lock()
+
+    def acquire(self) -> None:
+        while True:
+            wait = 0.0
+            with self._lock:
+                now = time.monotonic()
+                elapsed = max(0.0, now - self._ts)
+                self._ts = now
+                self._tokens = min(self._cap, self._tokens + elapsed * self._rate)
+
+                if self._tokens >= 1.0:
+                    self._tokens -= 1.0
+                    return
+
+                need = 1.0 - self._tokens
+                wait = need / self._rate
+
+            time.sleep(min(0.50, max(0.01, wait)))
+
+
+# -------------------------
+# config
+# -------------------------
+
+@dataclass
+class OIDynamicBudget:
+    enabled: bool = False
+    # kept for backward compatibility; with per-symbol scheduling it's usually not needed
+    min_symbols_per_tick: int = 5
+    max_symbols_per_tick_cap: int = 200
+
+
+@dataclass
+class OIAdaptive:
+    enabled: bool = True
+    penalty_step: int = 1
+    recovery_step: int = 1
+    extra_sleep_penalty_sec: float = 0.25
+    extra_sleep_recovery_sec: float = 0.05
+    extra_sleep_max_sec: float = 5.0
+    post_tick_sleep_max_sec: float = 10.0
+
+
+@dataclass
+class OIRateLimit:
+    enabled: bool = True
+    ip_limit_per_5m: int = 1000          # docs: 1000 requests / 5min
+    window_sec: int = 300
+    safety_factor: float = 0.80          # 0.8 => 800/5m effective
+    burst: int = 30                      # short burst capacity
+    # extra backoff if we still hit 429/-1003 (network jitter, other collectors, etc.)
+    backoff_min_sec: float = 1.0
+    backoff_max_sec: float = 30.0
+
+
+@dataclass
+class OIRepair:
+    enabled: bool = True
+    every_sec: int = 900
+    lookback_hours: int = 72
+    max_symbols_per_cycle: int = 25
+    max_ranges_per_symbol: int = 4
+    min_gap_points: int = 1
+    only_if_not_polling_behind: bool = True
+
+
+@dataclass
+class OIConfig:
+    enabled: bool = True
+
+    intervals: List[str] = field(default_factory=list)  # ["5m","15m","1h","4h","1d"]
+
+    seed_on_start: bool = True
+    seed_days: int = 30
+    seed_limit: int = 500
+    seed_max_pages_per_symbol: int = 8
+    seed_symbols_per_cycle: int = 5
+    seed_skip_if_recent_days: int = 7     # если WM уже "свежий", не сидим снова
+
+    # poll
+    poll_limit_max: int = 200             # если отстали — берем больше точек за раз (<=500)
+    poll_max_pages_per_symbol: int = 3    # если совсем отстали — максимум страниц догонялки
+    overlap_minutes: int = 60
+    safety_lag_sec: int = 15
+
+    # pacing
+    per_request_sleep_sec: float = 0.0    # теперь основной контроль через rate limiter
+    scan_sleep_sec: float = 0.20          # пауза цикла, когда нечего делать
+
+    refresh_symbols_sec: int = 3600
+    log_each_cycle: bool = True
+
+    stall_hits_to_blacklist: int = 3
+    blacklist_hours: int = 6
+    blacklist_log_every_sec: int = 120
+
+    schedule_jitter_sec: float = 1.0
+
+    dynamic_budget: OIDynamicBudget = field(default_factory=OIDynamicBudget)
+    adaptive: OIAdaptive = field(default_factory=OIAdaptive)
+    rate_limit: OIRateLimit = field(default_factory=OIRateLimit)
+    repair: OIRepair = field(default_factory=OIRepair)
+
+    # legacy (kept for backward compatibility)
+    poll_sec: float = 60.0
+    batch_size: int = 10
+    schedule: Dict[str, int] = field(default_factory=dict)
+
+    @staticmethod
+    def from_cfg(cfg: dict) -> "OIConfig":
+        c = OIConfig()
+
+        c.enabled = bool(cfg.get("enabled", True))
+        c.intervals = list(cfg.get("intervals") or ["5m", "15m", "1h", "4h", "1d"])
+
+        # keep only allowed intervals
+        c.intervals = [iv for iv in c.intervals if str(iv) in _ALLOWED_INTERVALS]
+        if not c.intervals:
+            c.intervals = ["5m", "15m", "1h", "4h", "1d"]
+
+        c.seed_on_start = bool(cfg.get("seed_on_start", True))
+        c.seed_days = int(cfg.get("seed_days", 30))
+        c.seed_limit = int(cfg.get("seed_limit", 500))
+        c.seed_max_pages_per_symbol = int(cfg.get("seed_max_pages_per_symbol", 8))
+        c.seed_symbols_per_cycle = int(cfg.get("seed_symbols_per_cycle", 5))
+        c.seed_skip_if_recent_days = int(cfg.get("seed_skip_if_recent_days", 7))
+
+        c.poll_limit_max = int(cfg.get("poll_limit_max", 200))
+        c.poll_limit_max = max(2, min(500, c.poll_limit_max))
+        c.poll_max_pages_per_symbol = int(cfg.get("poll_max_pages_per_symbol", 3))
+
+        c.overlap_minutes = int(cfg.get("overlap_minutes", 60))
+        c.safety_lag_sec = int(cfg.get("safety_lag_sec", 15))
+
+        c.per_request_sleep_sec = float(cfg.get("per_request_sleep_sec", 0.0))
+        c.scan_sleep_sec = float(cfg.get("scan_sleep_sec", 0.20))
+
+        c.refresh_symbols_sec = int(cfg.get("refresh_symbols_sec", 3600))
+        c.log_each_cycle = bool(cfg.get("log_each_cycle", True))
+
+        c.stall_hits_to_blacklist = int(cfg.get("stall_hits_to_blacklist", 3))
+        c.blacklist_hours = int(cfg.get("blacklist_hours", 6))
+        c.blacklist_log_every_sec = int(cfg.get("blacklist_log_every_sec", 120))
+
+        c.schedule_jitter_sec = float(cfg.get("schedule_jitter_sec", 1.0))
+
+        db_cfg = cfg.get("dynamic_budget") or {}
+        c.dynamic_budget = OIDynamicBudget(
+            enabled=bool(db_cfg.get("enabled", False)),
+            min_symbols_per_tick=int(db_cfg.get("min_symbols_per_tick", 5)),
+            max_symbols_per_tick_cap=int(db_cfg.get("max_symbols_per_tick_cap", 200)),
+        )
+
+        ad_cfg = cfg.get("adaptive") or {}
+        c.adaptive = OIAdaptive(
+            enabled=bool(ad_cfg.get("enabled", True)),
+            penalty_step=int(ad_cfg.get("penalty_step", 1)),
+            recovery_step=int(ad_cfg.get("recovery_step", 1)),
+            extra_sleep_penalty_sec=float(ad_cfg.get("extra_sleep_penalty_sec", 0.25)),
+            extra_sleep_recovery_sec=float(ad_cfg.get("extra_sleep_recovery_sec", 0.05)),
+            extra_sleep_max_sec=float(ad_cfg.get("extra_sleep_max_sec", 5.0)),
+            post_tick_sleep_max_sec=float(ad_cfg.get("post_tick_sleep_max_sec", 10.0)),
+        )
+
+        rl_cfg = cfg.get("rate_limit") or {}
+        c.rate_limit = OIRateLimit(
+            enabled=bool(rl_cfg.get("enabled", True)),
+            ip_limit_per_5m=int(rl_cfg.get("ip_limit_per_5m", 1000)),
+            window_sec=int(rl_cfg.get("window_sec", 300)),
+            safety_factor=float(rl_cfg.get("safety_factor", 0.80)),
+            burst=int(rl_cfg.get("burst", 30)),
+            backoff_min_sec=float(rl_cfg.get("backoff_min_sec", 1.0)),
+            backoff_max_sec=float(rl_cfg.get("backoff_max_sec", 30.0)),
+        )
+
+        repair_cfg = cfg.get("repair") or {}
+        c.repair = OIRepair(
+            enabled=bool(repair_cfg.get("enabled", True)),
+            every_sec=int(repair_cfg.get("every_sec", 900)),
+            lookback_hours=int(repair_cfg.get("lookback_hours", 72)),
+            max_symbols_per_cycle=int(repair_cfg.get("max_symbols_per_cycle", 25)),
+            max_ranges_per_symbol=int(repair_cfg.get("max_ranges_per_symbol", 4)),
+            min_gap_points=int(repair_cfg.get("min_gap_points", 1)),
+            only_if_not_polling_behind=bool(repair_cfg.get("only_if_not_polling_behind", True)),
+        )
+
+        # legacy
+        c.poll_sec = float(cfg.get("poll_sec", 60.0))
+        c.batch_size = int(cfg.get("batch_size", 10))
+        raw_schedule = cfg.get("schedule") or {}
+        c.schedule = {str(k): int(v) for k, v in raw_schedule.items()}
+
+        # If schedule provided, keep it (compat). Otherwise, default = interval length (best practice).
+        if not c.schedule:
+            c.schedule = {iv: int(_INTERVAL_SEC.get(iv, c.poll_sec)) for iv in c.intervals}
+        else:
+            for iv in c.intervals:
+                if iv not in c.schedule:
+                    c.schedule[iv] = int(_INTERVAL_SEC.get(iv, c.poll_sec))
+
+        return c
+
+
+# -------------------------
+# collector
+# -------------------------
+
+class BinanceOpenInterestCollector:
+    """
+    Open Interest Statistics collector (USDⓈ-M Futures).
+
+    Notes:
+    - Binance Futures does NOT provide a public WebSocket open interest stream.
+      So we rely on REST `/futures/data/openInterestHist` with smart scheduling and rate limiting.
+
+    Storage methods expected:
+      - upsert_open_interest(rows: list[dict]) -> int
+      - get_open_interest_watermarks_bulk(exchange_id:int, intervals:list[str]) -> dict[interval]->dict[symbol_id]->datetime
+        (fallback: get_open_interest_watermarks(exchange_id, interval) -> dict[symbol_id]->datetime)
+
+    IMPORTANT:
+      Чтобы не было [OI] no symbol name for symbol_id=...,
+      передавай symbol_id_to_symbol из run_market_data.
+    """
+
+    def __init__(
+        self,
+        *,
+        exchange_id: int,
+        symbol_ids: Sequence[int],
+        storage: Any,
+        rest: Any,
+        cfg: OIConfig,
+        stop_event: threading.Event,
+        logger: logging.Logger | None = None,
+        symbol_id_to_symbol: Optional[Dict[int, str]] = None,
+        watermarks: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        self.exchange_id = int(exchange_id)
+        self.storage = storage
+        self.rest = rest
+        self.cfg = cfg
+        self.stop_event = stop_event
+        self.logger = logger or log
+
+        self._symbol_ids: List[int] = list(map(int, symbol_ids))
+        self._sym_refresh_deadline = time.time() + self.cfg.refresh_symbols_sec
+
+        # id -> symbol
+        self._symbol_id_to_symbol: Dict[int, str] = {}
+        if symbol_id_to_symbol:
+            for sid, sym in symbol_id_to_symbol.items():
+                try:
+                    self._symbol_id_to_symbol[int(sid)] = str(sym).upper()
+                except Exception:
+                    continue
+
+        self._wm: Dict[str, Dict[int, datetime]] = {iv: {} for iv in self.cfg.intervals}
+
+        # per-symbol scheduling (next due times)
+        self._phase_sec: Dict[str, Dict[int, int]] = {iv: {} for iv in self.cfg.intervals}
+        self._next_due_ts: Dict[str, Dict[int, float]] = {iv: {} for iv in self.cfg.intervals}
+
+        # blacklist / stall
+        self._black_until: Dict[str, Dict[int, float]] = {iv: {} for iv in self.cfg.intervals}
+        self._stall_hits: Dict[str, Dict[int, int]] = {iv: {} for iv in self.cfg.intervals}
+        self._last_blacklist_log: float = 0.0
+
+        # adaptive pacing
+        self._extra_sleep_sec: float = 0.0
+
+        # global rate limiter
+        self._limiter: Optional[_TokenBucket] = None
+        if self.cfg.rate_limit.enabled:
+            eff_limit = max(1.0, float(self.cfg.rate_limit.ip_limit_per_5m) * float(self.cfg.rate_limit.safety_factor))
+            rate = eff_limit / max(1.0, float(self.cfg.rate_limit.window_sec))
+            cap = max(1, int(self.cfg.rate_limit.burst))
+            self._limiter = _TokenBucket(rate_per_sec=rate, capacity=cap)
+
+        self._apply_external_watermarks_if_any(watermarks)
+
+    # ---------------------------
+    # watermarks
+    # ---------------------------
+
+    def _apply_external_watermarks_if_any(self, watermarks: Optional[Dict[str, Any]]) -> None:
+        if not watermarks:
+            return
+        try:
+            for iv, mp in watermarks.items():
+                if iv not in self._wm:
+                    continue
+                if not isinstance(mp, dict):
+                    continue
+
+                out: Dict[int, datetime] = {}
+                for sid, v in mp.items():
+                    try:
+                        sid_i = int(sid)
+                    except Exception:
+                        continue
+                    dt = _normalize_wm_value(v)
+                    if dt is not None:
+                        out[sid_i] = dt
+
+                if out:
+                    self._wm[iv].update(out)
+        except Exception:
+            self.logger.exception("[OI] failed to apply external watermarks")
+
+    def _load_watermarks(self) -> None:
+        try:
+            if hasattr(self.storage, "get_open_interest_watermarks_bulk"):
+                bulk = self.storage.get_open_interest_watermarks_bulk(self.exchange_id, list(self.cfg.intervals)) or {}
+                for iv in self.cfg.intervals:
+                    mp = bulk.get(iv) or {}
+                    self._wm[iv] = {int(k): v for k, v in mp.items() if v is not None}
+                self.logger.info(
+                    "[OI] loaded watermarks BULK intervals=%s total=%d",
+                    ",".join(self.cfg.intervals),
+                    sum(len(self._wm[iv]) for iv in self.cfg.intervals),
+                )
+                return
+        except Exception:
+            self.logger.exception("[OI] failed to load watermarks via BULK, fallback")
+
+        for iv in self.cfg.intervals:
+            try:
+                if hasattr(self.storage, "get_open_interest_watermarks"):
+                    wm = self.storage.get_open_interest_watermarks(self.exchange_id, iv) or {}
+                    self._wm[iv] = {int(k): v for k, v in wm.items() if v is not None}
+                else:
+                    self._wm[iv] = {}
+                self.logger.info("[OI] loaded watermarks interval=%s count=%d", iv, len(self._wm[iv]))
+            except Exception:
+                self.logger.exception("[OI] failed to load watermarks interval=%s", iv)
+                self._wm[iv] = {}
+
+    # ---------------------------
+    # DB helpers
+    # ---------------------------
+
+    def _upsert_rows(self, rows: List[Dict[str, Any]]) -> int:
+        if not rows:
+            return 0
+        try:
+            return int(self.storage.upsert_open_interest(rows))
+        except Exception:
+            self.logger.exception("[OI] upsert_open_interest failed rows=%d", len(rows))
+            return 0
+
+    # ---------------------------
+    # REST helpers
+    # ---------------------------
+
+    def _rate_acquire(self) -> None:
+        if self._limiter is not None:
+            self._limiter.acquire()
+
+    def _fetch_hist(
+        self,
+        *,
+        symbol: str,
+        interval: str,
+        limit: int,
+        end_time_ms: Optional[int] = None,
+        start_time_ms: Optional[int] = None,
+    ) -> List[dict]:
+        """
+        Expected endpoint: GET /futures/data/openInterestHist
+
+        Safety:
+        - clamp too old startTime/endTime to Binance-supported recent horizon
+        - fallback without startTime on HTTP 400 / code -1130
+        """
+        self._rate_acquire()
+
+        start_time_ms, end_time_ms = _clamp_oi_hist_window(
+            start_time_ms=start_time_ms,
+            end_time_ms=end_time_ms,
+        )
+
+        def _call(*, st_ms: Optional[int], et_ms: Optional[int]) -> List[dict]:
+            # Most common naming in connectors: open_interest_hist / get_open_interest_hist
+            if hasattr(self.rest, "get_open_interest_hist"):
+                return self.rest.get_open_interest_hist(
+                    symbol=symbol,
+                    period=interval,
+                    limit=int(limit),
+                    endTime=et_ms,
+                    startTime=st_ms,
+                ) or []
+
+            if hasattr(self.rest, "open_interest_hist"):
+                return self.rest.open_interest_hist(
+                    symbol=symbol,
+                    period=interval,
+                    limit=int(limit),
+                    endTime=et_ms,
+                    startTime=st_ms,
+                ) or []
+
+            # Try a generic call style if user wrapped REST:
+            if hasattr(self.rest, "open_interest"):
+                try:
+                    return self.rest.open_interest(
+                        symbol=symbol,
+                        period=interval,
+                        limit=int(limit),
+                        endTime=et_ms,
+                        startTime=st_ms,
+                    ) or []
+                except TypeError:
+                    # probably "present open interest" endpoint, not statistics
+                    raise RuntimeError("REST.open_interest exists but doesn't support statistics params (period/startTime/endTime)")
+
+            raise RuntimeError("REST has no open interest history method")
+
+        try:
+            return _call(st_ms=start_time_ms, et_ms=end_time_ms)
+        except Exception as e:
+            payload = getattr(e, "payload", None) or {}
+            msg = str(payload.get("msg") or e)
+            code = payload.get("code")
+            is_invalid_start = (code == -1130) or ("starttime" in msg.lower() and "invalid" in msg.lower())
+
+            # Fallback: request the recent tail without startTime. This lets the collector
+            # recover from stale watermarks and gradually advance them into the valid window.
+            if is_invalid_start and start_time_ms is not None:
+                self.logger.warning(
+                    "[OI] invalid startTime fallback sym=%s interval=%s start_ms=%s end_ms=%s",
+                    symbol,
+                    interval,
+                    start_time_ms,
+                    end_time_ms,
+                )
+                return _call(st_ms=None, et_ms=end_time_ms)
+            raise
+
+    def _symbol_name(self, symbol_id: int) -> Optional[str]:
+        sym = self._symbol_id_to_symbol.get(int(symbol_id))
+        if sym:
+            return sym
+
+        try:
+            if hasattr(self.storage, "list_active_symbols_map"):
+                smap = self.storage.list_active_symbols_map(self.exchange_id) or {}
+
+                sym2 = None
+                if smap:
+                    any_val = next(iter(smap.values()))
+                    if isinstance(any_val, int):
+                        # {symbol: id}
+                        for k, v in smap.items():
+                            if int(v) == int(symbol_id):
+                                sym2 = str(k)
+                                break
+                    else:
+                        # {id: symbol}
+                        sym2 = smap.get(int(symbol_id))
+
+                if sym2:
+                    sym2 = str(sym2).upper()
+                    self._symbol_id_to_symbol[int(symbol_id)] = sym2
+                    return sym2
+
+            if hasattr(self.storage, "symbol_name"):
+                sym2 = self.storage.symbol_name(symbol_id)
+                if sym2:
+                    sym2 = str(sym2).upper()
+                    self._symbol_id_to_symbol[int(symbol_id)] = sym2
+                    return sym2
+        except Exception:
+            pass
+
+        return None
+
+    # ---------------------------
+    # blacklist / stall / adaptive
+    # ---------------------------
+
+    def _is_blacklisted(self, symbol_id: int, interval: str) -> bool:
+        until = self._black_until.get(interval, {}).get(int(symbol_id))
+        if until is None:
+            return False
+        if time.time() >= float(until):
+            try:
+                del self._black_until[interval][int(symbol_id)]
+            except Exception:
+                pass
+            return False
+        return True
+
+    def _note_success(self) -> None:
+        if self.cfg.adaptive.enabled:
+            self._extra_sleep_sec = max(0.0, self._extra_sleep_sec - self.cfg.adaptive.extra_sleep_recovery_sec)
+
+    def _note_rate_limit(self, symbol_id: int, interval: str, reason: str) -> None:
+        if self.cfg.adaptive.enabled:
+            self._extra_sleep_sec = min(
+                float(self.cfg.adaptive.extra_sleep_max_sec),
+                float(self._extra_sleep_sec) + float(self.cfg.adaptive.extra_sleep_penalty_sec),
+            )
+
+        now = time.time()
+        # short cooldown for this symbol
+        self._black_until.setdefault(interval, {})[int(symbol_id)] = now + 30.0
+
+        self.logger.warning(
+            "[OI] rate-limit interval=%s sym_id=%d reason=%s extra_sleep=%.2f",
+            interval,
+            int(symbol_id),
+            reason,
+            self._extra_sleep_sec,
+        )
+
+    def _note_stall(self, *, symbol: str, symbol_id: int, interval: str, best_ms: int, last_ms: int) -> None:
+        hits = int(self._stall_hits.setdefault(interval, {}).get(int(symbol_id), 0)) + 1
+        self._stall_hits[interval][int(symbol_id)] = hits
+
+        if hits >= int(self.cfg.stall_hits_to_blacklist):
+            until = time.time() + float(self.cfg.blacklist_hours) * 3600.0
+            self._black_until.setdefault(interval, {})[int(symbol_id)] = until
+            self._stall_hits[interval].pop(int(symbol_id), None)
+
+            if time.time() - self._last_blacklist_log > float(self.cfg.blacklist_log_every_sec):
+                self._last_blacklist_log = time.time()
+                self.logger.warning(
+                    "[OI] BLACKLIST interval=%s symbol=%s (%d) hits=%d last=%s best=%s for %.1fh",
+                    interval,
+                    symbol,
+                    int(symbol_id),
+                    hits,
+                    _dt_from_ms(int(last_ms)).isoformat(),
+                    _dt_from_ms(int(best_ms)).isoformat(),
+                    float(self.cfg.blacklist_hours),
+                )
+
+    # ---------------------------
+    # scheduling (per symbol)
+    # ---------------------------
+
+    def _phase_for(self, interval: str, symbol_id: int) -> int:
+        """
+        Stable phase in seconds inside the interval to spread requests.
+        """
+        sec = int(_INTERVAL_SEC.get(interval, 60))
+        mp = self._phase_sec.setdefault(interval, {})
+        if symbol_id in mp:
+            return int(mp[symbol_id])
+
+        h = hashlib.md5(f"{symbol_id}:{interval}".encode("utf-8")).digest()
+        v = int.from_bytes(h[:4], "big", signed=False)
+        phase = int(v % max(1, sec))
+        mp[symbol_id] = phase
+        return phase
+
+    def _schedule_next_due(self, interval: str, symbol_id: int) -> None:
+        sec = int(_INTERVAL_SEC.get(interval, 60))
+        phase = self._phase_for(interval, symbol_id)
+
+        now_dt = _utcnow()
+
+        wm = self._wm.get(interval, {}).get(symbol_id)
+        if wm is None:
+            base = _floor_ts(now_dt, interval)
+        else:
+            base = _floor_ts(wm, interval)
+
+        next_close = base + timedelta(seconds=sec)
+        due_dt = next_close + timedelta(seconds=int(self.cfg.safety_lag_sec) + int(phase))
+
+        # If already in the past, roll forward by whole intervals
+        while due_dt <= now_dt:
+            due_dt += timedelta(seconds=sec)
+
+        self._next_due_ts.setdefault(interval, {})[symbol_id] = due_dt.timestamp()
+
+    def _init_schedule_all(self) -> None:
+        for iv in self.cfg.intervals:
+            for sid in self._symbol_ids:
+                self._schedule_next_due(iv, int(sid))
+
+    # ---------------------------
+    # seed
+    # ---------------------------
+
+    def _seed_symbol_interval(self, *, symbol_id: int, interval: str) -> Tuple[int, int]:
+        sym = self._symbol_name(symbol_id)
+        if not sym:
+            return 0, 0
+
+        end_dt = _floor_ts(_utcnow() - timedelta(seconds=self.cfg.safety_lag_sec), interval)
+        end_ms = _ms(end_dt)
+
+        # If WM is already recent, skip heavy seed for this symbol/interval
+        prev = self._wm.get(interval, {}).get(symbol_id)
+        if prev is not None:
+            if prev >= (end_dt - timedelta(days=int(self.cfg.seed_skip_if_recent_days))):
+                return 0, 0
+
+        start_dt = end_dt - timedelta(days=int(self.cfg.seed_days))
+        start_ms = _ms(start_dt)
+
+        current_end_ms = end_ms
+        pages = 0
+        upserts_total = 0
+
+        while not self.stop_event.is_set():
+            if pages >= int(self.cfg.seed_max_pages_per_symbol):
+                break
+
+            try:
+                data = self._fetch_hist(
+                    symbol=sym,
+                    interval=interval,
+                    limit=int(self.cfg.seed_limit),
+                    end_time_ms=current_end_ms,
+                    start_time_ms=start_ms,  # stop earlier
+                )
+            except Exception as e:
+                s = str(e)
+                self.logger.exception("[OISeed] REST error sym=%s interval=%s", sym, interval)
+                if _is_rate_limit_error_text(s):
+                    self._note_rate_limit(symbol_id, interval, reason=s[:160])
+                    time.sleep(min(self.cfg.rate_limit.backoff_max_sec, max(self.cfg.rate_limit.backoff_min_sec, 2.0 + _jitter(2.0))))
+                break
+
+            pages += 1
+            if not data:
+                break
+
+            items: List[Dict[str, Any]] = []
+            all_ts_ms: List[int] = []
+
+            for it in data:
+                ts_ms = int(it.get("timestamp") or it.get("time") or 0)
+                if not ts_ms:
+                    continue
+                all_ts_ms.append(ts_ms)
+                if ts_ms < start_ms or ts_ms > end_ms:
+                    continue
+
+                items.append(
+                    {
+                        "exchange_id": self.exchange_id,
+                        "symbol_id": int(symbol_id),
+                        "interval": str(interval),
+                        "ts": _floor_ts(_dt_from_ms(ts_ms), interval),
+                        "open_interest": _safe_float(it.get("sumOpenInterest") or it.get("openInterest")),
+                        "open_interest_value": _safe_float(it.get("sumOpenInterestValue") or it.get("openInterestValue")),
+                        "source": "rest_seed",
+                    }
+                )
+
+            if items:
+                items.sort(key=lambda x: x["ts"])
+                up = self._upsert_rows(items)
+                upserts_total += up
+
+                best_ts = items[-1]["ts"]
+                prev2 = self._wm.setdefault(interval, {}).get(symbol_id)
+                if (prev2 is None) or (best_ts > prev2):
+                    self._wm[interval][symbol_id] = best_ts
+
+                self._note_success()
+
+            if not all_ts_ms:
+                break
+
+            oldest_ms = min(all_ts_ms)
+            if oldest_ms >= current_end_ms:
+                self._note_stall(symbol=sym, symbol_id=symbol_id, interval=interval, best_ms=oldest_ms, last_ms=current_end_ms)
+                break
+
+            # move window backward
+            current_end_ms = oldest_ms - 1
+
+            if self.cfg.per_request_sleep_sec > 0:
+                time.sleep(max(0.0, self.cfg.per_request_sleep_sec))
+            if self._extra_sleep_sec > 0:
+                time.sleep(min(float(self.cfg.adaptive.post_tick_sleep_max_sec), float(self._extra_sleep_sec)))
+
+        return upserts_total, pages
+
+    def _seed_interval(self, interval: str) -> None:
+        symbols = list(self._symbol_ids)
+        n = max(1, int(self.cfg.seed_symbols_per_cycle))
+        for batch in _chunks(symbols, n):
+            if self.stop_event.is_set():
+                break
+            for sid in batch:
+                if self.stop_event.is_set():
+                    break
+                up, pages = self._seed_symbol_interval(symbol_id=sid, interval=interval)
+                if up > 0:
+                    self.logger.info("[OISeed] interval=%s sym_id=%d upserts=%d pages=%d", interval, sid, up, pages)
+
+    # ---------------------------
+    # poll (catch-up aware)
+    # ---------------------------
+
+    def _poll_symbol_interval(self, *, symbol_id: int, interval: str) -> int:
+        if self._is_blacklisted(symbol_id, interval):
+            return 0
+
+        sym = self._symbol_name(symbol_id)
+        if not sym:
+            return 0
+
+        now = _utcnow()
+        end_dt = _floor_ts(now - timedelta(seconds=self.cfg.safety_lag_sec), interval)
+        end_ms = _ms(end_dt)
+
+        prev = self._wm.setdefault(interval, {}).get(symbol_id)
+
+        # compute overlap start
+        overlap_dt = None
+        if prev is not None:
+            overlap_dt = prev - timedelta(minutes=int(self.cfg.overlap_minutes))
+
+        # determine how many points we might need
+        sec = int(_INTERVAL_SEC.get(interval, 60))
+        approx_need = 2
+        if prev is not None:
+            delta_sec = max(0.0, (end_dt - prev).total_seconds())
+            approx_need = int(delta_sec // max(1, sec)) + 3  # +2 safety
+            approx_need = max(2, min(int(self.cfg.poll_limit_max), approx_need))
+
+        rows: List[Dict[str, Any]] = []
+
+        def _parse(data: List[dict]) -> None:
+            for it in data:
+                ts_ms = int(it.get("timestamp") or it.get("time") or 0)
+                if not ts_ms:
+                    continue
+                ts = _floor_ts(_dt_from_ms(ts_ms), interval)
+                if ts > end_dt:
+                    continue
+                rows.append(
+                    {
+                        "exchange_id": self.exchange_id,
+                        "symbol_id": int(symbol_id),
+                        "interval": str(interval),
+                        "ts": ts,
+                        "open_interest": _safe_float(it.get("sumOpenInterest") or it.get("openInterest")),
+                        "open_interest_value": _safe_float(it.get("sumOpenInterestValue") or it.get("openInterestValue")),
+                        "source": "rest_poll",
+                    }
+                )
+
+        # Fast path: one call with startTime (if prev exists and need not huge)
+        try:
+            if prev is None:
+                data = self._fetch_hist(symbol=sym, interval=interval, limit=2, end_time_ms=end_ms)
+                _parse(data)
+            else:
+                st = _ms(overlap_dt) if overlap_dt is not None else None
+                data = self._fetch_hist(
+                    symbol=sym,
+                    interval=interval,
+                    limit=int(approx_need),
+                    start_time_ms=st,
+                    end_time_ms=end_ms,
+                )
+                _parse(data)
+
+                # If still too few / endpoint ignored startTime, do paging backward up to poll_max_pages_per_symbol
+                if prev is not None and rows:
+                    rows.sort(key=lambda x: x["ts"])
+                if prev is not None:
+                    # if we still have a big gap (no new points), try paging backward a bit
+                    if (not rows) or (max(r["ts"] for r in rows) <= prev and (end_dt - prev).total_seconds() > sec * 3):
+                        cur_end_ms = end_ms
+                        pages = 0
+                        while pages < int(self.cfg.poll_max_pages_per_symbol) and not self.stop_event.is_set():
+                            pages += 1
+                            data2 = self._fetch_hist(
+                                symbol=sym,
+                                interval=interval,
+                                limit=int(self.cfg.poll_limit_max),
+                                end_time_ms=cur_end_ms,
+                            )
+                            if not data2:
+                                break
+                            _parse(data2)
+                            ts_list = [int(it.get("timestamp") or it.get("time") or 0) for it in data2 if (it.get("timestamp") or it.get("time"))]
+                            if not ts_list:
+                                break
+                            oldest = min(ts_list)
+                            if oldest <= _ms(prev):
+                                break
+                            if oldest >= cur_end_ms:
+                                self._note_stall(symbol=sym, symbol_id=symbol_id, interval=interval, best_ms=oldest, last_ms=cur_end_ms)
+                                break
+                            cur_end_ms = oldest - 1
+
+        except Exception as e:
+            s = str(e)
+            if _is_rate_limit_error_text(s):
+                self._note_rate_limit(symbol_id, interval, reason=s[:160])
+                # global backoff to avoid ban spiral
+                time.sleep(min(self.cfg.rate_limit.backoff_max_sec, max(self.cfg.rate_limit.backoff_min_sec, 1.0 + _jitter(2.0))))
+            else:
+                self.logger.exception("[OI] REST poll error sym=%s interval=%s", sym, interval)
+            return 0
+
+        if not rows:
+            return 0
+
+        rows.sort(key=lambda x: x["ts"])
+
+        if prev is not None:
+            rows = [r for r in rows if r["ts"] > prev]
+
+        if not rows:
+            return 0
+
+        up = self._upsert_rows(rows)
+        if up > 0:
+            best = rows[-1]["ts"]
+            prev2 = self._wm[interval].get(symbol_id)
+            if (prev2 is None) or (best > prev2):
+                self._wm[interval][symbol_id] = best
+            self._note_success()
+
+        return up
+
+
+    # ---------------------------
+    # repair missing OI against candle timestamps
+    # ---------------------------
+
+    def _storage_fetch_all(self, query: str, params: Sequence[Any]) -> List[dict]:
+        methods = [
+            "fetch_all_dict",
+            "fetch_all",
+            "query_all",
+            "query",
+            "select_all",
+        ]
+        for name in methods:
+            fn = getattr(self.storage, name, None)
+            if callable(fn):
+                try:
+                    rows = fn(query, params)
+                    if rows is None:
+                        return []
+                    out: List[dict] = []
+                    for r in rows:
+                        if isinstance(r, dict):
+                            out.append(r)
+                        elif hasattr(r, "_mapping"):
+                            out.append(dict(r._mapping))
+                        else:
+                            try:
+                                out.append(dict(r))
+                            except Exception:
+                                pass
+                    return out
+                except TypeError:
+                    try:
+                        rows = fn(query=query, params=params)
+                        if rows is None:
+                            return []
+                        out: List[dict] = []
+                        for r in rows:
+                            if isinstance(r, dict):
+                                out.append(r)
+                            elif hasattr(r, "_mapping"):
+                                out.append(dict(r._mapping))
+                            else:
+                                try:
+                                    out.append(dict(r))
+                                except Exception:
+                                    pass
+                        return out
+                    except Exception:
+                        continue
+                except Exception:
+                    continue
+        return []
+
+    def _list_missing_oi_ranges(self, *, interval: str, lookback_hours: int, max_symbols: int) -> List[dict]:
+        if hasattr(self.storage, "list_open_interest_gaps"):
+            try:
+                rows = self.storage.list_open_interest_gaps(
+                    exchange_id=self.exchange_id,
+                    interval=interval,
+                    lookback_hours=int(lookback_hours),
+                    max_symbols=int(max_symbols),
+                ) or []
+                return [dict(r) if not isinstance(r, dict) else r for r in rows]
+            except Exception:
+                self.logger.exception("[OI][REPAIR] list_open_interest_gaps failed interval=%s", interval)
+
+        sql = """
+        WITH c AS (
+            SELECT
+                c.symbol_id,
+                c.open_time
+            FROM candles c
+            WHERE c.exchange_id = %s
+              AND c.interval = %s
+              AND c.open_time >= now() - make_interval(hours => %s)
+        ),
+        gaps AS (
+            SELECT
+                c.symbol_id,
+                c.open_time
+            FROM c
+            LEFT JOIN open_interest oi
+              ON oi.exchange_id = %s
+             AND oi.symbol_id = c.symbol_id
+             AND oi.interval = %s
+             AND oi.ts = c.open_time
+            WHERE oi.ts IS NULL
+        ),
+        ranked AS (
+            SELECT
+                g.symbol_id,
+                MIN(g.open_time) AS start_ts,
+                MAX(g.open_time) AS end_ts,
+                COUNT(*) AS gap_points
+            FROM gaps g
+            GROUP BY g.symbol_id
+        )
+        SELECT
+            r.symbol_id,
+            s.symbol,
+            r.start_ts,
+            r.end_ts,
+            r.gap_points
+        FROM ranked r
+        JOIN symbols s
+          ON s.symbol_id = r.symbol_id
+         AND s.exchange_id = %s
+        ORDER BY r.gap_points DESC, r.end_ts DESC
+        LIMIT %s
+        """
+        return self._storage_fetch_all(
+            sql,
+            [self.exchange_id, interval, int(lookback_hours), self.exchange_id, interval, self.exchange_id, int(max_symbols)],
+        )
+
+    def _repair_symbol_interval_range(
+        self,
+        *,
+        symbol_id: int,
+        symbol: str,
+        interval: str,
+        start_ts: datetime,
+        end_ts: datetime,
+        max_pages: int,
+    ) -> int:
+        start_ts = _floor_ts(start_ts, interval)
+        end_ts = _floor_ts(end_ts, interval)
+        if end_ts < start_ts:
+            return 0
+
+        sec = int(_INTERVAL_SEC.get(interval, 60))
+        cur_end_ms = _ms(end_ts)
+        start_ms = _ms(start_ts)
+        upserts_total = 0
+        pages = 0
+
+        while not self.stop_event.is_set() and pages < max(1, int(max_pages)):
+            pages += 1
+            try:
+                data = self._fetch_hist(
+                    symbol=symbol,
+                    interval=interval,
+                    limit=int(self.cfg.poll_limit_max),
+                    start_time_ms=start_ms,
+                    end_time_ms=cur_end_ms,
+                )
+            except Exception as e:
+                s = str(e)
+                if _is_rate_limit_error_text(s):
+                    self._note_rate_limit(symbol_id, interval, reason=s[:160])
+                else:
+                    self.logger.exception("[OI][REPAIR] REST error symbol=%s interval=%s", symbol, interval)
+                break
+
+            if not data:
+                break
+
+            rows: List[Dict[str, Any]] = []
+            ts_list: List[int] = []
+            for it in data:
+                ts_ms = int(it.get("timestamp") or it.get("time") or 0)
+                if not ts_ms:
+                    continue
+                ts = _floor_ts(_dt_from_ms(ts_ms), interval)
+                if ts < start_ts or ts > end_ts:
+                    continue
+                rows.append(
+                    {
+                        "exchange_id": self.exchange_id,
+                        "symbol_id": int(symbol_id),
+                        "interval": str(interval),
+                        "ts": ts,
+                        "open_interest": _safe_float(it.get("sumOpenInterest") or it.get("openInterest")),
+                        "open_interest_value": _safe_float(it.get("sumOpenInterestValue") or it.get("openInterestValue")),
+                        "source": "rest_repair",
+                    }
+                )
+                ts_list.append(ts_ms)
+
+            if rows:
+                rows.sort(key=lambda x: x["ts"])
+                upserts_total += self._upsert_rows(rows)
+                best_ts = rows[-1]["ts"]
+                prev = self._wm.setdefault(interval, {}).get(symbol_id)
+                if (prev is None) or (best_ts > prev):
+                    self._wm[interval][symbol_id] = best_ts
+                self._note_success()
+
+            if not ts_list:
+                break
+
+            oldest = min(ts_list)
+            if oldest <= start_ms or oldest >= cur_end_ms:
+                break
+            cur_end_ms = oldest - 1
+
+        return int(upserts_total)
+
+    def _run_repair_cycle(self) -> int:
+        if not self.cfg.repair.enabled:
+            return 0
+
+        total_upserts = 0
+        for interval in self.cfg.intervals:
+            ranges = self._list_missing_oi_ranges(
+                interval=interval,
+                lookback_hours=int(self.cfg.repair.lookback_hours),
+                max_symbols=int(self.cfg.repair.max_symbols_per_cycle),
+            )
+            if not ranges:
+                continue
+
+            processed = 0
+            for row in ranges:
+                if self.stop_event.is_set():
+                    break
+                if processed >= int(self.cfg.repair.max_symbols_per_cycle):
+                    break
+
+                try:
+                    symbol_id = int(row.get("symbol_id"))
+                except Exception:
+                    continue
+                symbol = str(row.get("symbol") or self._symbol_name(symbol_id) or "").upper()
+                if not symbol:
+                    continue
+
+                if self.cfg.repair.only_if_not_polling_behind:
+                    wm = self._wm.setdefault(interval, {}).get(symbol_id)
+                    now_dt = _floor_ts(_utcnow() - timedelta(seconds=self.cfg.safety_lag_sec), interval)
+                    sec = int(_INTERVAL_SEC.get(interval, 60))
+                    if wm is not None and (now_dt - wm).total_seconds() > sec * 4:
+                        continue
+
+                start_ts = row.get("start_ts")
+                end_ts = row.get("end_ts")
+                if not isinstance(start_ts, datetime):
+                    start_ts = _normalize_wm_value(start_ts)
+                if not isinstance(end_ts, datetime):
+                    end_ts = _normalize_wm_value(end_ts)
+                if start_ts is None or end_ts is None:
+                    continue
+
+                gap_points = int(row.get("gap_points") or 0)
+                if gap_points < int(self.cfg.repair.min_gap_points):
+                    continue
+
+                up = self._repair_symbol_interval_range(
+                    symbol_id=symbol_id,
+                    symbol=symbol,
+                    interval=interval,
+                    start_ts=start_ts,
+                    end_ts=end_ts,
+                    max_pages=int(self.cfg.repair.max_ranges_per_symbol),
+                )
+                total_upserts += int(up)
+                processed += 1
+
+            if processed > 0:
+                self.logger.info(
+                    "[OI][REPAIR] interval=%s processed=%d upserts=%d lookback_hours=%d",
+                    interval,
+                    processed,
+                    total_upserts,
+                    int(self.cfg.repair.lookback_hours),
+                )
+
+        return int(total_upserts)
+
+    # ---------------------------
+    # symbol refresh
+    # ---------------------------
+
+    def _refresh_symbols_if_needed(self) -> None:
+        if time.time() < self._sym_refresh_deadline:
+            return
+        self._sym_refresh_deadline = time.time() + self.cfg.refresh_symbols_sec
+
+        try:
+            new_ids: List[int] = self._symbol_ids
+            if hasattr(self.storage, "list_active_symbol_ids"):
+                new_ids = list(map(int, self.storage.list_active_symbol_ids(self.exchange_id))) or self._symbol_ids
+
+            if hasattr(self.storage, "list_active_symbols_map"):
+                smap = self.storage.list_active_symbols_map(self.exchange_id) or {}
+                for sym, sid in smap.items():
+                    try:
+                        self._symbol_id_to_symbol[int(sid)] = str(sym).upper()
+                    except Exception:
+                        pass
+
+            # detect added symbols
+            old = set(self._symbol_ids)
+            new = set(new_ids)
+            added = list(new - old)
+
+            self._symbol_ids = list(new_ids)
+
+            for sid in added:
+                for iv in self.cfg.intervals:
+                    self._schedule_next_due(iv, int(sid))
+
+            self.logger.info("[OI] symbols refreshed ids=%d added=%d map=%d", len(self._symbol_ids), len(added), len(self._symbol_id_to_symbol))
+        except Exception:
+            self.logger.exception("[OI] failed to refresh symbols")
+
+    # ---------------------------
+    # main
+    # ---------------------------
+
+    def run(self) -> None:
+        rl = self.cfg.rate_limit
+        eff = float(rl.ip_limit_per_5m) * float(rl.safety_factor)
+        rps = eff / max(1.0, float(rl.window_sec))
+
+        self.logger.info(
+            "[OI] started intervals=%s symbols=%d seed=%s lag=%ds overlap=%dm "
+            "rate_limit=%s eff=%.0f/%.0fs (%.2f rps) burst=%d adaptive=%s",
+            ",".join(self.cfg.intervals),
+            len(self._symbol_ids),
+            self.cfg.seed_on_start,
+            self.cfg.safety_lag_sec,
+            self.cfg.overlap_minutes,
+            self.cfg.rate_limit.enabled,
+            eff,
+            float(rl.window_sec),
+            rps,
+            rl.burst,
+            self.cfg.adaptive.enabled,
+        )
+
+        self._load_watermarks()
+
+        # seed (optional)
+        if self.cfg.seed_on_start:
+            for interval in self.cfg.intervals:
+                if self.stop_event.is_set():
+                    break
+                self.logger.info(
+                    "[OISeed] start interval=%s seed_days=%d symbols=%d limit=%d max_pages=%d sym_per_cycle=%d skip_if_recent_days=%d",
+                    interval,
+                    self.cfg.seed_days,
+                    len(self._symbol_ids),
+                    self.cfg.seed_limit,
+                    self.cfg.seed_max_pages_per_symbol,
+                    self.cfg.seed_symbols_per_cycle,
+                    self.cfg.seed_skip_if_recent_days,
+                )
+                self._seed_interval(interval)
+
+        # init per-symbol schedule
+        self._init_schedule_all()
+
+        next_repair_ts = time.time() + max(30, int(self.cfg.repair.every_sec))
+        last_log = 0.0
+        while not self.stop_event.is_set():
+            self._refresh_symbols_if_needed()
+
+            now_ts = time.time()
+            did_any = False
+            cycle_up = 0
+
+            for iv in self.cfg.intervals:
+                if self.stop_event.is_set():
+                    break
+
+                due_map = self._next_due_ts.setdefault(iv, {})
+                # choose due symbols
+                due_sids = [sid for sid, ts in due_map.items() if now_ts >= float(ts) and not self._is_blacklisted(sid, iv)]
+                if not due_sids:
+                    continue
+
+                did_any = True
+
+                # small shuffle to avoid fixed ordering
+                random.shuffle(due_sids)
+
+                # process in batches
+                for batch in _chunks(due_sids, max(1, int(self.cfg.batch_size))):
+                    if self.stop_event.is_set():
+                        break
+                    for sid in batch:
+                        if self.stop_event.is_set():
+                            break
+                        cycle_up += self._poll_symbol_interval(symbol_id=int(sid), interval=iv)
+                        # schedule next due for this symbol based on updated WM
+                        self._schedule_next_due(iv, int(sid))
+
+                        if self.cfg.per_request_sleep_sec > 0:
+                            time.sleep(max(0.0, self.cfg.per_request_sleep_sec))
+                        if self._extra_sleep_sec > 0:
+                            time.sleep(min(float(self.cfg.adaptive.post_tick_sleep_max_sec), float(self._extra_sleep_sec)))
+
+            if now_ts >= next_repair_ts:
+                try:
+                    repair_up = self._run_repair_cycle()
+                    if repair_up > 0:
+                        cycle_up += int(repair_up)
+                except Exception:
+                    self.logger.exception("[OI][REPAIR] cycle failed")
+                finally:
+                    next_repair_ts = time.time() + max(60, int(self.cfg.repair.every_sec))
+
+            if self.cfg.log_each_cycle and (did_any or cycle_up > 0):
+                # log not more often than every ~5s
+                if now_ts - last_log > 5.0:
+                    last_log = now_ts
+                    self.logger.info(
+                        "[OI] tick ok upserts=%d symbols=%d intervals=%s extra_sleep=%.2f repair=%s",
+                        cycle_up,
+                        len(self._symbol_ids),
+                        ",".join(self.cfg.intervals),
+                        self._extra_sleep_sec,
+                        self.cfg.repair.enabled,
+                    )
+
+            if not did_any:
+                time.sleep(max(0.05, float(self.cfg.scan_sleep_sec)))
+
+        self.logger.info("[OI] stopped")
+
+
+# -------------------------
+# public starter
+# -------------------------
+
+def start_open_interest_collector(
+    *,
+    cfg: dict,
+    exchange_id: int,
+    symbol_ids: Sequence[int],
+    storage: Any,
+    rest: Any,
+    stop_event: threading.Event,
+    symbol_id_to_symbol: Optional[Dict[int, str]] = None,
+    watermarks: Optional[Dict[str, Any]] = None,
+) -> threading.Thread:
+    """
+    Run_market_data.py может передавать watermarks=...
+    Аргумент принимается и НЕ ломает запуск.
+    """
+    oi_cfg = OIConfig.from_cfg(cfg or {})
+    if not oi_cfg.enabled:
+        t = threading.Thread(target=lambda: None, name="BinanceOpenInterestCollector(disabled)", daemon=True)
+        t.start()
+        return t
+
+    collector = BinanceOpenInterestCollector(
+        exchange_id=exchange_id,
+        symbol_ids=symbol_ids,
+        storage=storage,
+        rest=rest,
+        cfg=oi_cfg,
+        stop_event=stop_event,
+        symbol_id_to_symbol=symbol_id_to_symbol,
+        watermarks=watermarks,
+    )
+    th = threading.Thread(target=collector.run, name="BinanceOpenInterestCollector", daemon=True)
+    th.start()
+    return th

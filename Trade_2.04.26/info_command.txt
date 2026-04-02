@@ -1,0 +1,49 @@
+# для создания
+# pip freeze > requirements.txt
+# для восстановления
+# pip install -r requirements.txt
+
+
+
+
+https://chat.deepseek.com/coder
+# ========================================================================== #
+import json
+
+data = {
+    'name': 'John',
+    'age': 30,
+    'city': 'New York'
+}
+
+with open('path_to_file.json', 'w') as file: # сохранение словаря в файл
+    json.dump(data, file)
+
+
+
+with open('path_to_file.json', 'r') as file: # чтение сохраненного файла
+    data = json.load(file)
+print(data)
+# ========================================================================== #
+import pickle
+
+data = {
+    'name': 'John',
+    'age': 30,
+    'city': 'New York'
+}
+
+with open('path_to_file.pkl', 'wb') as file: # сохранение в файл
+    pickle.dump(data, file)
+
+
+with open('path_to_file.pkl', 'rb') as file:  # чтение сохраненного файла
+    data = pickle.load(file)
+
+print(data)
+
+# ========================================================================== #
+Методы json.load и pickle.load используются для чтения JSON и pickle файлов соответственно.
+ Они автоматически преобразуют данные обратно в формат словаря. "rb" и "r" в вызовах open
+соответствуют режимам чтения (read). "rb" означает "read binary", т.е. чтение в бинарном режиме.
+Замените 'path_to_file.json' и 'path_to_file.pkl' на пути к вашим файлам.

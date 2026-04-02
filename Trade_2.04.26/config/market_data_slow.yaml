@@ -1,0 +1,239 @@
+# SLOW PROCESS: heavy collectors + universe/filters + OI + funding + ticker_24h + trades_all + retention
+# ВАЖНО:
+#   - Свечи собираем для 15m, 1h, 4h
+#   - 1h/4h дополнительно добиваем gap_repair'ом через REST
+#   - OI собираем отдельно для 5m, 15m, 1h с repair пропусков по timestamps свечей
+
+exchange: binance
+exchange_id: 1
+
+rest_limits:
+  max_rps: 3.5
+  max_rpm: 350
+  force: true
+
+startup_stagger:
+  after_universe: 0.6
+  after_symbol_filters: 0.8
+  after_candles: 1.0
+  after_open_interest: 1.0
+  after_funding: 0.8
+  after_ticker_24h: 0.8
+  after_gap_repair: 8.0
+
+universe:
+  enabled: true
+  seed_on_start: false
+  refresh_sec: 21600
+  min_size: 200
+  max_drop_ratio: 0.30
+
+symbol_filters:
+  enabled: true
+  refresh_sec: 7200
+  seed_on_start: true
+
+symbols_refresh:
+  refresh_sec: 300
+
+market_data:
+  enabled: true
+
+  candle_intervals: ["15m","1h","4h"]
+
+  seed_on_start: true
+  seed_days: 30
+  seed_limit: 1500
+  seed_max_pages_per_symbol: 3
+  seed_symbols_per_cycle: 4
+  per_request_sleep_sec: 0.25
+  seed_overlap_minutes: 60
+
+  use_ws: true
+  ws_max_streams_per_conn: 180
+  ws_url_max_len: 3500
+
+  ws_supervisor:
+    enabled: true
+    check_sec: 60
+    debounce_checks: 2
+    min_restart_sec: 180
+
+  update_open_candle: false
+
+  ws_ping_interval: 60
+  ws_ping_timeout: 30
+
+  rest_catchup_on_connect: true
+  catchup_max_symbols: 10
+  rest_catchup_max_pages: 1
+  rest_catchup_overlap_minutes: 60
+  rest_catchup_limit: 1500
+  catchup_seed_days: 2
+
+open_interest:
+  enabled: true
+  intervals: ["5m","15m","1h"]
+
+  seed_on_start: true
+  seed_days: 21
+  seed_limit: 500
+  seed_max_pages_per_symbol: 12
+  seed_symbols_per_cycle: 4
+  seed_skip_if_recent_days: 3
+
+  overlap_minutes: 90
+  safety_lag_sec: 25
+
+  poll_limit_max: 300
+  poll_max_pages_per_symbol: 5
+  batch_size: 6
+  scan_sleep_sec: 0.05
+  refresh_symbols_sec: 300
+  log_each_cycle: true
+
+  stall_hits_to_blacklist: 6
+  blacklist_hours: 2
+  blacklist_log_every_sec: 120
+
+  adaptive:
+    enabled: true
+    penalty_step: 1
+    recovery_step: 1
+    extra_sleep_penalty_sec: 0.20
+    extra_sleep_recovery_sec: 0.03
+    extra_sleep_max_sec: 3.0
+    post_tick_sleep_max_sec: 4.0
+
+  rate_limit:
+    enabled: true
+    ip_limit_per_5m: 1000
+    window_sec: 300
+    safety_factor: 0.82
+    burst: 20
+    backoff_min_sec: 1.0
+    backoff_max_sec: 20.0
+
+  repair:
+    enabled: true
+    every_sec: 900
+    lookback_hours: 72
+    max_symbols_per_cycle: 25
+    max_ranges_per_symbol: 4
+    min_gap_points: 1
+    only_if_not_polling_behind: true
+
+funding:
+  enabled: true
+  backfill_on_start: true
+  backfill_days: 3
+
+  use_ws: true
+
+  rest_safety_poll: true
+  poll_sec: 3600
+
+  symbols_per_cycle: 10
+  req_sleep_sec: 0.25
+
+  limit: 500
+  max_pages: 10
+  page_sleep_sec: 0.05
+
+  overlap_hours: 72
+
+liquidations:
+  enabled: false
+
+ticker_24h:
+  enabled: true
+  source: ws_24h
+  flush_sec: 10
+  ws_stream: "!ticker@arr"
+  ws_ping_interval: 60
+  ws_ping_timeout: 30
+  rest_safety_poll: false
+
+market_state_5m:
+  enabled: false
+  poll_sec: 15
+  symbols_per_cycle: 30
+  lookback_minutes: 180
+  refresh_symbols_sec: 300
+
+market_trades_all:
+  enabled: false
+  use_ws: true
+
+  ws_max_streams_per_conn: 160
+  ws_url_max_len: 3500
+  ws_ping_interval: 60
+  ws_ping_timeout: 30
+
+  flush_sec: 1.0
+  flush_max_rows: 5000
+
+  overlap_minutes: 60
+  agg_upsert_every_sec: 15
+  recalc_cvd_every_sec: 180
+  cvd_hours_back: 24
+
+  tail_sync_enabled: true
+  lag_tail_sec: 600
+  tail_sync_every_sec: 6
+  tail_sync_symbols_per_cycle: 2
+  tail_sync_limit: 1000
+  tail_sync_max_pages_per_symbol: 3
+  tail_sync_max_requests_per_cycle: 6
+  tail_sync_min_symbol_interval_sec: 60
+  tail_sync_safety_lag_sec: 3
+
+  warmup_enabled: true
+  warmup_sec: 180
+  warmup_lag_tail_sec: 60
+  warmup_tail_sync_every_sec: 4
+  warmup_tail_sync_symbols_per_cycle: 3
+  warmup_tail_sync_max_requests_per_cycle: 8
+  warmup_tail_sync_max_pages_per_symbol: 4
+  warmup_tail_sync_min_symbol_interval_sec: 25
+
+candles_gap_repair:
+  enabled: true
+  every_sec: 1800
+  max_symbols_per_cycle: 40
+  max_gaps_per_cycle: 10
+
+  intervals: ["1h", "4h"]
+  only_active_symbols: true
+  gaps_per_symbol: 2
+
+  max_gap_days: 30
+  min_gap_points: 1
+
+  limit: 1500
+  sleep_sec: 0.25
+
+  priority: 1
+  priority_symbols: []
+
+retention:
+  enabled: true
+  run_sec: 3600
+  log_each_cycle: true
+  log_zero_deletes: true
+
+  candles_days: 180
+  candle_intervals: ["15m", "1h", "4h"]
+
+  oi_keep_days:
+    "5m": 30
+    "15m": 45
+    "1h": 90
+
+  funding_days: 90
+  ticker_24h_days: 30
+
+  market_state_5m_days: 30
+
+  market_trades_days: 30
+  candles_trades_agg_days: 60

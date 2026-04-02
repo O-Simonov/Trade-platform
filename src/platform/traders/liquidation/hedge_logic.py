@@ -1050,6 +1050,7 @@ class TradeLiquidationHedgeLogicMixin:
                     price=float(add_ref_price),
                     cap_pct_wallet=float(add_cap_pct),
                     qty_step=float(qty_step or 0.0),
+                    leverage=float(getattr(self.p, 'leverage', 1.0) or 1.0),
                 )
                 if capped_add_qty < float(add_qty):
                     log.info('[trade_liquidation][LIMIT] capped MAIN_ADD_ON_HEDGE_DIFF %s %s qty %.8f -> %.8f by averaging_add_max_notional_pct_wallet=%.4f', str(symbol).upper(), str(main_ps).upper(), float(add_qty), float(capped_add_qty), float(add_cap_pct))
@@ -1062,6 +1063,7 @@ class TradeLiquidationHedgeLogicMixin:
                     price=float(add_ref_price),
                     cap_pct_wallet=float(main_total_cap_pct),
                     qty_step=float(qty_step or 0.0),
+                    leverage=float(getattr(self.p, 'leverage', 1.0) or 1.0),
                 )
                 allowed_add_qty = max(0.0, float(max_total_qty) - float(main_amt))
                 if qty_step > 0.0:
@@ -1430,24 +1432,245 @@ class TradeLiquidationHedgeLogicMixin:
         close_side = "SELL" if side_u == "LONG" else "BUY"
         hedge_ps = "SHORT" if side_u == "LONG" else "LONG"
 
-        # Trigger price from last add fill + configurable buffer.
-        # The extra buffer moves the pending hedge opener a bit farther from the
-        # raw last-add protection level so Binance does not activate it instantly
-        # on placement when mark price is already too close to the trigger.
+        # Trigger price for the pending hedge opener.
+        # Default source is the last add fill + configurable buffer.
+        # If hedge reopen anchor logic is enabled and we already have a recorded
+        # hedge close anchor, the pending reopen order must follow that anchor
+        # instead of staying pinned to the historical last add fill.
         try:
             trigger_buf_pct = float(getattr(self.p, "hedge_trigger_buffer_pct", 0.0) or 0.0)
         except Exception:
             trigger_buf_pct = 0.0
         trigger_buf_k = max(float(trigger_buf_pct), 0.0) / 100.0
 
-        if side_u == "LONG":
-            stop_price = last_fill * (1.0 - dist_pct / 100.0)
-            if trigger_buf_k > 0.0:
-                stop_price *= (1.0 - trigger_buf_k)
+        def _persist_pending_anchor(field_name: str, field_value: float) -> None:
+            try:
+                if not getattr(self, "_pl_has_raw_meta", False):
+                    return
+                uqm = """
+                UPDATE position_ledger
+                SET raw_meta = jsonb_set(
+                        COALESCE(raw_meta,'{}'::jsonb),
+                        '{hedge}',
+                        COALESCE(COALESCE(raw_meta,'{}'::jsonb)->'hedge','{}'::jsonb) || jsonb_build_object(%(field_name)s, %(field_value)s::double precision),
+                        true
+                    ),
+                    updated_at = now()
+                WHERE exchange_id=%(ex)s AND account_id=%(acc)s AND pos_uid=%(pos_uid)s AND status='OPEN';
+                """
+                self.store.execute(
+                    uqm,
+                    {
+                        "field_name": str(field_name),
+                        "field_value": float(field_value),
+                        "ex": int(self.exchange_id),
+                        "acc": int(self.account_id),
+                        "pos_uid": str(pos_uid),
+                    },
+                )
+            except Exception:
+                pass
+            try:
+                if isinstance(pos, dict):
+                    rm_local = pos.get("raw_meta")
+                    if isinstance(rm_local, str):
+                        import json as _json
+                        rm_local = _json.loads(rm_local) if rm_local.strip() else {}
+                    if not isinstance(rm_local, dict):
+                        rm_local = {}
+                    hedge_local = rm_local.get("hedge")
+                    if not isinstance(hedge_local, dict):
+                        hedge_local = {}
+                    hedge_local[str(field_name)] = float(field_value)
+                    rm_local["hedge"] = hedge_local
+                    pos["raw_meta"] = rm_local
+            except Exception:
+                pass
+
+        raw_meta = pos.get("raw_meta") if isinstance(pos, dict) else None
+        hedge_last_close_px = 0.0
+        hedge_reopen_anchor_px = 0.0
+        hedge_open_anchor_px = 0.0
+        try:
+            rm = raw_meta
+            if isinstance(rm, str):
+                import json as _json
+                rm = _json.loads(rm) if rm.strip() else {}
+            if isinstance(rm, dict):
+                h = rm.get("hedge") or {}
+                if isinstance(h, dict):
+                    hedge_last_close_px = float(h.get("last_close_px") or 0.0)
+                    hedge_reopen_anchor_px = float(h.get("reopen_anchor_px") or 0.0)
+                    hedge_open_anchor_px = float(h.get("open_anchor_px") or 0.0)
+                    if hedge_reopen_anchor_px <= 0.0:
+                        hedge_reopen_anchor_px = float(hedge_last_close_px or 0.0)
+        except Exception:
+            hedge_last_close_px = 0.0
+            hedge_reopen_anchor_px = 0.0
+            hedge_open_anchor_px = 0.0
+
+        reopen_anchor_mode = False
+        pending_anchor_mode = False
+        pending_anchor_kind = ""
+        pending_anchor_init = False
+        pending_anchor_move_pct = 0.0
+        reopen_target_price = 0.0
+        anchor_refresh_reason = None
+        try:
+            reopen_filter_enabled = bool(getattr(self.p, "hedge_reopen_price_filter_enabled", False))
+        except Exception:
+            reopen_filter_enabled = False
+        try:
+            reopen_move_pct = float(getattr(self.p, "hedge_reopen_price_move_pct", 0.0) or 0.0) / 100.0
+        except Exception:
+            reopen_move_pct = 0.0
+        try:
+            shift_trigger_pct = float(getattr(self.p, "hedge_reopen_anchor_shift_trigger_pct", 0.0) or 0.0) / 100.0
+        except Exception:
+            shift_trigger_pct = 0.0
+        try:
+            shift_step_pct = float(getattr(self.p, "hedge_reopen_anchor_shift_step_pct", 0.0) or 0.0) / 100.0
+        except Exception:
+            shift_step_pct = 0.0
+        try:
+            explicit_anchor_order_offset_pct = float(getattr(self.p, "hedge_reopen_order_offset_pct", 0.0) or 0.0) / 100.0
+        except Exception:
+            explicit_anchor_order_offset_pct = 0.0
+        try:
+            anchor_reprice_min_pct = float(getattr(self.p, "hedge_reopen_order_min_reprice_pct", 0.0) or 0.0) / 100.0
+        except Exception:
+            anchor_reprice_min_pct = 0.0
+        try:
+            anchor_reprice_cooldown_sec = float(getattr(self.p, "hedge_reopen_reprice_cooldown_sec", 0.0) or 0.0)
+        except Exception:
+            anchor_reprice_cooldown_sec = 0.0
+
+        # Early restore for first-open anchor: on later cycles there may already be a live
+        # pending hedge opener on the exchange, while raw_meta in the current position snapshot
+        # still lags behind. In that case we must derive the anchor from the existing order
+        # BEFORE falling back to last_add_fill, otherwise OPEN_ANCHOR_INIT will repeat forever.
+        try:
+            if reopen_filter_enabled and hedge_open_anchor_px <= 0.0 and hedge_reopen_anchor_px <= 0.0:
+                open_algos_early = self._rest_snapshot_get("open_algo_orders_all") or []
+                early_found = None
+                for ao in open_algos_early if isinstance(open_algos_early, list) else []:
+                    try:
+                        if str(ao.get("symbol") or "").upper() != str(sym).upper():
+                            continue
+                        otype = str(ao.get("orderType") or ao.get("type") or "").upper()
+                        if otype not in {"STOP_MARKET", "STOP"}:
+                            continue
+                        if bool(ao.get("reduceOnly")) or bool(ao.get("closePosition")):
+                            continue
+                        if str(ao.get("positionSide") or "").upper() != str(hedge_ps).upper():
+                            continue
+                        if str(ao.get("side") or "").upper() != str(close_side).upper():
+                            continue
+                        trig_ao = float(ao.get("triggerPrice") or ao.get("stopPrice") or 0.0)
+                        if trig_ao <= 0.0:
+                            continue
+                        early_found = ao
+                        break
+                    except Exception:
+                        continue
+                if early_found is not None:
+                    cur_f = float(early_found.get("triggerPrice") or early_found.get("stopPrice") or 0.0)
+                    _derive_move_pct = max(float(dist_pct or 0.0), 0.0) / 100.0
+                    denom = (1.0 - _derive_move_pct) if side_u == "LONG" else (1.0 + _derive_move_pct)
+                    if trigger_buf_k > 0.0:
+                        denom *= (1.0 - trigger_buf_k) if side_u == "LONG" else (1.0 + trigger_buf_k)
+                    derived_open_anchor_px = float(cur_f / denom) if denom > 1e-12 else 0.0
+                    if derived_open_anchor_px > 0.0:
+                        hedge_open_anchor_px = float(derived_open_anchor_px)
+                        try:
+                            _persist_pending_anchor("open_anchor_px", float(derived_open_anchor_px))
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
+        anchor_px = float(hedge_reopen_anchor_px or hedge_open_anchor_px or hedge_last_close_px or 0.0)
+        if reopen_filter_enabled and anchor_px <= 0.0 and float(last_fill or 0.0) > 0.0:
+            anchor_px = float(last_fill)
+            hedge_open_anchor_px = float(anchor_px)
+            pending_anchor_init = True
+            pending_anchor_kind = "first_open"
+            pending_anchor_move_pct = max(float(dist_pct or 0.0), 0.0) / 100.0
+        elif reopen_filter_enabled and anchor_px > 0.0:
+            if float(hedge_reopen_anchor_px or hedge_last_close_px or 0.0) > 0.0:
+                pending_anchor_kind = "reopen"
+                pending_anchor_move_pct = max(float(reopen_move_pct or 0.0), 0.0)
+            else:
+                pending_anchor_kind = "first_open"
+                pending_anchor_move_pct = max(float(dist_pct or 0.0), 0.0) / 100.0
+
+        if reopen_filter_enabled and anchor_px > 0.0:
+            reopen_anchor_mode = bool(float(hedge_reopen_anchor_px or hedge_last_close_px or 0.0) > 0.0)
+            pending_anchor_mode = True
+            if pending_anchor_init and abs(anchor_px) > 0.0:
+                _persist_pending_anchor("open_anchor_px", float(anchor_px))
+                try:
+                    log.info(
+                        "[TL][HEDGE][OPEN_ANCHOR_INIT] %s %s initialized first-open anchor from last_add_fill: anchor=%.8f move_pct=%.4f%%",
+                        str(sym).upper(),
+                        str(side_u).upper(),
+                        float(anchor_px),
+                        float(pending_anchor_move_pct * 100.0),
+                    )
+                except Exception:
+                    pass
+            new_anchor_px = float(anchor_px)
+            try:
+                mark_anchor = float(self._get_mark_price_live(sym) or 0.0)
+            except Exception:
+                mark_anchor = 0.0
+            if mark_anchor > 0.0 and shift_trigger_pct > 0.0 and shift_step_pct > 0.0:
+                if side_u == "LONG":
+                    while mark_anchor >= new_anchor_px * (1.0 + shift_trigger_pct):
+                        new_anchor_px = new_anchor_px * (1.0 + shift_step_pct)
+                else:
+                    while mark_anchor <= new_anchor_px * (1.0 - shift_trigger_pct):
+                        new_anchor_px = new_anchor_px * (1.0 - shift_step_pct)
+            if abs(new_anchor_px - anchor_px) > 1e-12:
+                _persist_pending_anchor("reopen_anchor_px" if reopen_anchor_mode else "open_anchor_px", float(new_anchor_px))
+                try:
+                    log.info(
+                        "[TL][HEDGE][%s_ANCHOR_SHIFT] %s %s mark=%.8f old_anchor=%.8f new_anchor=%.8f trigger=%.4f%% step=%.4f%%",
+                        "REOPEN" if reopen_anchor_mode else "OPEN",
+                        str(sym).upper(),
+                        str(side_u).upper(),
+                        float(mark_anchor),
+                        float(anchor_px),
+                        float(new_anchor_px),
+                        float(shift_trigger_pct * 100.0),
+                        float(shift_step_pct * 100.0),
+                    )
+                except Exception:
+                    pass
+                anchor_refresh_reason = "anchor_shift"
+            anchor_px = float(new_anchor_px)
+            anchor_order_offset_pct = max(
+                float(explicit_anchor_order_offset_pct or 0.0),
+                float(pending_anchor_move_pct or 0.0),
+            )
+            if side_u == "LONG":
+                reopen_target_price = anchor_px * (1.0 - max(anchor_order_offset_pct, 0.0))
+                if trigger_buf_k > 0.0:
+                    reopen_target_price *= (1.0 - trigger_buf_k)
+            else:
+                reopen_target_price = anchor_px * (1.0 + max(anchor_order_offset_pct, 0.0))
+                if trigger_buf_k > 0.0:
+                    reopen_target_price *= (1.0 + trigger_buf_k)
+            stop_price = float(reopen_target_price)
         else:
-            stop_price = last_fill * (1.0 + dist_pct / 100.0)
-            if trigger_buf_k > 0.0:
-                stop_price *= (1.0 + trigger_buf_k)
+            if side_u == "LONG":
+                stop_price = last_fill * (1.0 - dist_pct / 100.0)
+                if trigger_buf_k > 0.0:
+                    stop_price *= (1.0 - trigger_buf_k)
+            else:
+                stop_price = last_fill * (1.0 + dist_pct / 100.0)
+                if trigger_buf_k > 0.0:
+                    stop_price *= (1.0 + trigger_buf_k)
 
         # Tick rounding
         tick = 0.0
@@ -1609,13 +1832,197 @@ class TradeLiquidationHedgeLogicMixin:
                     },
                 )
                 if row and row[0]:
-                    found_hedge = {
-                        "clientAlgoId": str(row[0] or ""),
-                        "triggerPrice": float(row[1] or 0.0),
-                        "quantity": float(row[2] or 0.0),
-                    }
+                    stale_cid = str(row[0] or "")
+                    stale_trigger = float(row[1] or 0.0)
+                    stale_qty = float(row[2] or 0.0)
+                    stale_updated_at = row[3] if len(row) > 3 else None
+                    recent_db_hint = False
+                    try:
+                        recent_hint_sec = float(getattr(self.p, "hedge_db_open_fallback_grace_sec", 15.0) or 15.0)
+                    except Exception:
+                        recent_hint_sec = 15.0
+                    try:
+                        now_ms = int(time.time() * 1000)
+                        upd_ms = self._to_epoch_ms(stale_updated_at) or 0
+                        recent_db_hint = bool(upd_ms and now_ms > 0 and (now_ms - upd_ms) <= int(max(recent_hint_sec, 0.0) * 1000.0))
+                    except Exception:
+                        recent_db_hint = False
+
+                    if recent_db_hint:
+                        found_hedge = {
+                            "clientAlgoId": stale_cid,
+                            "triggerPrice": float(stale_trigger),
+                            "quantity": float(stale_qty),
+                        }
+                    else:
+                        try:
+                            self.store.set_algo_order_status(
+                                exchange_id=int(self.exchange_id),
+                                account_id=int(self.account_id),
+                                client_algo_id=str(stale_cid),
+                                status="CANCELED",
+                                raw_json={
+                                    "cancel_reason": "missing_on_exchange",
+                                    "cancel_source": "exchange_snapshot_reconcile",
+                                    "symbol": str(sym).upper(),
+                                    "position_side": str(hedge_ps).upper(),
+                                    "trigger_price": float(stale_trigger),
+                                    "quantity": float(stale_qty),
+                                },
+                            )
+                        except Exception:
+                            pass
+                        try:
+                            log.info(
+                                "[TL][HEDGE] ignore stale DB pending hedge %s %s cid=%s trigger=%.8f qty=%.8f reason=missing_on_exchange",
+                                str(sym).upper(),
+                                str(side_u).upper(),
+                                str(stale_cid),
+                                float(stale_trigger),
+                                float(stale_qty),
+                            )
+                        except Exception:
+                            pass
             except Exception:
                 pass
+
+        # Recovery path for restarts: if reopen filter is enabled but raw_meta has no saved
+        # anchor yet, derive it from an already existing pending hedge reopen order.
+        # This lets the bot continue trailing the reopen anchor instead of falling back to
+        # last_add_fill forever after a restart/recovery.
+        if reopen_filter_enabled and anchor_px <= 0.0 and found_hedge is not None:
+            try:
+                cur = found_hedge.get("triggerPrice") or found_hedge.get("stopPrice")
+                cur_f = float(cur) if cur is not None else 0.0
+            except Exception:
+                cur_f = 0.0
+            if cur_f > 0.0:
+                try:
+                    denom = 1.0
+                    _derive_move_pct = max(float(reopen_move_pct or 0.0), 0.0)
+                    if hedge_reopen_anchor_px <= 0.0 and hedge_last_close_px <= 0.0:
+                        _derive_move_pct = max(float(dist_pct or 0.0), 0.0) / 100.0
+                    if side_u == "LONG":
+                        denom = (1.0 - _derive_move_pct) * (1.0 - max(trigger_buf_k, 0.0))
+                    else:
+                        denom = (1.0 + _derive_move_pct) * (1.0 + max(trigger_buf_k, 0.0))
+                    derived_anchor_px = float(cur_f / denom) if denom > 1e-12 else 0.0
+                except Exception:
+                    derived_anchor_px = 0.0
+                if derived_anchor_px > 0.0:
+                    anchor_px = float(derived_anchor_px)
+                    restored_reopen = bool(float(hedge_last_close_px or hedge_reopen_anchor_px or 0.0) > 0.0)
+                    if restored_reopen:
+                        hedge_last_close_px = float(hedge_last_close_px or derived_anchor_px)
+                        hedge_reopen_anchor_px = float(derived_anchor_px)
+                        reopen_anchor_mode = True
+                        pending_anchor_kind = "reopen"
+                        pending_anchor_move_pct = max(float(reopen_move_pct or 0.0), 0.0)
+                    else:
+                        hedge_open_anchor_px = float(derived_anchor_px)
+                        reopen_anchor_mode = False
+                        pending_anchor_kind = "first_open"
+                        pending_anchor_move_pct = max(float(dist_pct or 0.0), 0.0) / 100.0
+                    pending_anchor_mode = True
+                    anchor_refresh_reason = anchor_refresh_reason or "anchor_restored_from_pending_order"
+                    try:
+                        if getattr(self, "_pl_has_raw_meta", False):
+                            if restored_reopen:
+                                uqm = """
+                                UPDATE position_ledger
+                                SET raw_meta = jsonb_set(
+                                        jsonb_set(
+                                            COALESCE(raw_meta,'{}'::jsonb),
+                                            '{hedge,reopen_anchor_px}',
+                                            to_jsonb(%(anchor_px)s::double precision),
+                                            true
+                                        ),
+                                        '{hedge,last_close_px}',
+                                        to_jsonb(%(last_close_px)s::double precision),
+                                        true
+                                    ),
+                                    updated_at = now()
+                                WHERE exchange_id=%(ex)s AND account_id=%(acc)s AND pos_uid=%(pos_uid)s AND status='OPEN';
+                                """
+                                params = {
+                                    "anchor_px": float(derived_anchor_px),
+                                    "last_close_px": float(hedge_last_close_px or derived_anchor_px),
+                                    "ex": int(self.exchange_id),
+                                    "acc": int(self.account_id),
+                                    "pos_uid": str(pos_uid),
+                                }
+                            else:
+                                uqm = """
+                                UPDATE position_ledger
+                                SET raw_meta = jsonb_set(
+                                        COALESCE(raw_meta,'{}'::jsonb),
+                                        '{hedge,open_anchor_px}',
+                                        to_jsonb(%(anchor_px)s::double precision),
+                                        true
+                                    ),
+                                    updated_at = now()
+                                WHERE exchange_id=%(ex)s AND account_id=%(acc)s AND pos_uid=%(pos_uid)s AND status='OPEN';
+                                """
+                                params = {
+                                    "anchor_px": float(derived_anchor_px),
+                                    "ex": int(self.exchange_id),
+                                    "acc": int(self.account_id),
+                                    "pos_uid": str(pos_uid),
+                                }
+                            self.store.execute(uqm, params)
+                    except Exception:
+                        pass
+                    try:
+                        log.info(
+                            "[TL][HEDGE][%s_ANCHOR_INIT] %s %s restored anchor from pending hedge order: trigger=%.8f -> anchor=%.8f move_pct=%.4f%% trigger_buf=%.4f%% cid=%s",
+                            "REOPEN" if restored_reopen else "OPEN",
+                            str(sym).upper(),
+                            str(side_u).upper(),
+                            float(cur_f),
+                            float(derived_anchor_px),
+                            float(pending_anchor_move_pct * 100.0),
+                            float(trigger_buf_k * 100.0),
+                            str(found_hedge.get('clientAlgoId') or ''),
+                        )
+                    except Exception:
+                        pass
+                    new_anchor_px = float(anchor_px)
+                    try:
+                        mark_anchor = float(self._get_mark_price_live(sym) or 0.0)
+                    except Exception:
+                        mark_anchor = 0.0
+                    if mark_anchor > 0.0 and shift_trigger_pct > 0.0 and shift_step_pct > 0.0:
+                        if side_u == "LONG":
+                            while mark_anchor >= new_anchor_px * (1.0 + shift_trigger_pct):
+                                new_anchor_px = new_anchor_px * (1.0 + shift_step_pct)
+                        else:
+                            while mark_anchor <= new_anchor_px * (1.0 - shift_trigger_pct):
+                                new_anchor_px = new_anchor_px * (1.0 - shift_step_pct)
+                    if abs(new_anchor_px - anchor_px) > 1e-12:
+                        anchor_px = float(new_anchor_px)
+                        hedge_reopen_anchor_px = float(new_anchor_px)
+                        try:
+                            _persist_pending_anchor("reopen_anchor_px" if restored_reopen else "open_anchor_px", float(new_anchor_px))
+                        except Exception:
+                            pass
+                        try:
+                            log.info(
+                                "[TL][HEDGE][REOPEN_ANCHOR_SHIFT] %s %s mark=%.8f old_anchor=%.8f new_anchor=%.8f trigger=%.4f%% step=%.4f%%",
+                                str(sym).upper(),
+                                str(side_u).upper(),
+                                float(mark_anchor),
+                                float(derived_anchor_px),
+                                float(new_anchor_px),
+                                float(shift_trigger_pct * 100.0),
+                                float(shift_step_pct * 100.0),
+                            )
+                        except Exception:
+                            pass
+                    # Keep the current exchange trigger for this cycle; subsequent cycles will
+                    # compute desired stop_price from the restored anchor and refresh the order only
+                    # if the shifted anchor truly implies a different trigger.
+                    reopen_target_price = float(cur_f)
+                    stop_price = float(cur_f)
 
         # If hedge POSITION is already open on the exchange (opposite positionSide has non-zero amt),
         # we must NOT place a pending hedge opener again.
@@ -1801,11 +2208,45 @@ class TradeLiquidationHedgeLogicMixin:
                     except Exception:
                         pass
             else:
-                # Default: if trigger already matches, or DB/exchange already reports an open hedge stopper, keep it.
+                # Default: if trigger already matches, keep it.
+                # For hedge reopen anchor mode, reprice the pending order when the
+                # desired trigger moved together with the anchor.
                 try:
                     tol = max(float(tick or 0.0) * 2.0, abs(stop_price) * 0.0002, 1e-8)
                     if cur_f > 0 and abs(cur_f - float(stop_price)) <= tol:
                         return False
+                    if cur_f > 0 and pending_anchor_mode and abs(cur_f - float(stop_price)) > tol:
+                        anchor_delta_rel = abs(float(cur_f) - float(stop_price)) / max(abs(float(cur_f)), 1e-12)
+                        if anchor_reprice_min_pct > 0.0 and anchor_delta_rel < anchor_reprice_min_pct:
+                            return False
+                        if anchor_reprice_cooldown_sec > 0.0:
+                            try:
+                                if not hasattr(self, "_recent_anchor_hedge_reprice_state") or not isinstance(self._recent_anchor_hedge_reprice_state, dict):
+                                    self._recent_anchor_hedge_reprice_state = {}
+                                _anchor_key = str(cid_hedge)
+                                _st = self._recent_anchor_hedge_reprice_state.get(_anchor_key) or {}
+                                _last_ts = float(_st.get("ts") or 0.0)
+                                _last_stop = float(_st.get("stop") or 0.0)
+                                if _last_ts and (time.time() - _last_ts) < anchor_reprice_cooldown_sec and abs(_last_stop - float(stop_price)) <= tol:
+                                    return False
+                            except Exception:
+                                pass
+                        must_refresh = True
+                        refresh_reason = refresh_reason or anchor_refresh_reason or "anchor_reprice"
+                        try:
+                            log.info(
+                                "[TL][HEDGE][%s_ANCHOR] refresh pending hedge %s %s: current=%.8f -> desired=%.8f anchor=%.8f move_pct=%.4f%% reason=%s",
+                                "REOPEN" if reopen_anchor_mode else "OPEN",
+                                str(sym).upper(),
+                                str(side_u).upper(),
+                                float(cur_f),
+                                float(stop_price),
+                                float(anchor_px if pending_anchor_mode else 0.0),
+                                float((max(float(explicit_anchor_order_offset_pct or 0.0), float(pending_anchor_move_pct or 0.0))) * 100.0),
+                                str(refresh_reason),
+                            )
+                        except Exception:
+                            pass
                     if cur_f > 0 and not must_refresh:
                         return False
                 except Exception:
@@ -1876,6 +2317,13 @@ class TradeLiquidationHedgeLogicMixin:
                 pass
 
             place_cid = str(cid_hedge)
+            try:
+                if pending_anchor_mode:
+                    if not hasattr(self, "_recent_anchor_hedge_reprice_state") or not isinstance(self._recent_anchor_hedge_reprice_state, dict):
+                        self._recent_anchor_hedge_reprice_state = {}
+                    self._recent_anchor_hedge_reprice_state[str(cid_hedge)] = {"ts": float(time.time()), "stop": float(stop_price)}
+            except Exception:
+                pass
             # Binance can permanently reserve a clientAlgoId after a cancel/reissue cycle.
             # If that happens, using the canonical *_HEDGE id again yields -4116 but no live
             # order appears on exchange. Retry with a short unique suffix and rely on semantic
@@ -1990,10 +2438,13 @@ class TradeLiquidationHedgeLogicMixin:
         if _dup_resp:
             return False
         self.log.info(
-            "[trade_liquidation][LIVE][HEDGE] placed after-last-add STOP_MARKET %s %s stop=%.8f (last_add=%.8f add_n=%s pct=%.4f qty=%.8f koff=%.4f funding_pct=%.4f)",
+            "[trade_liquidation][LIVE][HEDGE] placed after-last-add STOP_MARKET %s %s stop=%.8f (source=%s anchor=%.8f reopen_target=%.8f last_add=%.8f add_n=%s pct=%.4f qty=%.8f koff=%.4f funding_pct=%.4f)",
             str(sym).upper(),
             str(side_u),
             float(stop_price),
+            ("reopen_anchor" if reopen_anchor_mode else ("open_anchor" if pending_anchor_mode else "last_add_fill")),
+            float(anchor_px if pending_anchor_mode else 0.0),
+            float(reopen_target_price if pending_anchor_mode else 0.0),
             float(last_fill),
             str(last_n),
             float(dist_pct),
@@ -2476,6 +2927,10 @@ class TradeLiquidationHedgeLogicMixin:
                     if (not hedge_leg_owned) or (not self._has_open_position_live(symbol, str(hedge_ps))):
                         tok = _coid_token(str(p.get('pos_uid') or ''), n=20)
                         cid_htrl = f"TL_{tok}_HEDGE_TRL"
+                        try:
+                            log.info("[TL][HEDGE_TRL][DECISION] skip reason=no_open_hedge_or_binding sym=%s side=%s base_pos_uid=%s hedge_leg_owned=%s hedge_live=%s", symbol, hedge_ps, str(p.get('pos_uid') or ''), bool(hedge_leg_owned), bool(self._has_open_position_live(symbol, str(hedge_ps))))
+                        except Exception:
+                            pass
                         self._dlog("skip HEDGE_TRL: no open hedge position sym=%s side=%s", symbol, hedge_ps)
                         try:
                             cache = getattr(self, "_hedge_trl_local_open", None)
@@ -2608,6 +3063,19 @@ class TradeLiquidationHedgeLogicMixin:
                             db_htrl = None
                         have_db_open = bool(db_htrl and str(db_htrl.get("status") or "").upper() == "OPEN")
 
+                        try:
+                            existing_qty = float((existing or {}).get("quantity") or (existing or {}).get("origQty") or 0.0) if isinstance(existing, dict) else 0.0
+                        except Exception:
+                            existing_qty = 0.0
+                        try:
+                            existing_trig = float((existing or {}).get("activatePrice") or (existing or {}).get("activationPrice") or (existing or {}).get("triggerPrice") or 0.0) if isinstance(existing, dict) else 0.0
+                        except Exception:
+                            existing_trig = 0.0
+                        try:
+                            log.info("[TL][HEDGE_TRL][DECISION] sym=%s side=%s base_pos_uid=%s hedge_amt=%.8f existing=%s existing_qty=%.8f existing_trigger=%.8f db_open=%s", symbol, str(hedge_ps).upper(), str(p.get('pos_uid') or ''), float(q), bool(existing is not None), float(existing_qty), float(existing_trig), bool(have_db_open))
+                        except Exception:
+                            pass
+
                         # In-memory dedupe for exchanges/accounts where openAlgoOrders does not
                         # reliably return TRAILING_STOP_MARKET hedge orders. Once we successfully
                         # place HEDGE_TRL, keep a local "open" marker until hedge leg disappears
@@ -2634,7 +3102,18 @@ class TradeLiquidationHedgeLogicMixin:
                                 local_open_same = False
 
                         # Determine if we need to (re)issue
-                        need_place = (existing is None) and (not have_db_open) and (not local_open_same)
+                        # Exchange/openAlgoOrders is the source of truth here. A stale DB OPEN marker
+                        # must not block HEDGE_TRL placement, otherwise startup/main manager can skip
+                        # a genuinely missing hedge trailing and only recovery will restore it one cycle later.
+                        need_place = (existing is None) and (not local_open_same)
+                        if need_place and have_db_open:
+                            try:
+                                log.info(
+                                    "[TL][HEDGE_TRL][DECISION] stale_db_open_missing_exchange sym=%s side=%s base_pos_uid=%s cid=%s",
+                                    symbol, str(hedge_ps).upper(), str(p.get('pos_uid') or ''), cid_htrl
+                                )
+                            except Exception:
+                                pass
                         need_reissue = False
                         if (not need_place) and reissue_on_qty:
                             try:
@@ -2947,6 +3426,10 @@ class TradeLiquidationHedgeLogicMixin:
 
                     if (not hsl_owned) or (not self._has_open_position_live(symbol, str(hedge_ps))):
                         try:
+                            log.info("[TL][HEDGE_SL][DECISION] skip reason=no_open_hedge_or_binding sym=%s side=%s base_pos_uid=%s hsl_owned=%s hedge_live=%s", symbol, hedge_ps, str(p.get('pos_uid') or ''), bool(hsl_owned), bool(self._has_open_position_live(symbol, str(hedge_ps))))
+                        except Exception:
+                            pass
+                        try:
                             self._dlog("skip HEDGE_SL: no linked live hedge sym=%s side=%s base_pos_uid=%s", symbol, hedge_ps, str(p.get('pos_uid') or ''))
                         except Exception:
                             pass
@@ -2957,9 +3440,22 @@ class TradeLiquidationHedgeLogicMixin:
                     else:
                         try:
                             hedge_entry_use = float(hedge_entry or 0.0)
+                            hedge_entry_source = 'arg'
+                            try:
+                                live_hedge_pos = self._get_live_position(symbol, str(hedge_ps).upper())
+                            except Exception:
+                                live_hedge_pos = None
+                            try:
+                                live_hedge_entry = abs(float((live_hedge_pos or {}).get('entryPrice') or (live_hedge_pos or {}).get('avgEntryPrice') or (live_hedge_pos or {}).get('avgPrice') or 0.0))
+                            except Exception:
+                                live_hedge_entry = 0.0
+                            if live_hedge_entry > 0:
+                                hedge_entry_use = live_hedge_entry
+                                hedge_entry_source = 'live_position'
                             mp0 = float(self._get_mark_price_live(symbol) or 0.0)
                             if hedge_entry_use <= 0:
                                 hedge_entry_use = mp0
+                                hedge_entry_source = 'mark_fallback'
 
                             if str(hedge_ps).upper() == 'SHORT':
                                 stop_px = hedge_entry_use * (1.0 + hedge_sl_pct / 100.0)
@@ -3150,6 +3646,11 @@ class TradeLiquidationHedgeLogicMixin:
                             except Exception:
                                 recently_placed_same = False
 
+                            try:
+                                log.info('[TL][HEDGE_SL][DECISION] sym=%s side=%s base_pos_uid=%s hedge_amt=%.8f hedge_entry=%.8f entry_source=%s desired_trigger=%.8f existing_trigger=%.8f ex_open=%s db_open=%s trig_mismatch=%s', symbol, str(hedge_ps).upper(), str(p.get('pos_uid') or ''), float(hedge_amt), float(hedge_entry_use), str(hedge_entry_source), float(desired_trig), float(db_trig or 0.0), bool(ex_open), bool(db_open), bool(trig_mismatch))
+                            except Exception:
+                                pass
+
                             if ex_open and ex_close_position and not trig_mismatch:
                                 need_reissue = False
                             elif db_open and db_close_position and not trig_mismatch:
@@ -3261,7 +3762,7 @@ class TradeLiquidationHedgeLogicMixin:
                                         place_cache[sig_key] = {'sig': sig_val, 'ts': float(now_ts), 'cid': str(cid_hsl)}
                                     except Exception:
                                         pass
-                                    log.info('[TL][HEDGE_SL] placed %s %s qty=%.8f stop=%.8f entry=%.8f pct=%.4f be=%s be_pct=%.4f act_pct=%.4f cid=%s', symbol, str(hedge_ps).upper(), float(hedge_amt), float(stop_px), float(hedge_entry_use), float(hedge_sl_pct), bool(be_applied), float(be_pct or 0.0), float(be_act_pct or 0.0), cid_hsl)
+                                    log.info('[TL][HEDGE_SL] placed %s %s qty=%.8f stop=%.8f entry=%.8f entry_source=%s pct=%.4f be=%s be_pct=%.4f act_pct=%.4f cid=%s', symbol, str(hedge_ps).upper(), float(hedge_amt), float(stop_px), float(hedge_entry_use), str(hedge_entry_source), float(hedge_sl_pct), bool(be_applied), float(be_pct or 0.0), float(be_act_pct or 0.0), cid_hsl)
                         except Exception:
                             log.exception('[TL][HEDGE_SL] unexpected error for %s %s', symbol, hedge_ps)
 
@@ -3373,27 +3874,7 @@ class TradeLiquidationHedgeLogicMixin:
                                     new_anchor_px = new_anchor_px * (1.0 - shift_step_pct)
                         if abs(new_anchor_px - anchor_px) > 1e-12:
                             try:
-                                if getattr(self, "_pl_has_raw_meta", False):
-                                    uqm = """
-                                    UPDATE position_ledger
-                                    SET raw_meta = jsonb_set(
-                                            COALESCE(raw_meta,'{}'::jsonb),
-                                            '{hedge,reopen_anchor_px}',
-                                            to_jsonb(%(anchor_px)s::double precision),
-                                            true
-                                        ),
-                                        updated_at = now()
-                                    WHERE exchange_id=%(ex)s AND account_id=%(acc)s AND pos_uid=%(pos_uid)s AND status='OPEN';
-                                    """
-                                    self.store.execute(
-                                        uqm,
-                                        {
-                                            "anchor_px": float(new_anchor_px),
-                                            "ex": int(self.exchange_id),
-                                            "acc": int(self.account_id),
-                                            "pos_uid": str(p.get("pos_uid")),
-                                        },
-                                    )
+                                _persist_pending_anchor("reopen_anchor_px", float(new_anchor_px))
                             except Exception:
                                 pass
                             hedge_reopen_anchor_px = float(new_anchor_px)

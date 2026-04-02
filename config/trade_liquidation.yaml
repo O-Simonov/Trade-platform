@@ -14,10 +14,10 @@ traders:
       # ======================================================
       # Performance / Throughput tuning
       # ======================================================
-      max_recovery_symbols_per_cycle: 5            # Максимум символов, которые recovery обслуживает за один цикл
-      max_recovery_actions_per_cycle: 6            # Максимум recovery-действий (SL/TRL/cleanup) за один цикл
-      max_symbols_per_cycle: 5                     # Сколько открытых символов обслуживать за один цикл (round-robin batching)
-      use_exchange_snapshot_per_cycle: true        # Использовать единый snapshot позиций/ордеров биржи на цикл для снижения REST-нагрузки
+      max_recovery_symbols_per_cycle: 10            # Максимум символов, которые recovery обслуживает за один цикл
+      max_recovery_actions_per_cycle: 12            # Максимум recovery-действий (SL/TRL/cleanup) за один цикл
+      max_symbols_per_cycle: 10                     # Сколько открытых символов обслуживать за один цикл (round-robin batching)
+      use_exchange_snapshot_per_cycle: true         # Использовать единый snapshot позиций/ордеров биржи на цикл для снижения REST-нагрузки
 
       # ======================================================
       # Logging control / anti-spam
@@ -92,8 +92,8 @@ traders:
       # --- Hedge sizing с учетом funding
       hedge_funding_kof_limit: 0.6                  # Порог funding в %, после которого разрешается корректировка размера hedge
       hedge_koff_funding_boost: 1.6                 # Усиление hedge_koff при выгодном funding
-      hedge_koff: 1.0                               # Базовый множитель размера hedge относительно main
-      hedge_max_ratio: 2.0                          # Жесткий потолок размера hedge относительно main
+      hedge_koff: 0.7                               # Базовый множитель размера hedge относительно main
+      hedge_max_ratio: 1.5                          # Жесткий потолок размера hedge относительно main
 
       hedge_trigger_buffer_pct: 0.8                 # Буфер для триггера открытия hedge
       hedge_cooldown_sec: 180                       # Кулдаун между действиями по hedge
@@ -101,12 +101,15 @@ traders:
       hedge_open_only_after_max_adds: true          # Первый hedge открывать только после выполнения всех доборов main
 
       hedge_reopen_price_filter_enabled: true       # Включить повторный перезаход по цене относительно прошлого выхода hedge
-      hedge_reopen_price_move_pct: 0.5              # Для main LONG / short hedge: цена должна стать ниже anchor на 0.5%; для main SHORT / long hedge: выше на 0.5%
+      hedge_reopen_price_move_pct: 1.0              # Для main LONG / short hedge: цена должна стать ниже anchor на 0.7%; для main SHORT / long hedge: выше на 0.7%
       hedge_reopen_anchor_shift_trigger_pct: 2.0    # Сдвигать anchor, если цена ушла на этот % в сторону основной позиции
-      hedge_reopen_anchor_shift_step_pct: 1.0       # На сколько сдвигать anchor при срабатывании триггера
+      hedge_reopen_anchor_shift_step_pct: 1.5       # На сколько сдвигать anchor при срабатывании триггера
+      hedge_reopen_order_offset_pct: 1.0            # Явная дистанция pending hedge-ордера от anchor; 0 = старое поведение
+      hedge_reopen_order_min_reprice_pct: 0.3       # Минимальное изменение trigger (%) для перевыставления hedge-ордера
+      hedge_reopen_reprice_cooldown_sec: 30         # Минимальная пауза между перевыставлениями hedge-ордера от anchor
 
       main_add_on_hedge_price_diff_enabled: true    # Добор main, если цена входа main слишком сильно отличается от цены входа hedge
-      main_add_on_hedge_price_diff_pct: 10.0        # Порог расхождения entry main vs hedge в процентах %
+      main_add_on_hedge_price_diff_pct: 12.0        # Порог расхождения entry main vs hedge в процентах %
       main_add_on_hedge_price_diff_koff_lot: 2.0    # Объем добора = текущий объем main * коэффициент
       hedge_promote_survivor_to_main_enabled: true  # Если main закрылась, а hedge осталась открытой — создать новую safe LIVE main-позицию из surviving hedge
 
@@ -125,7 +128,7 @@ traders:
       hedge_adaptive_enabled: true                  # Включить адаптивное усиление hedge
       hedge_adaptive_trigger_pct: 0.8               # После какого adverse move (%) начать усиливать hedge
       hedge_adaptive_step_pct: 0.8                  # Шаг adverse move (%) для дополнительного усиления
-      hedge_adaptive_boost_per_step: 0.1            # Дополнительный koff за каждый шаг adverse move
+      hedge_adaptive_boost_per_step: 0.05            # Дополнительный koff за каждый шаг adverse move
       hedge_adaptive_max_extra_koff: 0.35           # Максимальная добавка к hedge_koff от adaptive логики
 
       # --- Защита от плохого funding по hedge, чтобы не попасть на дойку
@@ -163,12 +166,13 @@ traders:
       # Hedge SL move to Break-Even / Profit-Lock
       # Работает только если hedge_stop_loss_pct > 0
       # ======================================================
-      hedge_stop_loss_be_pct: 1.3                   # Куда переносить hedge SL после активации: процент прибыли/запаса относительно entry
-      hedge_stop_loss_be_activation_pct: 1.5        # При каком движении в прибыль активировать перенос hedge SL в BE / profit-lock
-      hedge_stop_loss_be_pct_min: 1.0               # Минимально допустимое значение hedge_stop_loss_be_pct
+      hedge_stop_loss_be_pct: 0.8                   # Куда переносить hedge SL после активации: процент прибыли/запаса относительно entry
+      hedge_stop_loss_be_activation_pct: 1.2        # При каком движении в прибыль активировать перенос hedge SL в BE / profit-lock
+      hedge_stop_loss_be_pct_min: 0.8               # Минимально допустимое значение hedge_stop_loss_be_pct
       hedge_stop_loss_be_pct_max: 10.0              # Максимально допустимое значение hedge_stop_loss_be_pct
-      hedge_stop_loss_be_activation_pct_min: 1.0    # Минимально допустимое значение hedge_stop_loss_be_activation_pct
+      hedge_stop_loss_be_activation_pct_min: 0.8    # Минимально допустимое значение hedge_stop_loss_be_activation_pct
       hedge_stop_loss_be_activation_pct_max: 10.0   # Максимально допустимое значение hedge_stop_loss_be_activation_pct
+
       hedge_close_on_main_positive: false           # Закрывать hedge, если основная позиция вышла в плюс
 
       # ======================================================
@@ -176,10 +180,10 @@ traders:
       # ======================================================
       max_open_positions: 8                         # Максимум одновременно открытых позиций
       max_position_notional_pct_wallet: 1.0         # Лимит initial entry как % от wallet*leverage
-      averaging_add_max_notional_pct_wallet: 5.0    # 0 = OFF; максимум notional одного добора как % от wallet*leverage
+      averaging_add_max_notional_pct_wallet: 10.0    # 0 = OFF; максимум notional одного добора как % от wallet*leverage
       main_position_max_notional_pct_wallet: 10.0   # 0 = OFF; максимум суммарной основной позиции как % от wallet*leverage
       hedge_position_max_notional_pct_wallet: 10.0   # 0 = OFF; максимум суммарной hedge-позиции как % от wallet*leverage
-      risk_wallet_pct: 1.5                          # Риск на сделку от кошелька
+      risk_wallet_pct: 1.0                          # Риск на сделку от кошелька
       live_entry_reduce_on_max_position: true       # Если позиция не проходит по лимитам → уменьшать размер и пробовать снова
       live_entry_reduce_steps: 3                    # Максимум попыток уменьшения
       live_entry_reduce_factor: 0.8                 # На каждом шаге размер = размер * 0.8
@@ -213,7 +217,8 @@ traders:
       client_order_id_prefix: TL                    # Префикс clientOrderId
       enable_stop_loss: true                        # Включить постановку SL
       defer_stop_loss_until_last_add: true          # Не ставить обычный SL сразу, пока не будут выполнены все доборы; на main trailing это больше не влияет
-      sl_after_last_add_distance_pct: 5.0           # Дистанция SL после последнего добора, если включён отложенный SL
+
+      sl_after_last_add_distance_pct: 2.0           # Дистанция SL после последнего добора, если включён отложенный SL
 
       # ======================================================
       # Main trailing stop
@@ -307,8 +312,11 @@ traders:
       reconcile_binance_adds_every_sec: 300         # Как часто делать такую сверку по истории Binance
       # Эти параметры специально ослаблены для снижения шума по value:
       # если qty совпадает, не надо каждый цикл дергать value_usdt
-      reconcile_auto_adjust_ledger_value_usdt: true   # Автоматически обновлять ledger value_usdt при значимом расхождении
-      reconcile_refresh_position_value_usdt: true     # Делать refresh value_usdt по текущему рынку во время reconcile
+      reconcile_auto_adjust_ledger_value_usdt: false   # Автоматически обновлять ledger value_usdt при значимом расхождении
+      reconcile_refresh_position_value_usdt: false     # Делать refresh value_usdt по текущему рынку во время reconcile
+      reconcile_auto_sync_entry_price: true            # Синхронизировать ledger entry/avg с live exchange entryPrice
+      reconcile_entry_price_tolerance_pct: 0.001       # Относительный порог (0.1%) для entry sync
+      reconcile_sync_after_recovery: true              # После RECOVERY подтягивать qty/entry/value из positionRisk
       reconcile_value_refresh_min_delta_usdt: 2.0     # Минимальное изменение value для обновления
       reconcile_value_tolerance_usdt: 2.5             # Порог, после которого value mismatch считается значимым
 
@@ -325,5 +333,5 @@ traders:
       # Async REST
       # ======================================================
       async_rest_enabled: true                      # Включить параллельные REST-запросы
-      async_rest_workers: 6                         # Количество воркеров
+      async_rest_workers: 8                         # Количество воркеров
       async_rest_timeout_sec: 8                     # Таймаут async REST-запроса в секундах

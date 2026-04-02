@@ -109,7 +109,7 @@ traders:
       hedge_reopen_reprice_cooldown_sec: 30         # Минимальная пауза между перевыставлениями hedge-ордера от anchor
 
       main_add_on_hedge_price_diff_enabled: true    # Добор main, если цена входа main слишком сильно отличается от цены входа hedge
-      main_add_on_hedge_price_diff_pct: 12.0        # Порог расхождения entry main vs hedge в процентах %
+      main_add_on_hedge_price_diff_pct: 20.0        # Порог расхождения entry main vs hedge в процентах %
       main_add_on_hedge_price_diff_koff_lot: 2.0    # Объем добора = текущий объем main * коэффициент
       hedge_promote_survivor_to_main_enabled: true  # Если main закрылась, а hedge осталась открытой — создать новую safe LIVE main-позицию из surviving hedge
 
@@ -167,7 +167,7 @@ traders:
       # Работает только если hedge_stop_loss_pct > 0
       # ======================================================
       hedge_stop_loss_be_pct: 0.8                   # Куда переносить hedge SL после активации: процент прибыли/запаса относительно entry
-      hedge_stop_loss_be_activation_pct: 1.2        # При каком движении в прибыль активировать перенос hedge SL в BE / profit-lock
+      hedge_stop_loss_be_activation_pct: 1.0        # При каком движении в прибыль активировать перенос hedge SL в BE / profit-lock
       hedge_stop_loss_be_pct_min: 0.8               # Минимально допустимое значение hedge_stop_loss_be_pct
       hedge_stop_loss_be_pct_max: 10.0              # Максимально допустимое значение hedge_stop_loss_be_pct
       hedge_stop_loss_be_activation_pct_min: 0.8    # Минимально допустимое значение hedge_stop_loss_be_activation_pct

@@ -1487,6 +1487,43 @@ class TradeLiquidationHedgeLogicMixin:
             except Exception:
                 pass
 
+        def _anchor_tol(anchor_value: float) -> float:
+            try:
+                return max(float(tick or 0.0) * 2.0, abs(float(anchor_value or 0.0)) * 0.0002, 1e-8)
+            except Exception:
+                return 1e-8
+
+        def _anchor_changed(prev_anchor: float, new_anchor: float) -> bool:
+            try:
+                return abs(float(new_anchor or 0.0) - float(prev_anchor or 0.0)) > _anchor_tol(float(prev_anchor or new_anchor or 0.0))
+            except Exception:
+                return abs(float(new_anchor or 0.0) - float(prev_anchor or 0.0)) > 1e-8
+
+        def _anchor_move_allowed(prev_anchor: float, new_anchor: float) -> bool:
+            try:
+                prev_f = float(prev_anchor or 0.0)
+                new_f = float(new_anchor or 0.0)
+            except Exception:
+                return False
+            if prev_f <= 0.0 or new_f <= 0.0:
+                return False
+            tol_local = _anchor_tol(prev_f)
+            if side_u == "LONG":
+                return new_f > (prev_f + tol_local)
+            return new_f < (prev_f - tol_local)
+
+        def _normalize_anchor(prev_anchor: float, candidate_anchor: float) -> float:
+            try:
+                prev_f = float(prev_anchor or 0.0)
+                cand_f = float(candidate_anchor or 0.0)
+            except Exception:
+                return float(candidate_anchor or 0.0)
+            if prev_f <= 0.0 or cand_f <= 0.0:
+                return cand_f
+            if side_u == "LONG":
+                return max(prev_f, cand_f)
+            return min(prev_f, cand_f)
+
         raw_meta = pos.get("raw_meta") if isinstance(pos, dict) else None
         hedge_last_close_px = 0.0
         hedge_reopen_anchor_px = 0.0
@@ -1516,6 +1553,7 @@ class TradeLiquidationHedgeLogicMixin:
         pending_anchor_move_pct = 0.0
         reopen_target_price = 0.0
         anchor_refresh_reason = None
+        anchor_changed_this_cycle = False
         try:
             reopen_filter_enabled = bool(getattr(self.p, "hedge_reopen_price_filter_enabled", False))
         except Exception:
@@ -1580,6 +1618,7 @@ class TradeLiquidationHedgeLogicMixin:
                     if trigger_buf_k > 0.0:
                         denom *= (1.0 - trigger_buf_k) if side_u == "LONG" else (1.0 + trigger_buf_k)
                     derived_open_anchor_px = float(cur_f / denom) if denom > 1e-12 else 0.0
+                    derived_open_anchor_px = _normalize_anchor(float(hedge_open_anchor_px or hedge_reopen_anchor_px or hedge_last_close_px or 0.0), derived_open_anchor_px)
                     if derived_open_anchor_px > 0.0:
                         hedge_open_anchor_px = float(derived_open_anchor_px)
                         try:
@@ -1619,6 +1658,7 @@ class TradeLiquidationHedgeLogicMixin:
                     )
                 except Exception:
                     pass
+            old_anchor_px = float(anchor_px)
             new_anchor_px = float(anchor_px)
             try:
                 mark_anchor = float(self._get_mark_price_live(sym) or 0.0)
@@ -1631,7 +1671,8 @@ class TradeLiquidationHedgeLogicMixin:
                 else:
                     while mark_anchor <= new_anchor_px * (1.0 - shift_trigger_pct):
                         new_anchor_px = new_anchor_px * (1.0 - shift_step_pct)
-            if abs(new_anchor_px - anchor_px) > 1e-12:
+            new_anchor_px = _normalize_anchor(old_anchor_px, new_anchor_px)
+            if _anchor_move_allowed(old_anchor_px, new_anchor_px):
                 _persist_pending_anchor("reopen_anchor_px" if reopen_anchor_mode else "open_anchor_px", float(new_anchor_px))
                 try:
                     log.info(
@@ -1648,6 +1689,7 @@ class TradeLiquidationHedgeLogicMixin:
                 except Exception:
                     pass
                 anchor_refresh_reason = "anchor_shift"
+                anchor_changed_this_cycle = True
             anchor_px = float(new_anchor_px)
             anchor_order_offset_pct = max(
                 float(explicit_anchor_order_offset_pct or 0.0),
@@ -1909,6 +1951,7 @@ class TradeLiquidationHedgeLogicMixin:
                     derived_anchor_px = float(cur_f / denom) if denom > 1e-12 else 0.0
                 except Exception:
                     derived_anchor_px = 0.0
+                derived_anchor_px = _normalize_anchor(float(hedge_reopen_anchor_px or hedge_open_anchor_px or hedge_last_close_px or 0.0), derived_anchor_px)
                 if derived_anchor_px > 0.0:
                     anchor_px = float(derived_anchor_px)
                     restored_reopen = bool(float(hedge_last_close_px or hedge_reopen_anchor_px or 0.0) > 0.0)
@@ -1986,6 +2029,7 @@ class TradeLiquidationHedgeLogicMixin:
                         )
                     except Exception:
                         pass
+                    old_anchor_px = float(anchor_px)
                     new_anchor_px = float(anchor_px)
                     try:
                         mark_anchor = float(self._get_mark_price_live(sym) or 0.0)
@@ -1998,13 +2042,15 @@ class TradeLiquidationHedgeLogicMixin:
                         else:
                             while mark_anchor <= new_anchor_px * (1.0 - shift_trigger_pct):
                                 new_anchor_px = new_anchor_px * (1.0 - shift_step_pct)
-                    if abs(new_anchor_px - anchor_px) > 1e-12:
+                    new_anchor_px = _normalize_anchor(old_anchor_px, new_anchor_px)
+                    if _anchor_move_allowed(old_anchor_px, new_anchor_px):
                         anchor_px = float(new_anchor_px)
                         hedge_reopen_anchor_px = float(new_anchor_px)
                         try:
                             _persist_pending_anchor("reopen_anchor_px" if restored_reopen else "open_anchor_px", float(new_anchor_px))
                         except Exception:
                             pass
+                        anchor_changed_this_cycle = True
                         try:
                             log.info(
                                 "[TL][HEDGE][REOPEN_ANCHOR_SHIFT] %s %s mark=%.8f old_anchor=%.8f new_anchor=%.8f trigger=%.4f%% step=%.4f%%",
@@ -2216,6 +2262,8 @@ class TradeLiquidationHedgeLogicMixin:
                     if cur_f > 0 and abs(cur_f - float(stop_price)) <= tol:
                         return False
                     if cur_f > 0 and pending_anchor_mode and abs(cur_f - float(stop_price)) > tol:
+                        if not anchor_changed_this_cycle:
+                            return False
                         anchor_delta_rel = abs(float(cur_f) - float(stop_price)) / max(abs(float(cur_f)), 1e-12)
                         if anchor_reprice_min_pct > 0.0 and anchor_delta_rel < anchor_reprice_min_pct:
                             return False
@@ -3568,12 +3616,14 @@ class TradeLiquidationHedgeLogicMixin:
                                 tick = 0.0
                                 tol_px = 1e-8
                             try:
-                                desired_trig = float(self._fmt_price(symbol, stop_px))
+                                desired_trig_base = float(self._fmt_price(symbol, stop_px))
                             except Exception:
-                                desired_trig = float(stop_px)
+                                desired_trig_base = float(stop_px)
 
-                            # Compare against the *safe* trigger that would actually be sent to Binance,
-                            # otherwise tiny mark-buffer adjustments can cause endless reissue loops (e.g. REZUSDT).
+                            # Build a *placement-safe* trigger separately from the stable/base trigger.
+                            # We compare open HEDGE_SL orders against an acceptable band [base .. safe]
+                            # instead of against the transient mark-adjusted trigger itself; otherwise
+                            # the SL can flap between two nearby prices when mark hovers near the stop.
                             try:
                                 live_mark_cmp = float(mp0 or self._get_mark_price_live(symbol) or 0.0)
                             except Exception:
@@ -3582,18 +3632,27 @@ class TradeLiquidationHedgeLogicMixin:
                                 sl_buf_cmp = float(getattr(self.p, 'hedge_stop_loss_trigger_buffer_pct', 0.35) or 0.35)
                             except Exception:
                                 sl_buf_cmp = 0.35
+
+                            desired_trig_safe = float(desired_trig_base)
                             if live_mark_cmp > 0 and tick and float(tick) > 0:
                                 if str(hedge_ps).upper() == 'SHORT':
-                                    desired_trig = float(self._safe_price_above_mark(desired_trig, live_mark_cmp, float(tick), sl_buf_cmp))
+                                    desired_trig_safe = float(self._safe_price_above_mark(desired_trig_base, live_mark_cmp, float(tick), sl_buf_cmp))
                                 else:
-                                    desired_trig = float(self._safe_price_below_mark(desired_trig, live_mark_cmp, float(tick), sl_buf_cmp))
+                                    desired_trig_safe = float(self._safe_price_below_mark(desired_trig_base, live_mark_cmp, float(tick), sl_buf_cmp))
+
+                            desired_trig = float(desired_trig_base)
 
                             try:
                                 trig_tol_pct = float(getattr(self.p, 'hedge_stop_loss_compare_tolerance_pct', 0.08) or 0.08)
                             except Exception:
                                 trig_tol_pct = 0.08
-                            trig_tol_abs = max(float(tol_px), abs(float(desired_trig)) * (float(trig_tol_pct) / 100.0), 1e-8)
-                            trig_mismatch = bool(is_open_now and db_trig is not None and abs(float(db_trig) - float(desired_trig)) > trig_tol_abs)
+                            trig_tol_abs = max(float(tol_px), abs(float(desired_trig_base)) * (float(trig_tol_pct) / 100.0), 1e-8)
+                            trig_low = min(float(desired_trig_base), float(desired_trig_safe))
+                            trig_high = max(float(desired_trig_base), float(desired_trig_safe))
+                            trig_mismatch = False
+                            if is_open_now and db_trig is not None:
+                                db_trig_f = float(db_trig)
+                                trig_mismatch = bool(db_trig_f < (trig_low - trig_tol_abs) or db_trig_f > (trig_high + trig_tol_abs))
                             be_already = False
                             try:
                                 if is_open_now and db_trig is not None and hedge_entry_use > 0:
@@ -3651,7 +3710,11 @@ class TradeLiquidationHedgeLogicMixin:
                             except Exception:
                                 pass
 
-                            if ex_open and ex_close_position and not trig_mismatch:
+                            # Final idempotency guard: when an equivalent HEDGE_SL is already open,
+                            # never cancel/recreate it just because recovery state is noisy in the first cycle.
+                            if is_open_now and (not qty_mismatch) and (not trig_mismatch):
+                                need_reissue = False
+                            elif ex_open and ex_close_position and not trig_mismatch:
                                 need_reissue = False
                             elif db_open and db_close_position and not trig_mismatch:
                                 need_reissue = False
@@ -3688,7 +3751,7 @@ class TradeLiquidationHedgeLogicMixin:
                                         live_mark = float(mp0 or self._get_mark_price_live(symbol) or 0.0)
                                     except Exception:
                                         live_mark = float(mp0 or 0.0)
-                                    safe_trig = float(desired_trig)
+                                    safe_trig = float(desired_trig_safe if desired_trig_safe > 0 else desired_trig)
                                     try:
                                         tick_safe = float(self._price_tick_for_symbol(symbol) or 0.0)
                                     except Exception:
@@ -3699,9 +3762,9 @@ class TradeLiquidationHedgeLogicMixin:
                                         sl_buf = 0.35
                                     if live_mark > 0 and tick_safe > 0:
                                         if str(hedge_ps).upper() == 'SHORT':
-                                            safe_trig = float(self._safe_price_above_mark(safe_trig, live_mark, tick_safe, sl_buf))
+                                            safe_trig = float(self._safe_price_above_mark(float(desired_trig), live_mark, tick_safe, sl_buf))
                                         else:
-                                            safe_trig = float(self._safe_price_below_mark(safe_trig, live_mark, tick_safe, sl_buf))
+                                            safe_trig = float(self._safe_price_below_mark(float(desired_trig), live_mark, tick_safe, sl_buf))
                                     try:
                                         resp_sl = self._binance.new_algo_order(
                                             symbol=symbol,

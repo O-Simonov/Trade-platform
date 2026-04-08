@@ -624,8 +624,17 @@ class TradeLiquidationEntryRulesMixin:
                         positionSide=hedge_ps,
                     )
                     return self._binance.new_order(**params)
-                except Exception:
-                    return None
+                except Exception as e:
+                    log.exception(
+                        "[trade_liquidation][HEDGE] failed to place protective hedge STOP_MARKET symbol=%s side=%s hedge_ps=%s qty=%s stop=%s err=%s",
+                        str(symbol).upper(),
+                        str(close_side).upper(),
+                        str(hedge_ps).upper() if 'hedge_ps' in locals() else "",
+                        str(hedge_qty) if 'hedge_qty' in locals() else "",
+                        str(stop_px) if 'stop_px' in locals() else "",
+                        str(e),
+                    )
+                    raise
 
             # LIVE trailing stop (Binance Futures): TRAILING_STOP_MARKET
             # Note: in Hedge Mode Binance forbids reduceOnly param, so we omit it there.

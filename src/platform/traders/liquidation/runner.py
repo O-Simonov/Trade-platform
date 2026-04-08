@@ -20,6 +20,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
+from src.platform.notifications.telegram import resolve_targets_from_env, broadcast_telegram_message
+
 from src.platform.data.storage.postgres.storage import PostgreSQLStorage
 
 
@@ -108,6 +110,9 @@ class TradeLiquidation(
         # Prefer self._binance everywhere.
         self._binance_rest = self._binance
 
+        if self._is_live and self._binance is not None:
+            self._ensure_exchange_position_mode()
+
         # --------------------------------------------------
         # Step 4: Async REST (ThreadPool)
         # --------------------------------------------------
@@ -139,9 +144,309 @@ class TradeLiquidation(
             self._rest_pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="tl_rest")
             self._dlog("async REST enabled: workers=%d", workers)
 
+        self._health_window = {
+            "started_ts": time.time(),
+            "recovery_by_symbol": {},
+            "recovery_total": 0,
+            "partial_verify_failed": 0,
+            "reconcile_cycles_with_diff": 0,
+            "orphan_mismatches": 0,
+            "orphan_cleanups": 0,
+            "cycle_elapsed_over_threshold": 0,
+        }
+        self._health_last_report_ts = 0.0
+        self._health_last_alert_ts = {}
+        self._slow_cycle_streak = 0
+
         if self.p.debug:
             self._dlog("position_ledger.raw_meta present=%s", self._pl_has_raw_meta)
             self._dlog("mode=%s account_id=%s hedge=%s", self.p.mode, str(self.account_id), str(self.p.hedge_enabled))
+
+    def _ensure_exchange_position_mode(self) -> None:
+        """Ensure Binance account position mode matches strategy hedge setting before trading."""
+        if not self._is_live or self._binance is None:
+            return
+        want_hedge = bool(getattr(self.p, "hedge_enabled", False))
+        try:
+            is_hedge = bool(self._binance.ensure_position_mode(hedge_enabled=want_hedge, fail_if_cannot_switch=True))
+            mode_name = "HEDGE" if is_hedge else "ONE_WAY"
+            log.warning(
+                "[trade_liquidation][BINANCE] verified position mode=%s account_id=%s hedge_enabled=%s",
+                mode_name,
+                str(self.account_id),
+                str(want_hedge),
+            )
+        except Exception as e:
+            raise RuntimeError(
+                "Binance position mode check/switch failed before trading start: "
+                f"{e}. Close conflicting positions/orders or switch the account mode manually, then restart the trader."
+            ) from e
+
+
+    def _merge_position_raw_meta(self, *, pos_uid: str, patch: Dict[str, Any]) -> bool:
+        try:
+            if not self._pl_has_raw_meta:
+                return False
+            uid = str(pos_uid or "").strip()
+            if not uid or not isinstance(patch, dict) or not patch:
+                return False
+            self.store.execute(
+                """
+                UPDATE position_ledger
+                SET raw_meta = COALESCE(raw_meta,'{}'::jsonb) || %(meta)s::jsonb,
+                    updated_at = now()
+                WHERE exchange_id=%(ex)s
+                  AND account_id=%(acc)s
+                  AND pos_uid=%(pos_uid)s
+                  AND status='OPEN'
+                """,
+                {
+                    "meta": json.dumps(patch),
+                    "ex": int(self.exchange_id),
+                    "acc": int(self.account_id),
+                    "pos_uid": uid,
+                },
+            )
+            return True
+        except Exception:
+            log.debug("[trade_liquidation][META] failed to persist raw_meta patch pos_uid=%s patch=%s", str(pos_uid or ""), str(list((patch or {}).keys())), exc_info=True)
+            return False
+
+    def _guard_state_from_raw_meta(self, raw_meta: Any) -> Dict[str, Any]:
+        try:
+            rm = raw_meta
+            if isinstance(rm, str):
+                rm = json.loads(rm) if rm.strip() else {}
+            if not isinstance(rm, dict):
+                rm = {}
+            gs = rm.get("guard_state") if isinstance(rm.get("guard_state"), dict) else {}
+            return dict(gs)
+        except Exception:
+            return {}
+
+    def _persist_trailing_guard_state(self, *, pos_uid: str, cid_trl: str, sym: str, side: str, event: str, status: str, extra: Optional[Dict[str, Any]] = None) -> None:
+        try:
+            now_ts = float(time.time())
+            now_iso = _utc_now().isoformat()
+            trl = {
+                "cid": str(cid_trl or ""),
+                "symbol": str(sym or "").upper(),
+                "side": str(side or "").upper(),
+                "event": str(event or ""),
+                "status": str(status or ""),
+                "ts": float(now_ts),
+                "ts_iso": now_iso,
+            }
+            for k, v in (extra or {}).items():
+                if v is not None:
+                    trl[k] = v
+            patch = {"guard_state": {"trailing": trl}}
+            self._merge_position_raw_meta(pos_uid=pos_uid, patch=patch)
+            if event == "place":
+                if not hasattr(self, "_recent_main_trl_place_ts") or not isinstance(self._recent_main_trl_place_ts, dict):
+                    self._recent_main_trl_place_ts = {}
+                self._recent_main_trl_place_ts[str(cid_trl or "")] = now_ts
+            elif event == "verify":
+                if not hasattr(self, "_last_trl_verify_ts") or not isinstance(self._last_trl_verify_ts, dict):
+                    self._last_trl_verify_ts = {}
+                self._last_trl_verify_ts[str(cid_trl or "")] = now_ts
+        except Exception:
+            log.debug("[trade_liquidation][GUARD] failed to persist trailing state pos_uid=%s cid=%s", str(pos_uid or ""), str(cid_trl or ""), exc_info=True)
+
+    def _load_trailing_guard_state(self, *, raw_meta: Any, cid_trl: str) -> Tuple[float, float]:
+        recent_ts = 0.0
+        verify_ts = 0.0
+        try:
+            if not hasattr(self, "_recent_main_trl_place_ts") or not isinstance(self._recent_main_trl_place_ts, dict):
+                self._recent_main_trl_place_ts = {}
+            if not hasattr(self, "_last_trl_verify_ts") or not isinstance(self._last_trl_verify_ts, dict):
+                self._last_trl_verify_ts = {}
+            cid = str(cid_trl or "")
+            recent_ts = float(self._recent_main_trl_place_ts.get(cid, 0.0) or 0.0)
+            verify_ts = float(self._last_trl_verify_ts.get(cid, 0.0) or 0.0)
+            gs = self._guard_state_from_raw_meta(raw_meta)
+            trl = gs.get("trailing") if isinstance(gs.get("trailing"), dict) else {}
+            if trl and str(trl.get("cid") or "") == cid:
+                evt = str(trl.get("event") or "").lower()
+                ts = float(trl.get("ts") or 0.0)
+                if evt == "place":
+                    recent_ts = max(recent_ts, ts)
+                elif evt == "verify":
+                    verify_ts = max(verify_ts, ts)
+            self._recent_main_trl_place_ts[cid] = float(recent_ts)
+            self._last_trl_verify_ts[cid] = float(verify_ts)
+        except Exception:
+            pass
+        return float(recent_ts), float(verify_ts)
+
+    def _persist_partial_reduce_state(self, *, pos_uid: str, symbol: str, side: str, phase: str, before_amt: float, expected_reduce_qty: float, after_amt: Optional[float] = None, actual_reduce_qty: Optional[float] = None, verified: Optional[bool] = None, reason: Optional[str] = None) -> None:
+        try:
+            now_ts = float(time.time())
+            payload = {
+                "symbol": str(symbol or "").upper(),
+                "side": str(side or "").upper(),
+                "phase": str(phase or ""),
+                "before_qty": float(before_amt or 0.0),
+                "expected_reduce_qty": float(expected_reduce_qty or 0.0),
+                "ts": now_ts,
+                "ts_iso": _utc_now().isoformat(),
+            }
+            if after_amt is not None:
+                payload["after_qty"] = float(after_amt)
+            if actual_reduce_qty is not None:
+                payload["actual_reduce_qty"] = float(actual_reduce_qty)
+            if verified is not None:
+                payload["verified"] = bool(verified)
+            if reason:
+                payload["reason"] = str(reason)
+            patch = {"guard_state": {"partial_reduce": payload}}
+            self._merge_position_raw_meta(pos_uid=pos_uid, patch=patch)
+        except Exception:
+            log.debug("[trade_liquidation][GUARD] failed to persist partial reduce state pos_uid=%s", str(pos_uid or ""), exc_info=True)
+
+    def _health_bump(self, key: str, value: int = 1) -> None:
+        try:
+            if not isinstance(getattr(self, "_health_window", None), dict):
+                return
+            self._health_window[key] = int(self._health_window.get(key, 0) or 0) + int(value or 0)
+        except Exception:
+            pass
+
+    def _health_note_recovery(self, *, symbol: str, kind: str) -> None:
+        try:
+            if not isinstance(getattr(self, "_health_window", None), dict):
+                return
+            mp = self._health_window.get("recovery_by_symbol")
+            if not isinstance(mp, dict):
+                mp = {}
+                self._health_window["recovery_by_symbol"] = mp
+            sym = str(symbol or "").upper()
+            row = mp.get(sym)
+            if not isinstance(row, dict):
+                row = {}
+                mp[sym] = row
+            row[str(kind or "recovery")] = int(row.get(str(kind or "recovery"), 0) or 0) + 1
+            row["total"] = int(row.get("total", 0) or 0) + 1
+            self._health_bump("recovery_total", 1)
+        except Exception:
+            pass
+
+    def _health_alert_throttled(self, alert_key: str, text: str) -> None:
+        try:
+            now_ts = float(time.time())
+            min_sec = float(getattr(self.p, "health_alert_min_interval_sec", 900.0) or 900.0)
+            last = float(getattr(self, "_health_last_alert_ts", {}).get(alert_key, 0.0) or 0.0)
+            if last > 0 and (now_ts - last) < max(30.0, min_sec):
+                return
+            if not hasattr(self, "_health_last_alert_ts") or not isinstance(self._health_last_alert_ts, dict):
+                self._health_last_alert_ts = {}
+            self._health_last_alert_ts[alert_key] = now_ts
+            log.warning("[trade_liquidation][HEALTH_ALERT] %s", text)
+            if bool(getattr(self.p, "health_telegram_enabled", False)):
+                try:
+                    targets = resolve_targets_from_env(include_friends=bool(getattr(self.p, "health_telegram_include_friends", False)), max_friends=int(getattr(self.p, "health_telegram_max_friends", 0) or 0))
+                    if targets:
+                        broadcast_telegram_message(text, targets=targets)
+                except Exception:
+                    log.debug("[trade_liquidation][HEALTH_ALERT] telegram send failed", exc_info=True)
+        except Exception:
+            pass
+
+    def _count_positions_without_trailing(self, positions: List[dict]) -> int:
+        try:
+            if not bool(getattr(self.p, "trailing_enabled", False)):
+                return 0
+            count = 0
+            hedge_mode = bool(getattr(self.p, "hedge_enabled", False))
+            for p in positions or []:
+                try:
+                    raw_meta = p.get("raw_meta") or {}
+                    if isinstance(raw_meta, str):
+                        raw_meta = json.loads(raw_meta) if raw_meta.strip() else {}
+                    if not isinstance(raw_meta, dict):
+                        raw_meta = {}
+                    sym = str(p.get("symbol") or "").upper().strip()
+                    side = str(p.get("side") or "").upper().strip()
+                    pos_uid = str(p.get("pos_uid") or "").strip()
+                    if not sym or side not in {"LONG", "SHORT"} or not pos_uid:
+                        continue
+                    hedge_bind = raw_meta.get("hedge_binding") if isinstance(raw_meta.get("hedge_binding"), dict) else {}
+                    is_hedge_managed_side = bool(hedge_mode and hedge_bind and str(hedge_bind.get("role") or "").lower() == "hedge")
+                    if is_hedge_managed_side:
+                        continue
+                    tok = _coid_token(pos_uid, n=20)
+                    cid_trl = f"TL_{tok}_TRL"
+                    position_side = side if hedge_mode else None
+                    close_side = "SELL" if side == "LONG" else "BUY"
+                    has_trl = self._find_known_algo_order_by_client_id(sym, cid_trl) is not None
+                    if not has_trl:
+                        has_trl = self._find_semantic_open_algo(sym, client_suffix="_TRL", position_side=position_side if hedge_mode else None, order_type="TRAILING_STOP_MARKET", side=close_side) is not None
+                    if not has_trl:
+                        count += 1
+                except Exception:
+                    continue
+            return int(count)
+        except Exception:
+            return 0
+
+    def _emit_health_snapshot(self, *, open_positions: List[dict], reconcile_stats: Dict[str, int], elapsed: float) -> None:
+        try:
+            if not bool(getattr(self.p, "health_monitor_enabled", True)):
+                return
+            slow_threshold = float(getattr(self.p, "health_slow_cycle_threshold_sec", 20.0) or 20.0)
+            if float(elapsed or 0.0) > slow_threshold:
+                self._slow_cycle_streak = int(getattr(self, "_slow_cycle_streak", 0) or 0) + 1
+                self._health_bump("cycle_elapsed_over_threshold", 1)
+            else:
+                self._slow_cycle_streak = 0
+
+            without_trl = self._count_positions_without_trailing(open_positions or [])
+            recovery_by_symbol = dict((getattr(self, "_health_window", {}) or {}).get("recovery_by_symbol") or {})
+            partial_failed = int((getattr(self, "_health_window", {}) or {}).get("partial_verify_failed", 0) or 0)
+            orphan_mismatches = int((getattr(self, "_health_window", {}) or {}).get("orphan_mismatches", 0) or 0)
+            orphan_cleanups = int((getattr(self, "_health_window", {}) or {}).get("orphan_cleanups", 0) or 0)
+            diff_cycles = int((getattr(self, "_health_window", {}) or {}).get("reconcile_cycles_with_diff", 0) or 0)
+            slow_cycles = int((getattr(self, "_health_window", {}) or {}).get("cycle_elapsed_over_threshold", 0) or 0)
+            summary = (
+                f"positions_without_trailing={int(without_trl)} "
+                f"orphan_mismatches={int(orphan_mismatches)} orphan_cleanups={int(orphan_cleanups)} "
+                f"partial_verify_failed={int(partial_failed)} reconcile_diff_cycles={int(diff_cycles)} "
+                f"recovery_by_symbol={recovery_by_symbol} slow_cycle_streak={int(self._slow_cycle_streak)} slow_cycles={int(slow_cycles)} elapsed={float(elapsed):.2f}s"
+            )
+            report_every = float(getattr(self.p, "health_report_interval_sec", 600.0) or 600.0)
+            now_ts = float(time.time())
+            last_report = float(getattr(self, "_health_last_report_ts", 0.0) or 0.0)
+            if report_every <= 0 or (now_ts - last_report) >= max(60.0, report_every):
+                log.info("[trade_liquidation][HEALTH] %s", summary)
+                self._health_last_report_ts = now_ts
+                self._health_window = {
+                    "started_ts": now_ts,
+                    "recovery_by_symbol": {},
+                    "recovery_total": 0,
+                    "partial_verify_failed": 0,
+                    "reconcile_cycles_with_diff": 0,
+                    "orphan_mismatches": 0,
+                    "orphan_cleanups": 0,
+                    "cycle_elapsed_over_threshold": 0,
+                }
+
+            if without_trl >= int(getattr(self.p, "health_alert_open_positions_without_trailing", 1) or 1) and without_trl > 0:
+                self._health_alert_throttled("without_trailing", f"TL health alert: open_algo below expected, positions_without_trailing={int(without_trl)} account_id={int(self.account_id)}")
+            max_recovery = 0
+            max_recovery_sym = ""
+            for sym, row in recovery_by_symbol.items():
+                total = int((row or {}).get("total", 0) or 0)
+                if total > max_recovery:
+                    max_recovery = total
+                    max_recovery_sym = str(sym or "")
+            if max_recovery >= int(getattr(self.p, "health_alert_recovery_repeats_per_symbol", 3) or 3) and max_recovery_sym:
+                self._health_alert_throttled(f"recovery_repeat:{max_recovery_sym}", f"TL health alert: symbol {max_recovery_sym} recovered {int(max_recovery)} times in current health window")
+            if diff_cycles >= int(getattr(self.p, "health_alert_reconcile_cycles", 3) or 3):
+                self._health_alert_throttled("reconcile_freq", f"TL health alert: reconcile found mismatches too often, diff_cycles={int(diff_cycles)} orphan_mismatches={int(orphan_mismatches)}")
+            if int(getattr(self, "_slow_cycle_streak", 0) or 0) >= int(getattr(self.p, "health_alert_slow_cycles", 3) or 3):
+                self._health_alert_throttled("slow_cycles", f"TL health alert: cycle latency degraded, slow_cycle_streak={int(self._slow_cycle_streak)} threshold={float(slow_threshold):.1f}s last_elapsed={float(elapsed):.2f}s")
+        except Exception:
+            log.debug("[trade_liquidation][HEALTH] emit failed", exc_info=True)
 
     def _symbols_map(self, cache_ttl_sec: float = 600.0) -> Dict[int, str]:
         """Return {symbol_id: symbol} cache (DB read is cheap but keep it tidy)."""
@@ -914,6 +1219,11 @@ class TradeLiquidation(
         except Exception:
             pass
 
+        try:
+            self._emit_health_snapshot(open_positions=open_positions or [], reconcile_stats=reconcile_stats or {}, elapsed=float(elapsed))
+        except Exception:
+            log.debug("[trade_liquidation][HEALTH] post-cycle emit failed", exc_info=True)
+
         out = {
             "strategy": self.STRATEGY_ID,
             "paper": not self._is_live,
@@ -1131,11 +1441,34 @@ class TradeLiquidation(
 
             led_qty = abs(_safe_float(p.get("qty_current"), 0.0))
             ex_qty = abs(_safe_float(ex_pos.get((sym, side)), 0.0))
+            raw_meta = p.get("raw_meta") or {}
+            if isinstance(raw_meta, str):
+                try:
+                    raw_meta = json.loads(raw_meta) if raw_meta.strip() else {}
+                except Exception:
+                    raw_meta = {}
+            orphan_meta = (raw_meta.get("orphan_reconcile") or {}) if isinstance(raw_meta, dict) else {}
+            orphan_cycles = max(1, int(getattr(self.p, "reconcile_orphan_close_cycles", 3) or 3))
 
             if self._is_flat_qty(ex_qty, sym):
                 missing_on_exchange += 1
-                if auto_close:
+                self._health_bump("orphan_mismatches", 1)
+                prev_missing = int(orphan_meta.get("missing_cycles") or 0)
+                new_missing = prev_missing + 1 if led_qty > 0.0 else prev_missing
+                if led_qty > 0.0 and auto_close and new_missing >= orphan_cycles:
                     try:
+                        orphan_patch = {
+                            "orphan_reconcile": {
+                                "symbol": sym,
+                                "side": side,
+                                "qty_ledger": float(led_qty),
+                                "qty_exchange": 0.0,
+                                "missing_cycles": int(new_missing),
+                                "threshold": int(orphan_cycles),
+                                "cleanup_reason": "reconciled_orphan",
+                                "cleanup_ts": _utc_now().isoformat(),
+                            }
+                        }
                         self.store.execute(
                             """
                             UPDATE position_ledger
@@ -1143,12 +1476,9 @@ class TradeLiquidation(
                                 closed_at=now(),
                                 qty_current=0,
                                 updated_at=now(),
-                                raw_meta = jsonb_set(
-                                    COALESCE(raw_meta, '{}'::jsonb),
-                                    '{close_reason}',
-                                    to_jsonb(%(reason)s::text),
-                                    true
-                                )
+                                raw_meta = COALESCE(raw_meta, '{}'::jsonb)
+                                           || %(orphan_meta)s::jsonb
+                                           || jsonb_build_object('close_reason', %(reason)s::text)
                             WHERE exchange_id=%(exchange_id)s
                               AND account_id=%(account_id)s
                               AND pos_uid=%(pos_uid)s
@@ -1157,30 +1487,88 @@ class TradeLiquidation(
                                 "exchange_id": int(self.exchange_id),
                                 "account_id": int(self.account_id),
                                 "pos_uid": str(p.get("pos_uid") or ""),
-                                "reason": "reconcile_missing_on_exchange",
+                                "reason": "reconciled_orphan",
+                                "orphan_meta": json.dumps(orphan_patch),
                             },
                         )
                         closed_ledger += 1
+                        self._health_bump("orphan_cleanups", 1)
+                        log.warning("[trade_liquidation][ORPHAN_CLEANUP] auto-closed orphan ledger %s %s pos_uid=%s qty_led=%.8f miss_cycles=%d threshold=%d", sym, side, str(p.get("pos_uid") or ""), float(led_qty), int(new_missing), int(orphan_cycles))
                         try:
                             c = self._live_cancel_symbol_orders(sym)
                             if c:
-                                self._dlog("reconcile: flat on exchange -> canceled %s orders for %s", c, sym)
+                                self._dlog("reconcile: orphan cleanup -> canceled %s orders for %s", c, sym)
                         except Exception as _e:
-                            self._dlog("reconcile: failed to cancel orders for %s: %s", sym, _e)
+                            self._dlog("reconcile: failed to cancel orphan orders for %s: %s", sym, _e)
                     except Exception:
-                        log.exception("[trade_liquidation][RECONCILE] failed to auto-close ledger pos_uid=%s", str(p.get("pos_uid") or ""))
+                        log.exception("[trade_liquidation][RECONCILE] failed to auto-close orphan ledger pos_uid=%s", str(p.get("pos_uid") or ""))
+                else:
+                    if led_qty > 0.0:
+                        self._merge_position_raw_meta(
+                            pos_uid=str(p.get("pos_uid") or ""),
+                            patch={
+                                "orphan_reconcile": {
+                                    "symbol": sym,
+                                    "side": side,
+                                    "qty_ledger": float(led_qty),
+                                    "qty_exchange": 0.0,
+                                    "missing_cycles": int(new_missing),
+                                    "threshold": int(orphan_cycles),
+                                    "last_seen_missing_ts": _utc_now().isoformat(),
+                                }
+                            },
+                        )
+                        log.warning("[trade_liquidation][RECONCILE][ORPHAN] ledger open but exchange flat %s %s pos_uid=%s qty_led=%.8f miss_cycles=%d/%d", sym, side, str(p.get("pos_uid") or ""), float(led_qty), int(new_missing), int(orphan_cycles))
+                    elif auto_close:
+                        try:
+                            self.store.execute(
+                                """
+                                UPDATE position_ledger
+                                SET status='CLOSED',
+                                    closed_at=now(),
+                                    qty_current=0,
+                                    updated_at=now(),
+                                    raw_meta = jsonb_set(
+                                        COALESCE(raw_meta, '{}'::jsonb),
+                                        '{close_reason}',
+                                        to_jsonb(%(reason)s::text),
+                                        true
+                                    )
+                                WHERE exchange_id=%(exchange_id)s
+                                  AND account_id=%(account_id)s
+                                  AND pos_uid=%(pos_uid)s
+                                """,
+                                {
+                                    "exchange_id": int(self.exchange_id),
+                                    "account_id": int(self.account_id),
+                                    "pos_uid": str(p.get("pos_uid") or ""),
+                                    "reason": "reconcile_missing_on_exchange",
+                                },
+                            )
+                            closed_ledger += 1
+                        except Exception:
+                            log.exception("[trade_liquidation][RECONCILE] failed to auto-close ledger pos_uid=%s", str(p.get("pos_uid") or ""))
                 continue
+
+            if isinstance(orphan_meta, dict) and orphan_meta:
+                self._merge_position_raw_meta(
+                    pos_uid=str(p.get("pos_uid") or ""),
+                    patch={
+                        "orphan_reconcile": {
+                            "symbol": sym,
+                            "side": side,
+                            "qty_ledger": float(led_qty),
+                            "qty_exchange": float(ex_qty),
+                            "missing_cycles": 0,
+                            "recovered_ts": _utc_now().isoformat(),
+                        }
+                    },
+                )
 
             # Qty/Value mismatch checks.
             led_val = float(_safe_float(p.get("position_value_usdt"), 0.0))
             led_entry = abs(float(_safe_float(p.get("entry_price"), 0.0) or 0.0))
             led_avg = abs(float(_safe_float(p.get("avg_price"), 0.0) or 0.0))
-            raw_meta = p.get("raw_meta") or {}
-            if isinstance(raw_meta, str):
-                try:
-                    raw_meta = json.loads(raw_meta) if raw_meta.strip() else {}
-                except Exception:
-                    raw_meta = {}
             value_mode = "entry_notional"
             try:
                 value_mode = str(((raw_meta or {}).get("reconcile") or {}).get("value_mode") or "entry_notional")
@@ -1419,6 +1807,9 @@ class TradeLiquidation(
                         log.warning("[trade_liquidation][RECONCILE] external exchange position: %s %s", k[0], k[1])
                     else:
                         log.debug("[trade_liquidation][RECONCILE] external exchange position: %s %s", k[0], k[1])
+
+        if int(missing_on_exchange) > 0 or int(qty_mismatch) > 0 or int(external) > 0:
+            self._health_bump("reconcile_cycles_with_diff", 1)
 
         return {
             "ledger_open": int(len(led)),
@@ -2624,6 +3015,7 @@ class TradeLiquidation(
                                 status=str(resp.get("status") or "NEW"),
                             )
                         recovered += 1
+                        self._health_note_recovery(symbol=sym, kind="sl")
                         log.info("[trade_liquidation][RECOVERY] placed missing SL %s %s pos_uid=%s", sym, side, pos_uid)
                     except Exception:
                         _rollback_recovery_action()
@@ -2732,6 +3124,7 @@ class TradeLiquidation(
                         except Exception:
                             pass
                         recovered += 1
+                    self._health_note_recovery(symbol=sym, kind="tp")
                     log.info("[trade_liquidation][RECOVERY] placed missing TP %s %s pos_uid=%s", sym, side, pos_uid)
                 except Exception:
                     _rollback_recovery_action()
@@ -2823,19 +3216,53 @@ class TradeLiquidation(
                 if place_trailing and trailing_enabled and (not has_trl) and (not is_hedge_managed_side):
                     if not _reserve_recovery_action():
                         break
-                    try:
-                        if not hasattr(self, "_recent_main_trl_place_ts"):
-                            self._recent_main_trl_place_ts = {}
-                    except Exception:
-                        pass
                     recent_trl_ts = 0.0
                     trl_guard_sec = float(getattr(self.p, "trailing_place_guard_sec", 180) or 180)
+                    recent_trl_ts, _persisted_verify_ts = self._load_trailing_guard_state(raw_meta=raw_meta, cid_trl=cid_trl)
+                    force_verify_missing = False
+                    now_trl_ts = time.time()
                     try:
-                        recent_trl_ts = float(getattr(self, "_recent_main_trl_place_ts", {}).get(cid_trl, 0.0) or 0.0)
+                        verify_every = float(getattr(self.p, "trailing_verify_interval_sec", 45) or 45)
                     except Exception:
-                        recent_trl_ts = 0.0
-                    if recent_trl_ts and (time.time() - recent_trl_ts) < trl_guard_sec:
-                        continue
+                        verify_every = 45.0
+                    last_verify_ts = float(_persisted_verify_ts or 0.0)
+                    if recent_trl_ts and (now_trl_ts - recent_trl_ts) < trl_guard_sec:
+                        if (now_trl_ts - last_verify_ts) >= verify_every:
+                            self._persist_trailing_guard_state(pos_uid=pos_uid, cid_trl=cid_trl, sym=sym, side=side, event="verify", status="pending_check", extra={"verify_interval_sec": float(verify_every)})
+                            try:
+                                fresh_algos = self._refresh_open_algo_snapshot_for_symbol(sym) or []
+                            except Exception:
+                                fresh_algos = []
+                            trl_present = False
+                            try:
+                                trl_present = self._find_open_algo_order_by_client_id(sym, cid_trl) is not None
+                                if not trl_present:
+                                    trl_present = self._find_semantic_open_algo(
+                                        sym,
+                                        client_suffix="_TRL",
+                                        position_side=position_side if hedge_mode else None,
+                                        order_type="TRAILING_STOP_MARKET",
+                                        side=close_side,
+                                    ) is not None
+                            except Exception:
+                                trl_present = False
+                            if trl_present:
+                                self._persist_trailing_guard_state(pos_uid=pos_uid, cid_trl=cid_trl, sym=sym, side=side, event="verify", status="present")
+                                continue
+                            force_verify_missing = True
+                            try:
+                                if hasattr(self, "_recent_main_trl_place_ts") and isinstance(self._recent_main_trl_place_ts, dict):
+                                    self._recent_main_trl_place_ts.pop(cid_trl, None)
+                            except Exception:
+                                pass
+                            try:
+                                self._forget_recent_desired_order("_recent_trl_desired", cid_trl)
+                            except Exception:
+                                pass
+                            self._persist_trailing_guard_state(pos_uid=pos_uid, cid_trl=cid_trl, sym=sym, side=side, event="verify", status="missing")
+                            log.warning("[trade_liquidation][TRL_VERIFY] missing trailing after recent place; forcing restore %s %s pos_uid=%s", sym, side, pos_uid)
+                        else:
+                            continue
                     # reference price: before any averaging adds -> entry_price, after adds -> avg_price
                     try:
                         avg_state = (raw_meta or {}).get("avg_state") or {}
@@ -2908,6 +3335,8 @@ class TradeLiquidation(
                         except Exception:
                             pass
                         recovered += 1
+                        self._health_note_recovery(symbol=sym, kind="trailing")
+                        sync_after_recovery = bool(getattr(self.p, "reconcile_sync_after_recovery", True))
                         if bool(sync_after_recovery):
                             try:
                                 self._sync_ledger_open_position_from_exchange(
@@ -2921,10 +3350,7 @@ class TradeLiquidation(
                                 )
                             except Exception:
                                 log.exception("[trade_liquidation][RECOVERY] failed to sync ledger after trailing recovery for %s %s pos_uid=%s", sym, side, pos_uid)
-                        try:
-                            self._recent_main_trl_place_ts[cid_trl] = time.time()
-                        except Exception:
-                            pass
+                        self._persist_trailing_guard_state(pos_uid=pos_uid, cid_trl=cid_trl, sym=sym, side=side, event="place", status="placed", extra={"activate_price": float(act) if act is not None else None, "qty": float(qty_use), "callback_rate": float(cb), "forced_after_verify": bool(force_verify_missing)})
                         log.info("[trade_liquidation][RECOVERY] placed missing TRAILING %s %s pos_uid=%s", sym, side, pos_uid) if not (isinstance(resp_trl, dict) and resp_trl.get("_duplicate")) else None
             except Exception:
                 _rollback_recovery_action()
@@ -3181,6 +3607,7 @@ class TradeLiquidation(
         except Exception:
             pass
 
+        self._health_note_recovery(symbol=sym_u, kind="add1")
         log.info("[trade_liquidation][RECOVERY] placed missing ADD1 %s %s pos_uid=%s price=%s qty=%s", sym_u, side, pos_uid, add_price, add_qty)
 
 

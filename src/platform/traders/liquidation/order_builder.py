@@ -417,6 +417,67 @@ class BinanceUMFuturesRest:
     def balance(self) -> Any:
         return self._request("GET", "/fapi/v2/balance", signed=True)
 
+    def get_position_mode(self) -> bool:
+        """Return True when Binance USD-M account is in Hedge Mode (dual-side)."""
+        res = self._request("GET", "/fapi/v1/positionSide/dual", signed=True)
+        if isinstance(res, dict):
+            val = res.get("dualSidePosition")
+            if isinstance(val, bool):
+                return bool(val)
+            return str(val or "").strip().lower() == "true"
+        return False
+
+    def change_position_mode(self, dual_side_position: bool) -> Dict[str, Any]:
+        """Switch Binance USD-M position mode.
+
+        dual_side_position=True  -> Hedge Mode
+        dual_side_position=False -> One-way Mode
+        """
+        return self._request(
+            "POST",
+            "/fapi/v1/positionSide/dual",
+            signed=True,
+            dualSidePosition="true" if bool(dual_side_position) else "false",
+        )
+
+    def ensure_position_mode(self, *, hedge_enabled: bool, fail_if_cannot_switch: bool = True) -> bool:
+        """Ensure Binance account position mode matches strategy hedge setting.
+
+        Returns current Hedge Mode state after verification.
+        Raises RuntimeError on mismatch when fail_if_cannot_switch=True.
+        """
+        want_hedge = bool(hedge_enabled)
+        try:
+            current = bool(self.get_position_mode())
+        except Exception as e:
+            raise RuntimeError(f"failed to fetch Binance position mode: {e}") from e
+
+        if current == want_hedge:
+            return current
+
+        try:
+            self.change_position_mode(want_hedge)
+        except Exception as e:
+            msg = str(e)
+            if fail_if_cannot_switch:
+                raise RuntimeError(
+                    "failed to switch Binance position mode to "
+                    f"{'HEDGE' if want_hedge else 'ONE_WAY'}: {msg}"
+                ) from e
+            return current
+
+        try:
+            verified = bool(self.get_position_mode())
+        except Exception as e:
+            raise RuntimeError(f"position mode switch requested but verification failed: {e}") from e
+
+        if verified != want_hedge:
+            raise RuntimeError(
+                "Binance position mode mismatch after switch attempt: "
+                f"wanted={'HEDGE' if want_hedge else 'ONE_WAY'} got={'HEDGE' if verified else 'ONE_WAY'}"
+            )
+        return verified
+
     def position_risk(self) -> List[Dict[str, Any]]:
         """GET /fapi/v2/positionRisk (signed)."""
         res = self._request("GET", "/fapi/v2/positionRisk", signed=True)
@@ -986,6 +1047,23 @@ class TradeLiquidationOrderBuilderMixin:
             return False
         return False
 
+    def _forget_recent_desired_order(self, bucket: str, key: str) -> None:
+        try:
+            store = getattr(self, bucket, None)
+            if isinstance(store, dict):
+                store.pop(str(key), None)
+        except Exception:
+            pass
+
+    def _remember_recent_desired_order(self, bucket: str, key: str, payload: dict) -> None:
+        try:
+            if not hasattr(self, bucket) or not isinstance(getattr(self, bucket), dict):
+                setattr(self, bucket, {})
+            store = getattr(self, bucket)
+            store[str(key)] = {"ts": time.time(), "payload": payload}
+        except Exception:
+            pass
+
     def _tl_safe_trigger_price(self, *, symbol: str, close_side: str, desired: float, mark: float, tick: float, buffer_pct: float) -> float:
         """Ensure conditional trigger price won't immediately trigger.
 
@@ -1356,6 +1434,7 @@ class TradeLiquidationOrderBuilderMixin:
         }
         if self._memo_recent_desired_order("_recent_trl_desired", cid_trl, _trl_payload, trl_guard_sec):
             return False
+        self._forget_recent_desired_order("_recent_trl_desired", cid_trl)
 
         # Cancel existing TRL (best-effort)
         try:
@@ -1381,7 +1460,7 @@ class TradeLiquidationOrderBuilderMixin:
                         pass
                     return None
 
-            self._binance.new_order(
+            resp_trl = self._binance.new_order(
                 symbol=sym,
                 side=close_side,
                 type="TRAILING_STOP_MARKET",
@@ -1392,11 +1471,40 @@ class TradeLiquidationOrderBuilderMixin:
                 newClientOrderId=cid_trl,
                 positionSide=position_side if hedge_mode else None,
             )
+            self._remember_recent_desired_order("_recent_trl_desired", cid_trl, _trl_payload)
+            try:
+                self._upsert_algo_order_shadow(resp_trl, pos_uid=str(pos_uid or ""), strategy_id=self.STRATEGY_ID)
+            except Exception:
+                pass
+            try:
+                self._mark_local_algo_open(
+                    cid_trl,
+                    symbol=sym,
+                    position_side=position_side if hedge_mode else side_u,
+                    order_type="TRAILING_STOP_MARKET",
+                    side=close_side,
+                    quantity=float(qty_main),
+                    trigger_price=float(activation),
+                    close_position=None,
+                    pos_uid=str(pos_uid or ""),
+                )
+            except Exception:
+                pass
+            try:
+                self._refresh_open_algo_snapshot_for_symbol(sym)
+            except Exception:
+                pass
             try:
                 self._set_cached_trl_activation(sym, side_u, cid_trl, float(activation))
             except Exception:
                 pass
         except Exception:
+            self._forget_recent_desired_order("_recent_trl_desired", cid_trl)
+            try:
+                if hasattr(self, "_recent_main_trl_place_ts") and isinstance(self._recent_main_trl_place_ts, dict):
+                    self._recent_main_trl_place_ts.pop(cid_trl, None)
+            except Exception:
+                pass
             return False
 
         # store meta flag (best-effort)
@@ -1580,6 +1688,7 @@ class TradeLiquidationOrderBuilderMixin:
             }
             if self._memo_recent_desired_order("_recent_trl_desired", cid_trl, _trl_payload, trl_guard_sec):
                 return False
+            self._forget_recent_desired_order("_recent_trl_desired", cid_trl)
 
             resp = self._binance.new_order(
                 symbol=sym_u,
@@ -1593,6 +1702,7 @@ class TradeLiquidationOrderBuilderMixin:
                 positionSide=position_side,
             )
             _dup_resp = bool(isinstance(resp, dict) and resp.get("_duplicate"))
+            self._remember_recent_desired_order("_recent_trl_desired", cid_trl, _trl_payload)
             try:
                 self._upsert_order_shadow(
                     pos_uid=pos_uid,
@@ -1606,6 +1716,28 @@ class TradeLiquidationOrderBuilderMixin:
                     reduce_only=True,
                     status=str(resp.get("status") or "NEW"),
                 )
+            except Exception:
+                pass
+            try:
+                self._upsert_algo_order_shadow(resp, pos_uid=str(pos_uid or ""), strategy_id=self.STRATEGY_ID)
+            except Exception:
+                pass
+            try:
+                self._mark_local_algo_open(
+                    cid_trl,
+                    symbol=sym_u,
+                    position_side=position_side or side_u,
+                    order_type="TRAILING_STOP_MARKET",
+                    side=close_side,
+                    quantity=float(qty),
+                    trigger_price=float(activation),
+                    close_position=None,
+                    pos_uid=str(pos_uid or ""),
+                )
+            except Exception:
+                pass
+            try:
+                self._refresh_open_algo_snapshot_for_symbol(sym_u)
             except Exception:
                 pass
             try:
@@ -1628,6 +1760,15 @@ class TradeLiquidationOrderBuilderMixin:
             )
             return True
         except Exception:
+            try:
+                self._forget_recent_desired_order("_recent_trl_desired", cid_trl)
+            except Exception:
+                pass
+            try:
+                if hasattr(self, "_recent_main_trl_place_ts") and isinstance(self._recent_main_trl_place_ts, dict):
+                    self._recent_main_trl_place_ts.pop(cid_trl, None)
+            except Exception:
+                pass
             self.log.exception(
                 "[trade_liquidation][LIVE][TP_TRL] failed pre-last-add ensure for %s %s (pos_uid=%s)",
                 str(sym).upper(),

@@ -1,3 +1,7 @@
+# Агрессивный пресет.
+# Подходит только если депозит выдерживает повышенную волатильность и просадки, а цель — быстрее набирать позицию и дольше удерживать профит.
+# Главная идея: выше риск, больше загрузка портфеля, глубже доборы и более поздний trailing.
+
 # ============================================================
 # Trade Platform — конфиг трейдера trade_liquidation
 # Проверенная и прокомментированная версия
@@ -86,18 +90,18 @@ traders:
       # ======================================================
       # Риск и ограничения на позиции
       # ======================================================
-      leverage: 20                                  # Торговое плечо
+      leverage: 25                                  # Торговое плечо
       margin_type: CROSSED                          # Тип маржи: CROSSED или ISOLATED
       hedge_enabled: true                           # true = использовать hedge mode с отдельными LONG/SHORT позициями
 
       # --- Hedge sizing с учетом funding
       hedge_funding_kof_limit: 0.6                  # Порог funding (%), после которого разрешается корректировать размер hedge
       hedge_koff_funding_boost: 1.6                 # Во сколько раз усиливать hedge_koff при выгодном funding
-      hedge_koff: 0.7                               # Базовый размер hedge как доля от main-позиции
-      hedge_max_ratio: 1.5                          # Жесткий максимум размера hedge относительно объема main
+      hedge_koff: 0.85                              # Базовый размер hedge как доля от main-позиции
+      hedge_max_ratio: 1.8                          # Жесткий максимум размера hedge относительно объема main
 
       hedge_trigger_buffer_pct: 0.8                 # Буфер в % перед открытием hedge, чтобы не реагировать на микрошум
-      hedge_cooldown_sec: 180                       # Минимальная пауза между действиями по hedge на одном символе
+      hedge_cooldown_sec: 120                       # Минимальная пауза между действиями по hedge на одном символе
       hedge_reopen_enabled: true                    # Разрешить повторное открытие hedge после его закрытия
       hedge_open_only_after_max_adds: true          # Открывать первый hedge только после выполнения всех разрешённых доборов main
 
@@ -117,12 +121,12 @@ traders:
       # --- Profit optimization / balanced hedge unwind
       hedge_unwind_enabled: true                    # true = частично разгружать hedge, когда цена идёт обратно в пользу main
       hedge_unwind_step1_pct: 0.8                   # Первый шаг unwind при движении цены на 0.8% в сторону main от entry hedge
-      hedge_unwind_step1_share: 0.35                # Какая доля исходного hedge-объема закрывается на шаге 1
+      hedge_unwind_step1_share: 0.40                # Какая доля исходного hedge-объема закрывается на шаге 1
       hedge_unwind_step2_pct: 1.6                   # Второй шаг unwind при движении на 1.6% в сторону main
-      hedge_unwind_step2_share: 0.35                # Какая доля исходного hedge-объема закрывается на шаге 2
+      hedge_unwind_step2_share: 0.40                # Какая доля исходного hedge-объема закрывается на шаге 2
       hedge_unwind_full_exit_enabled: true          # true = полностью закрывать остаток hedge при сильном возврате цены
       hedge_unwind_full_exit_pct: 2.4               # На каком движении (%) полностью выходить из hedge
-      hedge_unwind_cooldown_sec: 30                 # Пауза между частичными разгрузками hedge
+      hedge_unwind_cooldown_sec: 20                 # Пауза между частичными разгрузками hedge
       hedge_unwind_min_qty_ratio: 0.15              # Не делать unwind, если остаток станет меньше 15% исходного объема hedge
 
       # --- Adaptive hedge AI (мягкое увеличение hedge только при усилении движения против main)
@@ -135,9 +139,9 @@ traders:
       # --- Защита от плохого funding по hedge
       hedge_funding_guard_enabled: true             # true = динамически сокращать/закрывать hedge при токсичном funding
       hedge_funding_bad_limit_pct: 0.8              # Funding (%) от которого hedge считается дорогим для удержания
-      hedge_funding_reduce_share: 0.25              # Какую долю hedge сократить при плохом funding
+      hedge_funding_reduce_share: 0.20              # Какую долю hedge сократить при плохом funding
       hedge_funding_full_exit_limit_pct: 1.2        # Funding (%), при котором лучше полностью выйти из hedge
-      hedge_funding_cooldown_sec: 300               # Пауза между funding-защитными действиями
+      hedge_funding_cooldown_sec: 420               # Пауза между funding-защитными действиями
       hedge_funding_soft_cap_ratio: 0.25            # Мягкий потолок допустимого hedge при плохом funding
 
       # ======================================================
@@ -176,29 +180,29 @@ traders:
       # ======================================================
       # Лимиты по позициям
       # ======================================================
-      max_open_positions: 10                        # Максимум одновременно открытых main-позиций/символов под управлением
-      max_position_notional_pct_wallet: 1.0         # Максимальный notional начального входа как % от wallet * leverage
-      averaging_add_max_notional_pct_wallet: 12.0   # Максимальный notional одного добора как % от wallet * leverage; 0 = отключить ограничение
-      main_position_max_notional_pct_wallet: 12.0   # Максимальный суммарный размер main-позиции как % от wallet * leverage
-      hedge_position_max_notional_pct_wallet: 12.0  # Максимальный суммарный размер hedge-позиции как % от wallet * leverage
-      risk_wallet_pct: 1.0                          # Базовый риск на сделку в % от кошелька
-      live_entry_reduce_on_max_position: true       # true = если лимит превышен, уменьшать размер входа и пробовать снова
-      live_entry_reduce_steps: 3                    # Сколько шагов уменьшения размера допускается перед окончательным отказом
-      live_entry_reduce_factor: 0.8                 # На каждом шаге размер входа умножается на этот коэффициент
+      max_open_positions: 12                          # Максимум одновременно открытых main-позиций/символов под управлением
+      max_position_notional_pct_wallet: 1.5           # Максимальный notional начального входа как % от wallet * leverage
+      averaging_add_max_notional_pct_wallet: 15.0     # Максимальный notional одного добора как % от wallet * leverage; 0 = отключить ограничение
+      main_position_max_notional_pct_wallet: 15.0     # Максимальный суммарный размер main-позиции как % от wallet * leverage
+      hedge_position_max_notional_pct_wallet: 15.0    # Максимальный суммарный размер hedge-позиции как % от wallet * leverage
+      risk_wallet_pct: 1.5                            # Базовый риск на сделку в % от кошелька
+      live_entry_reduce_on_max_position: true         # true = если лимит превышен, уменьшать размер входа и пробовать снова
+      live_entry_reduce_steps: 3                      # Сколько шагов уменьшения размера допускается перед окончательным отказом
+      live_entry_reduce_factor: 0.85                  # На каждом шаге размер входа умножается на этот коэффициент
 
       # ======================================================
       # Базовые SL / TP
       # ======================================================
-      stop_loss_pct: 2.0                            # Базовый stop-loss (%) по основной позиции
-      take_profit_pct: 6.0                          # Базовый full take-profit (%) по main; используется как fallback, если partial TP выключен
+      stop_loss_pct: 2.3    # Базовый stop-loss (%) по основной позиции
+      take_profit_pct: 7.5  # Базовый full take-profit (%) по main; используется как fallback, если partial TP выключен
 
       # --- Частичная фиксация прибыли по main
       main_partial_tp_enabled: true                 # true = использовать ступенчатую фиксацию прибыли по main вместо единого full TP
-      main_partial_tp1_pct: 1.8                     # При каком движении (%) в прибыль закрывать первый partial TP main
-      main_partial_tp1_share: 0.30                  # Какую долю текущей main-позиции закрыть на первом partial TP
-      main_partial_tp2_pct: 3.8                     # При каком движении (%) в прибыль закрывать второй partial TP main
-      main_partial_tp2_share: 0.30                  # Какую долю позиции закрыть на втором partial TP
-      main_partial_tp_cooldown_sec: 30              # Минимальная пауза между частичными закрытиями main
+      main_partial_tp1_pct: 2.0                     # При каком движении (%) в прибыль закрывать первый partial TP main
+      main_partial_tp1_share: 0.25                  # Какую долю текущей main-позиции закрыть на первом partial TP
+      main_partial_tp2_pct: 4.5                     # При каком движении (%) в прибыль закрывать второй partial TP main
+      main_partial_tp2_share: 0.25                  # Какую долю позиции закрыть на втором partial TP
+      main_partial_tp_cooldown_sec: 20              # Минимальная пауза между частичными закрытиями main
       main_partial_tp_min_qty_ratio: 0.15           # Не делать partial TP, если остаток станет слишком маленьким (< 15% исходного)
       recalc_sl_tp: true                            # true = пересчитывать SL/TP/trailing после доборов и изменения средней цены
 
@@ -218,23 +222,22 @@ traders:
 
       sl_after_last_add_distance_pct: 2.0           # На каком расстоянии (%) ставить SL после выполнения последнего добора
 
-
       # ======================================================
       # Main trailing stop
       # ======================================================
       trailing_enabled: true                        # true = использовать trailing stop по основной позиции
-      trailing_activation_pct: 2.5                  # При каком движении (%) в прибыль активируется main trailing
-      trailing_trail_pct: 0.5                       # callbackRate (%) trailing stop по main
+      trailing_activation_pct: 3.0                  # При каком движении (%) в прибыль активируется main trailing
+      trailing_trail_pct: 0.7                       # callbackRate (%) trailing stop по main
       trailing_activation_buffer_pct: 0.3           # Буфер к activation price для защиты от мгновенного срабатывания
       tp_trigger_buffer_pct: 0.3                    # Буфер для triggerPrice fallback full TP
       trailing_place_retries: 3                     # Сколько раз повторять постановку main trailing при временной ошибке Binance
       tp_place_retries: 3                           # Сколько раз повторять постановку full TP при временной ошибке Binance
       trailing_reissue_on_qty_change: true          # Перевыставлять trailing при изменении объёма позиции, например после partial TP
       trailing_reissue_on_avg_entry_change: true    # Перевыставлять trailing при изменении средней цены входа main
-      trailing_reissue_cooldown_sec: 120            # Минимальная пауза между обычными перевыставлениями main trailing
+      trailing_reissue_cooldown_sec: 150            # Минимальная пауза между обычными перевыставлениями main trailing
       trailing_qty_tolerance: 1e-8                  # Допуск сравнения qty; меньше значения считается несущественным шумом
       trailing_place_guard_sec: 180                 # Защита от слишком частых попыток постановки одного и того же trailing в живом процессе
-      trailing_verify_interval_sec: 45              # Период страховочной проверки: если trailing потерялся, бот попробует восстановить его без рестарта
+      trailing_verify_interval_sec: 60              # Период страховочной проверки: если trailing потерялся, бот попробует восстановить его без рестарта
       # Важно:
       # - Main trailing может ставиться ещё до выполнения всех доборов.
       # - Если цена сразу идёт в прибыль, partial TP фиксирует часть объёма, а trailing ведёт остаток.
@@ -244,8 +247,8 @@ traders:
       # Усреднение (averaging / adds)
       # ======================================================
       averaging_enabled: true                       # true = разрешить доборы позиции при движении против входа
-      averaging_max_adds: 1                         # Сколько максимум доборов разрешено для одной main-позиции
-      averaging_add_position_multiplier: 2.0        # Во сколько раз увеличивать позицию на первом доборе ADD1
+      averaging_max_adds: 2                         # Сколько максимум доборов разрешено для одной main-позиции
+      averaging_add_position_multiplier: 2.2        # Во сколько раз увеличивать позицию на первом доборе ADD1
       averaging_add_pct_of_position: 100.0          # Для последующих доборов: какой % от текущей позиции добирать
 
       # Построение уровней для доборов
@@ -292,7 +295,7 @@ traders:
       # ======================================================
       # Portfolio cap
       # ======================================================
-      portfolio_cap_ratio: 0.7                      # Если суммарная загрузка портфеля >= 70% wallet, новые сделки не открывать; 0 = OFF
+      portfolio_cap_ratio: 0.85         # Если суммарная загрузка портфеля >= 70% wallet, новые сделки не открывать; 0 = OFF
 
       # ======================================================
       # Reconcile (сверка биржи и леджера)

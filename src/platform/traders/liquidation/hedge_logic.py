@@ -572,6 +572,8 @@ class TradeLiquidationHedgeLogicMixin:
 
     def _live_reduce_hedge_market(self, *, symbol: str, hedge_ps: str, qty: float, reason: str = "UNWIND") -> bool:
         """Best-effort partial/full reduce of an open hedge leg."""
+        sym_u = str(symbol).upper()
+        ps_u = str(hedge_ps).upper()
         try:
             q = float(qty or 0.0)
         except Exception:
@@ -579,16 +581,51 @@ class TradeLiquidationHedgeLogicMixin:
         if q <= 0.0 or getattr(self, '_binance', None) is None:
             return False
         try:
-            step = float(self._qty_step_for_symbol(symbol) or 0.0)
+            step = float(self._qty_step_for_symbol(sym_u) or 0.0)
         except Exception:
             step = 0.0
+
+        def _live_hedge_amt(force_refresh: bool = True) -> float:
+            pr = []
+            try:
+                if force_refresh:
+                    pr = self._binance.position_risk()
+                    try:
+                        self._rest_snapshot_set('position_risk', pr if isinstance(pr, list) else [])
+                    except Exception:
+                        pass
+                else:
+                    pr = self._rest_snapshot_get('position_risk') or []
+            except Exception:
+                pr = []
+            if not isinstance(pr, list):
+                pr = []
+            for row in pr:
+                try:
+                    if str(row.get('symbol') or '').upper() != sym_u:
+                        continue
+                    if str(row.get('positionSide') or '').upper() != ps_u:
+                        continue
+                    amt = float(row.get('positionAmt') or 0.0)
+                    return abs(amt)
+                except Exception:
+                    continue
+            return 0.0
+
+        live_amt = _live_hedge_amt(force_refresh=True)
+        if live_amt <= 0.0:
+            log.info('[TL][HEDGE_UNWIND] skip reduce no live hedge %s %s req_qty=%.8f reason=%s', sym_u, ps_u, float(q), str(reason))
+            return False
+
+        q = min(float(q), float(live_amt))
         if step and step > 0.0:
             q = float(_round_qty_to_step(q, step, mode='down'))
         if q <= 0.0:
             return False
-        close_side = 'BUY' if str(hedge_ps).upper() == 'SHORT' else 'SELL'
+
+        close_side = 'BUY' if ps_u == 'SHORT' else 'SELL'
         try:
-            params = dict(symbol=str(symbol).upper(), side=close_side, type='MARKET', quantity=float(q), positionSide=str(hedge_ps).upper())
+            params = dict(symbol=sym_u, side=close_side, type='MARKET', quantity=float(q), positionSide=ps_u)
             try:
                 self._binance.new_order(**params)
             except Exception as e1:
@@ -599,13 +636,103 @@ class TradeLiquidationHedgeLogicMixin:
                 else:
                     raise
             return True
-        except Exception:
-            log.exception('[TL][HEDGE_UNWIND] market reduce failed %s %s qty=%.8f reason=%s', symbol, hedge_ps, float(q), str(reason))
+        except Exception as e:
+            msg = str(e)
+            if 'ReduceOnly Order is rejected' in msg or '"code":-2022' in msg or 'code: -2022' in msg:
+                refreshed_amt = _live_hedge_amt(force_refresh=True)
+                log.info('[TL][HEDGE_UNWIND] benign reduce race %s %s req_qty=%.8f live_amt=%.8f reason=%s', sym_u, ps_u, float(q), float(refreshed_amt), str(reason))
+                return False
+            log.exception('[TL][HEDGE_UNWIND] market reduce failed %s %s qty=%.8f reason=%s', sym_u, ps_u, float(q), str(reason))
             return False
 
     def _live_get_main_position_amt(self, *, symbol: str, main_ps: str, force_refresh: bool = False) -> float:
         sym_u = str(symbol).upper()
         ps_u = str(main_ps).upper()
+        pr = None
+        try:
+            if force_refresh and getattr(self, '_binance', None) is not None:
+                pr = self._binance.position_risk()
+                try:
+                    self._rest_snapshot_set('position_risk', pr if isinstance(pr, list) else [])
+                except Exception:
+                    pass
+            else:
+                pr = self._rest_snapshot_get('position_risk') or []
+        except Exception:
+            pr = []
+        if not isinstance(pr, list) or not pr:
+            try:
+                if getattr(self, '_binance', None) is not None:
+                    pr = self._binance.position_risk()
+                    try:
+                        self._rest_snapshot_set('position_risk', pr if isinstance(pr, list) else [])
+                    except Exception:
+                        pass
+            except Exception:
+                pr = []
+        try:
+            for r in pr if isinstance(pr, list) else []:
+                if str(r.get('symbol') or '').upper() != sym_u:
+                    continue
+                if str(r.get('positionSide') or '').upper() != ps_u:
+                    continue
+                amt = float(r.get('positionAmt') or 0.0)
+                if abs(amt) > 0.0:
+                    return abs(float(amt))
+            return 0.0
+        except Exception:
+            return 0.0
+
+    def _verify_partial_reduce(self, *, symbol: str, position_side: str, before_amt: float, expected_reduce_qty: float, tag: str, pos_uid: str = "", reason: str = "") -> tuple[bool, float, float]:
+        """Refresh live position and confirm that size actually decreased after a market reduce."""
+        sym_u = str(symbol).upper()
+        ps_u = str(position_side).upper()
+        try:
+            before = abs(float(before_amt or 0.0))
+        except Exception:
+            before = 0.0
+        try:
+            expected = abs(float(expected_reduce_qty or 0.0))
+        except Exception:
+            expected = 0.0
+        after = 0.0
+        try:
+            after = float(self._live_get_position_amt(symbol=sym_u, position_side=ps_u, force_refresh=True) or 0.0)
+        except Exception:
+            after = 0.0
+        actual = max(float(before) - float(after), 0.0)
+        verify_abs = max(float(getattr(self.p, 'partial_close_verify_min_abs_qty', 0.0) or 0.0), 0.0)
+        verify_ratio = max(float(getattr(self.p, 'partial_close_verify_min_fill_ratio', 0.20) or 0.20), 0.0)
+        min_expected = float(expected) * float(verify_ratio) if expected > 0.0 else 0.0
+        threshold = max(float(verify_abs), float(min_expected), 1e-12)
+        ok = (actual >= threshold) or (before > 0.0 and after <= 1e-12)
+        if not ok:
+            try:
+                self._health_bump('partial_verify_failed', 1)
+            except Exception:
+                pass
+            log.warning('[%s][VERIFY] reduce not confirmed %s %s before=%.8f after=%.8f actual=%.8f expected=%.8f threshold=%.8f', str(tag), sym_u, ps_u, float(before), float(after), float(actual), float(expected), float(threshold))
+        try:
+            if pos_uid:
+                self._persist_partial_reduce_state(
+                    pos_uid=str(pos_uid or ''),
+                    symbol=sym_u,
+                    side=ps_u,
+                    phase='verify',
+                    before_amt=float(before),
+                    expected_reduce_qty=float(expected),
+                    after_amt=float(after),
+                    actual_reduce_qty=float(actual),
+                    verified=bool(ok),
+                    reason=str(reason or tag or ''),
+                )
+        except Exception:
+            pass
+        return bool(ok), float(after), float(actual)
+
+    def _live_get_position_amt(self, *, symbol: str, position_side: str, force_refresh: bool = False) -> float:
+        sym_u = str(symbol).upper()
+        ps_u = str(position_side).upper()
         pr = None
         try:
             if force_refresh and getattr(self, '_binance', None) is not None:
@@ -729,9 +856,45 @@ class TradeLiquidationHedgeLogicMixin:
             target_close_qty = min(target_close_qty, max_close)
             if target_close_qty <= 0.0:
                 return False
+            before_amt = float(main_amt)
+            try:
+                self._persist_partial_reduce_state(
+                    pos_uid=str(p.get('pos_uid') or ''),
+                    symbol=str(symbol).upper(),
+                    side=str(main_side).upper(),
+                    phase='attempt',
+                    before_amt=float(before_amt),
+                    expected_reduce_qty=float(target_close_qty),
+                    reason=str(action),
+                )
+            except Exception:
+                pass
             if not self._live_reduce_main_market(symbol=str(symbol).upper(), main_ps=str(main_side).upper(), qty=float(target_close_qty), reason=action):
+                try:
+                    self._persist_partial_reduce_state(
+                        pos_uid=str(p.get('pos_uid') or ''),
+                        symbol=str(symbol).upper(),
+                        side=str(main_side).upper(),
+                        phase='attempt_failed',
+                        before_amt=float(before_amt),
+                        expected_reduce_qty=float(target_close_qty),
+                        reason=str(action),
+                    )
+                except Exception:
+                    pass
                 return False
-            remaining_qty = max(float(main_amt) - float(target_close_qty), 0.0)
+            verified, live_remaining_qty, actual_reduced = self._verify_partial_reduce(
+                symbol=str(symbol).upper(),
+                position_side=str(main_side).upper(),
+                before_amt=float(before_amt),
+                expected_reduce_qty=float(target_close_qty),
+                tag='TL][MAIN_PARTIAL_TP',
+                pos_uid=str(p.get('pos_uid') or ''),
+                reason=str(action),
+            )
+            if not verified:
+                return False
+            remaining_qty = max(float(live_remaining_qty), 0.0)
             try:
                 if getattr(self, '_pl_has_raw_meta', False):
                     patch = {'profit': {
@@ -739,6 +902,9 @@ class TradeLiquidationHedgeLogicMixin:
                         'main_tp1_done': bool(tp1_done or action == 'TP1' or action == 'TP2'),
                         'main_tp2_done': bool(tp2_done or action == 'TP2'),
                         'main_last_partial_tp_ts': float(time.time()),
+                        'main_last_partial_tp_req_qty': float(target_close_qty),
+                        'main_last_partial_tp_fill_qty': float(actual_reduced),
+                        'main_last_partial_tp_verify_ts': float(time.time()),
                     }}
                     self.store.execute(
                         """
@@ -751,7 +917,7 @@ class TradeLiquidationHedgeLogicMixin:
                     )
             except Exception:
                 pass
-            log.info('[TL][MAIN_PARTIAL_TP] %s %s action=%s close_qty=%.8f remain_est=%.8f move_pct=%.4f entry=%.8f mark=%.8f', symbol, str(main_side).upper(), str(action), float(target_close_qty), float(remaining_qty), float(move_pct), float(entry_px), float(mark))
+            log.info('[TL][MAIN_PARTIAL_TP] %s %s action=%s close_qty=%.8f fill_qty=%.8f remain_live=%.8f move_pct=%.4f entry=%.8f mark=%.8f', symbol, str(main_side).upper(), str(action), float(target_close_qty), float(actual_reduced), float(remaining_qty), float(move_pct), float(entry_px), float(mark))
             return True
         except Exception:
             log.exception('[TL][MAIN_PARTIAL_TP] unexpected error for %s %s', symbol, main_side)
@@ -1254,10 +1420,47 @@ class TradeLiquidationHedgeLogicMixin:
                 if target_close_qty <= 0.0:
                     return False
 
+            before_amt = float(cur_amt)
+            try:
+                self._persist_partial_reduce_state(
+                    pos_uid=str(p.get('pos_uid') or ''),
+                    symbol=str(symbol).upper(),
+                    side=str(hedge_ps).upper(),
+                    phase='attempt',
+                    before_amt=float(before_amt),
+                    expected_reduce_qty=float(target_close_qty),
+                    reason=f'UNWIND_{action}',
+                )
+            except Exception:
+                pass
             if not self._live_reduce_hedge_market(symbol=str(symbol).upper(), hedge_ps=str(hedge_ps).upper(), qty=float(target_close_qty), reason=f'UNWIND_{action}'):
+                try:
+                    self._persist_partial_reduce_state(
+                        pos_uid=str(p.get('pos_uid') or ''),
+                        symbol=str(symbol).upper(),
+                        side=str(hedge_ps).upper(),
+                        phase='attempt_failed',
+                        before_amt=float(before_amt),
+                        expected_reduce_qty=float(target_close_qty),
+                        reason=f'UNWIND_{action}',
+                    )
+                except Exception:
+                    pass
                 return False
 
-            remaining_qty = max(cur_amt - float(target_close_qty), 0.0)
+            verified, live_remaining_qty, actual_reduced = self._verify_partial_reduce(
+                symbol=str(symbol).upper(),
+                position_side=str(hedge_ps).upper(),
+                before_amt=float(before_amt),
+                expected_reduce_qty=float(target_close_qty),
+                tag='TL][HEDGE_UNWIND',
+                pos_uid=str(p.get('pos_uid') or ''),
+                reason=f'UNWIND_{action}',
+            )
+            if not verified:
+                return False
+
+            remaining_qty = max(float(live_remaining_qty), 0.0)
             try:
                 if getattr(self, '_pl_has_raw_meta', False):
                     patch = {'hedge': {
@@ -1267,6 +1470,9 @@ class TradeLiquidationHedgeLogicMixin:
                         'unwind_full_exit_done': bool(full_done or action == 'FULL'),
                         'unwind_last_action_ts': float(time.time()),
                         'last_action_ts': float(time.time()),
+                        'unwind_last_req_qty': float(target_close_qty),
+                        'unwind_last_fill_qty': float(actual_reduced),
+                        'unwind_last_verify_ts': float(time.time()),
                     }}
                     if action == 'FULL':
                         patch['hedge'].update({'last_close_reason': 'UNWIND_FULL', 'last_close_ts': float(time.time()), 'last_close_px': float(mark), 'reopen_anchor_px': float(mark)})
@@ -1300,7 +1506,7 @@ class TradeLiquidationHedgeLogicMixin:
             except Exception:
                 pass
 
-            log.info('[TL][HEDGE_UNWIND] %s %s action=%s close_qty=%.8f remain_est=%.8f move_pct=%.4f entry=%.8f mark=%.8f', symbol, str(hedge_ps).upper(), str(action), float(target_close_qty), float(remaining_qty), float(move_pct), float(hedge_entry_use), float(mark))
+            log.info('[TL][HEDGE_UNWIND] %s %s action=%s close_qty=%.8f fill_qty=%.8f remain_live=%.8f move_pct=%.4f entry=%.8f mark=%.8f', symbol, str(hedge_ps).upper(), str(action), float(target_close_qty), float(actual_reduced), float(remaining_qty), float(move_pct), float(hedge_entry_use), float(mark))
             return True
         except Exception:
             log.exception('[TL][HEDGE_UNWIND] unexpected error for %s %s', symbol, hedge_ps)

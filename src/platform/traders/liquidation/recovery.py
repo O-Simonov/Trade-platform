@@ -1710,8 +1710,60 @@ class TradeLiquidationRecoveryMixin:
                         recent_trl_ts = float(getattr(self, "_recent_main_trl_place_ts", {}).get(cid_trl, 0.0) or 0.0)
                     except Exception:
                         recent_trl_ts = 0.0
-                    if recent_trl_ts and (time.time() - recent_trl_ts) < trl_guard_sec:
-                        continue
+                    force_verify_missing = False
+                    now_trl_ts = time.time()
+                    try:
+                        verify_every = float(getattr(self.p, "trailing_verify_interval_sec", 45) or 45)
+                    except Exception:
+                        verify_every = 45.0
+                    try:
+                        if not hasattr(self, "_last_trl_verify_ts") or not isinstance(self._last_trl_verify_ts, dict):
+                            self._last_trl_verify_ts = {}
+                    except Exception:
+                        pass
+                    last_verify_ts = 0.0
+                    try:
+                        last_verify_ts = float(getattr(self, "_last_trl_verify_ts", {}).get(cid_trl, 0.0) or 0.0)
+                    except Exception:
+                        last_verify_ts = 0.0
+                    if recent_trl_ts and (now_trl_ts - recent_trl_ts) < trl_guard_sec:
+                        if (now_trl_ts - last_verify_ts) >= verify_every:
+                            try:
+                                self._last_trl_verify_ts[cid_trl] = now_trl_ts
+                            except Exception:
+                                pass
+                            try:
+                                fresh_algos = self._refresh_open_algo_snapshot_for_symbol(sym) or []
+                            except Exception:
+                                fresh_algos = []
+                            trl_present = False
+                            try:
+                                trl_present = self._find_open_algo_order_by_client_id(sym, cid_trl) is not None
+                                if not trl_present:
+                                    trl_present = self._find_semantic_open_algo(
+                                        sym,
+                                        client_suffix="_TRL",
+                                        position_side=position_side if hedge_mode else None,
+                                        order_type="TRAILING_STOP_MARKET",
+                                        side=close_side,
+                                    ) is not None
+                            except Exception:
+                                trl_present = False
+                            if trl_present:
+                                continue
+                            force_verify_missing = True
+                            try:
+                                if hasattr(self, "_recent_main_trl_place_ts") and isinstance(self._recent_main_trl_place_ts, dict):
+                                    self._recent_main_trl_place_ts.pop(cid_trl, None)
+                            except Exception:
+                                pass
+                            try:
+                                self._forget_recent_desired_order("_recent_trl_desired", cid_trl)
+                            except Exception:
+                                pass
+                            log.warning("[trade_liquidation][TRL_VERIFY] missing trailing after recent place; forcing restore %s %s pos_uid=%s", sym, side, pos_uid)
+                        else:
+                            continue
                     # reference price: before any averaging adds -> entry_price, after adds -> avg_price
                     try:
                         avg_state = (raw_meta or {}).get("avg_state") or {}

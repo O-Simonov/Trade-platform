@@ -452,6 +452,18 @@ class TradeLiquidationParams:
     # Safety buffer to prevent "Order would immediately trigger" on Binance.
     trailing_activation_buffer_pct: float = 0.20
     trailing_place_retries: int = 5
+    reconcile_orphan_close_cycles: int = 3
+    health_monitor_enabled: bool = True
+    health_report_interval_sec: int = 600
+    health_slow_cycle_threshold_sec: float = 20.0
+    health_alert_open_positions_without_trailing: int = 1
+    health_alert_recovery_repeats_per_symbol: int = 3
+    health_alert_reconcile_cycles: int = 3
+    health_alert_slow_cycles: int = 3
+    health_alert_min_interval_sec: int = 900
+    health_telegram_enabled: bool = False
+    health_telegram_include_friends: bool = False
+    health_telegram_max_friends: int = 0
 
     # --- averaging/levels (paper only for now)
     averaging_enabled: bool = True
@@ -691,6 +703,18 @@ class TradeLiquidationParams:
             params.get("live_entry_reduce_factor", cls().live_entry_reduce_factor),
             cls().live_entry_reduce_factor,
         )
+        params["reconcile_orphan_close_cycles"] = int(_as_int(params.get("reconcile_orphan_close_cycles"), cls().reconcile_orphan_close_cycles) or cls().reconcile_orphan_close_cycles)
+        params["health_monitor_enabled"] = _as_bool(params.get("health_monitor_enabled", cls().health_monitor_enabled), cls().health_monitor_enabled)
+        params["health_report_interval_sec"] = int(_as_int(params.get("health_report_interval_sec"), cls().health_report_interval_sec) or cls().health_report_interval_sec)
+        params["health_slow_cycle_threshold_sec"] = float(_as_float(params.get("health_slow_cycle_threshold_sec", cls().health_slow_cycle_threshold_sec), cls().health_slow_cycle_threshold_sec) or cls().health_slow_cycle_threshold_sec)
+        params["health_alert_open_positions_without_trailing"] = int(_as_int(params.get("health_alert_open_positions_without_trailing"), cls().health_alert_open_positions_without_trailing) or cls().health_alert_open_positions_without_trailing)
+        params["health_alert_recovery_repeats_per_symbol"] = int(_as_int(params.get("health_alert_recovery_repeats_per_symbol"), cls().health_alert_recovery_repeats_per_symbol) or cls().health_alert_recovery_repeats_per_symbol)
+        params["health_alert_reconcile_cycles"] = int(_as_int(params.get("health_alert_reconcile_cycles"), cls().health_alert_reconcile_cycles) or cls().health_alert_reconcile_cycles)
+        params["health_alert_slow_cycles"] = int(_as_int(params.get("health_alert_slow_cycles"), cls().health_alert_slow_cycles) or cls().health_alert_slow_cycles)
+        params["health_alert_min_interval_sec"] = int(_as_int(params.get("health_alert_min_interval_sec"), cls().health_alert_min_interval_sec) or cls().health_alert_min_interval_sec)
+        params["health_telegram_enabled"] = _as_bool(params.get("health_telegram_enabled", cls().health_telegram_enabled), cls().health_telegram_enabled)
+        params["health_telegram_include_friends"] = _as_bool(params.get("health_telegram_include_friends", cls().health_telegram_include_friends), cls().health_telegram_include_friends)
+        params["health_telegram_max_friends"] = int(_as_int(params.get("health_telegram_max_friends"), cls().health_telegram_max_friends) or cls().health_telegram_max_friends)
 
         params["debug"] = _as_bool(params.get("debug", cls().debug), cls().debug)
         params["debug_top"] = int(_as_int(params.get("debug_top"), cls().debug_top) or cls().debug_top)

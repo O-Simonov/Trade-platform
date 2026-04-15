@@ -58,6 +58,31 @@ class TradeLiquidationEntryRulesMixin:
     def _process_new_signals(self) -> Dict[str, int]:
         open_positions = self._get_open_positions()
         open_by_symbol = {int(p["symbol_id"]) for p in open_positions}
+        # Safety: also respect OPEN ledger rows even if exchange snapshot is temporarily stale.
+        # This prevents duplicate re-entry on the same symbol while reconcile/orphan cleanup
+        # has not yet finished.
+        try:
+            ledger_rows = list(self.store.query_dict(
+                """
+                SELECT DISTINCT symbol_id
+                FROM position_ledger
+                WHERE exchange_id=%(ex)s
+                  AND account_id=%(acc)s
+                  AND strategy_id=%(sid)s
+                  AND status='OPEN'
+                  AND COALESCE(source, CASE WHEN %(mode)s='live' THEN 'live' ELSE 'paper' END)
+                      = CASE WHEN %(mode)s='live' THEN 'live' ELSE 'paper' END
+                """,
+                {
+                    "ex": int(self.exchange_id),
+                    "acc": int(self.account_id),
+                    "sid": str(self.STRATEGY_ID),
+                    "mode": str(getattr(self, 'mode', 'live')).lower(),
+                },
+            ))
+            open_by_symbol |= {int(r["symbol_id"]) for r in ledger_rows if r.get("symbol_id") is not None}
+        except Exception:
+            pass
         open_symbol_count = len(open_by_symbol)
         open_leg_count = len(open_positions)
 
@@ -595,46 +620,13 @@ class TradeLiquidationEntryRulesMixin:
             if sl_price <= 0:
                 return None
 
-            # Averaging/scale-in mode: вместо классического стоп-лосса ставим
-            # условный маркет-ордер, который **открывает** противоположную сторону (hedge),
-            # чтобы зафиксировать риск, не закрывая основную позицию.
             avg_enabled = bool(getattr(self.p, "averaging_enabled", False)) and int(self._cfg_max_adds() or 0) > 0
-            if avg_enabled and bool(getattr(self.p, "hedge_enabled", False)):
-                if not hedge_mode:
-                    return None
-                try:
-                    price_tick = float(tick_size or 0)
-                    stop_px = float(_round_price_to_tick(sl_price, price_tick, mode="down" if ledger_side == "LONG" else "up"))
-                    hedge_qty, _hedge_koff_eff, _funding_pct = self._compute_live_hedge_qty_with_funding(
-                        symbol=str(symbol).upper(),
-                        main_side=str(ledger_side).upper(),
-                        main_qty=float(qty),
-                    )
-                    if hedge_qty <= 0:
-                        return None
-                    hedge_ps = "SHORT" if ledger_side == "LONG" else "LONG"
-                    params = dict(
-                        symbol=symbol,
-                        side=close_side,
-                        type="STOP_MARKET",
-                        stopPrice=stop_px,
-                        quantity=hedge_qty,
-                        workingType=str(getattr(self.p, "working_type", "MARK_PRICE")),
-                        newClientOrderId=cid_hedge,
-                        positionSide=hedge_ps,
-                    )
-                    return self._binance.new_order(**params)
-                except Exception as e:
-                    log.exception(
-                        "[trade_liquidation][HEDGE] failed to place protective hedge STOP_MARKET symbol=%s side=%s hedge_ps=%s qty=%s stop=%s err=%s",
-                        str(symbol).upper(),
-                        str(close_side).upper(),
-                        str(hedge_ps).upper() if 'hedge_ps' in locals() else "",
-                        str(hedge_qty) if 'hedge_qty' in locals() else "",
-                        str(stop_px) if 'stop_px' in locals() else "",
-                        str(e),
-                    )
-                    raise
+
+            # In hedge mode, main SL must remain a regular reduce-only/close-position STOP_MARKET
+            # when enable_stop_loss=true. Do NOT reinterpret main SL as a hedge opener here.
+            # If enable_stop_loss=false, we simply skip placing main SL on entry.
+            if hedge_mode and (not bool(getattr(self.p, "enable_stop_loss", True))):
+                return None
 
             # LIVE trailing stop (Binance Futures): TRAILING_STOP_MARKET
             # Note: in Hedge Mode Binance forbids reduceOnly param, so we omit it there.
@@ -718,17 +710,16 @@ class TradeLiquidationEntryRulesMixin:
                 return None
 
 
-            # stop-limit (STOP)
+            # protective stop-loss as close-position market stop
             params = dict(
                 symbol=symbol,
                 side=close_side,
-                type="STOP",
-                timeInForce=str(getattr(self.p, "time_in_force", "GTC")),
-                quantity=float(qty),
-                price=float(sl_price),
+                type="STOP_MARKET",
                 stopPrice=float(sl_price),
                 newClientOrderId=cid_sl,
                 positionSide=position_side if hedge_mode else None,
+                closePosition=True,
+                workingType="MARK_PRICE",
             )
             if (not hedge_mode) and bool(self.p.reduce_only):
                 params["reduceOnly"] = True
@@ -736,7 +727,7 @@ class TradeLiquidationEntryRulesMixin:
                 symbol,
                 client_suffix="_SL",
                 position_side=position_side if hedge_mode else None,
-                order_type="STOP",
+                order_type="STOP_MARKET",
                 side=close_side,
             )
             if known_sl:
@@ -1152,7 +1143,7 @@ class TradeLiquidationEntryRulesMixin:
         except Exception:
             max_adds_cfg = 0
         try:
-            if bool(getattr(self.p, "trailing_enabled", False)) and bool(getattr(self.p, "averaging_enabled", False)) and max_adds_cfg > 0:
+            if bool(getattr(self.p, "trailing_enabled", False)):
                 self._live_ensure_tp_trailing_pre_last_add(
                     pos={
                         "symbol": str(symbol),

@@ -39,6 +39,8 @@ class TradeLiquidationHedgeLogicMixin:
         """
         if not bool(getattr(self.p, 'hedge_promote_survivor_to_main_enabled', True)):
             return False
+        if bool(getattr(self.p, 'enable_stop_loss', True)):
+            return False
         try:
             pos_uid_old = str((hedge_pos or {}).get('pos_uid') or '').strip()
             hedge_side = str((hedge_pos or {}).get('side') or '').upper().strip()
@@ -221,6 +223,8 @@ class TradeLiquidationHedgeLogicMixin:
 
         Returns hedge_pos_uid when binding exists/was created, else None.
         """
+        if bool(getattr(self.p, 'enable_stop_loss', True)):
+            return None
         try:
             base_pos_uid = str((base_pos or {}).get('pos_uid') or '').strip()
             if not base_pos_uid:
@@ -2721,6 +2725,8 @@ class TradeLiquidationHedgeLogicMixin:
             return {"checked": 0, "opened": 0, "closed": 0, "skipped": 0}
 
         if not bool(getattr(self.p, "hedge_enabled", False)):
+            return {"checked": 0, "opened": 0, "closed": 0, "skipped": 0}
+        if bool(getattr(self.p, "enable_stop_loss", True)):
             return {"checked": 0, "opened": 0, "closed": 0, "skipped": 0}
 
         hedge_koff = float(getattr(self.p, "hedge_koff", 1.2) or 1.2)

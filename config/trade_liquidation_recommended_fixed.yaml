@@ -154,7 +154,7 @@ traders:
       hedge_trailing_enabled: true                  # Включить отдельный trailing для hedge
       hedge_trailing_activation_pct: 2.0            # Активация trailing в % от средней цены входа hedge
       hedge_trailing_trail_pct: 0.6                 # callbackRate (%) для trailing
-      hedge_trailing_activation_buffer_pct: 0.3     # Буфер от мгновенного срабатывания
+      hedge_trailing_activation_buffer_pct: 0.5     # Буфер от мгновенного срабатывания
       hedge_trailing_place_retries: 3               # Ретраи постановки hedge trailing
       hedge_trailing_working_type: MARK_PRICE       # MARK_PRICE или CONTRACT_PRICE
       hedge_trailing_reissue_on_qty_change: true    # Перевыставлять hedge trailing при изменении размера hedge-позиции
@@ -169,7 +169,7 @@ traders:
       # 0 = выключено
       # SHORT: stop = entry * (1 + pct/100)
       # LONG : stop = entry * (1 - pct/100)
-      hedge_stop_loss_pct: 0.5                      # Базовый стоп-лосс hedge в процентах от цены входа
+      hedge_stop_loss_pct: 0.3                      # Базовый стоп-лосс hedge в процентах от цены входа
 
       # ======================================================
       # Hedge SL move to Break-Even / Profit-Lock
@@ -187,12 +187,12 @@ traders:
       # ======================================================
       # Лимиты по позициям
       # ======================================================
-      max_open_positions: 6                         # Максимум одновременно открытых позиций; снижено для лучшего контроля риска # Максимум одновременно открытых позиций
-      max_position_notional_pct_wallet: 2.0         # Лимит initial entry как % от wallet*leverage; чуть консервативнее вход # Лимит initial entry как % от wallet*leverage
+      max_open_positions: 10                         # Максимум одновременно открытых позиций; снижено для лучшего контроля риска # Максимум одновременно открытых позиций
+      max_position_notional_pct_wallet: 1.0         # Лимит initial entry как % от wallet*leverage; чуть консервативнее вход # Лимит initial entry как % от wallet*leverage
       averaging_add_max_notional_pct_wallet: 12.0   # Максимум notional одного добора как % от wallet*leverage; ограничен    # 0 = OFF; максимум notional одного добора как % от wallet*leverage
       main_position_max_notional_pct_wallet: 12.0   # Максимум суммарной основной позиции как % от wallet*leverage # 0 = OFF; максимум суммарной основной позиции как % от wallet*leverage
       hedge_position_max_notional_pct_wallet: 12.0  # Максимум суммарной hedge-позиции как % от wallet*leverage   # 0 = OFF; максимум суммарной hedge-позиции как % от wallet*leverage
-      risk_wallet_pct: 3.0                          # Риск на сделку от кошелька; умеренно-консервативный баланс # Риск на сделку от кошелька
+      risk_wallet_pct: 1.0                          # Риск на сделку от кошелька; умеренно-консервативный баланс # Риск на сделку от кошелька
       live_entry_reduce_on_max_position: true       # Если позиция не проходит по лимитам → уменьшать размер и пробовать снова
       live_entry_reduce_steps: 3                    # Максимум попыток уменьшения
       live_entry_reduce_factor: 0.8                 # На каждом шаге размер = размер * 0.8
@@ -200,15 +200,15 @@ traders:
       # ======================================================
       # Базовые SL / TP
       # ======================================================
-      stop_loss_pct: 20.0                           # Базовый SL (%) по main
+      stop_loss_pct: 2.0                            # Базовый SL (%) по main
       take_profit_pct: 6.0                          # Базовый full TP (%) по main; используется как fallback, если partial TP выключен
 
       # --- Частичная фиксация прибыли по main
       main_partial_tp_enabled: true                 # Разрешить частично фиксировать прибыль по main; при true обычный full TP по main не ставится
-      main_partial_tp1_pct: 2.7                     # Первый partial TP по main — немного раньше для фиксации части прибыли # Первый partial TP при движении в прибыль на 1.8% от средней цены входа main
-      main_partial_tp1_share: 0.35                  # Доля закрытия на TP1; сохраняем больше позиции для продолжения тренда # Закрыть 35% позиции
-      main_partial_tp2_pct: 4.0                     # Второй partial TP по main — немного ближе # Второй partial TP при движении в прибыль на 3.8% от средней цены входа main
-      main_partial_tp2_share: 0.35                  # Доля закрытия на TP2; фиксируем ощутимую часть прибыли # Закрыть еще 35% позиции
+      main_partial_tp1_pct: 1.7                     # Первый partial TP по main — немного раньше для фиксации части прибыли # Первый partial TP при движении в прибыль на 1.8% от средней цены входа main
+      main_partial_tp1_share: 0.5                   # Доля закрытия на TP1; сохраняем больше позиции для продолжения тренда # Закрыть 50% позиции
+      main_partial_tp2_pct: 3.4                     # Второй partial TP по main — немного ближе # Второй partial TP при движении в прибыль на 3.8% от средней цены входа main
+      main_partial_tp2_share: 0.30                  # Доля закрытия на TP2; фиксируем ощутимую часть прибыли # Закрыть еще 30% позиции
       main_partial_tp_cooldown_sec: 30              # Кулдаун между partial TP
       main_partial_tp_min_qty_ratio: 0.15           # Не резать позицию, если остаток станет меньше 15% от исходного
       recalc_sl_tp: true                            # Пересчитывать уровни SL/TP/trailing после усреднений и изменения средней цены
@@ -224,7 +224,6 @@ traders:
       working_type: MARK_PRICE                      # Тип триггерной цены для SL/TP/условных ордеров
       time_in_force: GTC                            # Политика времени жизни ордера: GTC / IOC / FOK
       client_order_id_prefix: TL                    # Префикс clientOrderId
-
       enable_stop_loss: true                        # Включить постановку SL
 
       defer_stop_loss_until_last_add: false         # Не ставить обычный SL сразу, пока не будут выполнены все доборы; на main trailing это больше не влияет
@@ -235,8 +234,8 @@ traders:
       # Main trailing stop
       # ======================================================
       trailing_enabled: true                        # Включить trailing по основной позиции
-      trailing_activation_pct: 2.8                  # Активация main trailing чуть раньше для защиты оставшегося объёма # На каком профит-движении (% от средней цены входа main) активируется trailing
-      trailing_trail_pct: 0.5                       # callbackRate (%) для trailing stop по main; немного плотнее сопровождение # callbackRate (%) для trailing stop по main
+      trailing_activation_pct: 2.2                  # Активация main trailing чуть раньше для защиты оставшегося объёма # На каком профит-движении (% от средней цены входа main) активируется trailing
+      trailing_trail_pct: 0.45                      # callbackRate (%) для trailing stop по main; немного плотнее сопровождение # callbackRate (%) для trailing stop по main
       trailing_activation_buffer_pct: 0.3           # Буфер к activation price, чтобы избежать мгновенного срабатывания на постановке
       tp_trigger_buffer_pct: 0.3                    # Буфер для triggerPrice TP, если full TP используется как fallback-режим без partial TP
       trailing_place_retries: 3                     # Сколько раз повторять постановку main trailing при ошибке Binance
@@ -328,8 +327,8 @@ traders:
       # Эти параметры специально ослаблены для снижения шума по value:
       # если qty совпадает, не надо каждый цикл дергать value_usdt
 
-      reconcile_auto_adjust_ledger_value_usdt: true   # Автоматически обновлять ledger value_usdt при значимом расхождении
-      reconcile_refresh_position_value_usdt: true     # Делать refresh value_usdt по текущему рынку во время reconcile
+      reconcile_auto_adjust_ledger_value_usdt: false   # Автоматически обновлять ledger value_usdt при значимом расхождении
+      reconcile_refresh_position_value_usdt: false     # Делать refresh value_usdt по текущему рынку во время reconcile
       reconcile_auto_sync_entry_price: true            # Синхронизировать ledger entry/avg с live exchange entryPrice
       reconcile_entry_price_tolerance_pct: 0.001       # Относительный порог (0.1%) для entry sync
       reconcile_sync_after_recovery: true              # После RECOVERY подтягивать qty/entry/value из positionRisk

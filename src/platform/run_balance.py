@@ -398,33 +398,55 @@ class BinanceFuturesRest:
                     raise RateLimitError(f"binance http {r.status_code} {method} {path}: {r.text}", retry_after)
 
                 if r.status_code >= 400:
-                    # Sometimes Binance returns JSON with code=-1003 without 418/429.
                     try:
                         j = r.json()
-                        if isinstance(j, dict) and str(j.get("code")) == "-1003":
-                            retry_after = 60.0
+                        if isinstance(j, dict):
+                            code = str(j.get("code"))
                             msg = str(j.get("msg") or "")
-                            m = re.search(r"banned until\s+(\d+)", msg)
-                            if m:
-                                banned_until_ms = int(m.group(1))
-                                retry_after = max((banned_until_ms / 1000.0) - time.time(), 5.0)
-                            self._set_cooldown(retry_after, reason=f"code_-1003:{path}")
-                            raise RateLimitError(f"binance rate limit {method} {path}: {msg}", retry_after)
+
+                            # -1021: local timestamp drifted ahead/behind server time.
+                            # Resync once and retry the signed request automatically.
+                            if signed and code == "-1021":
+                                log.warning("[BINANCE REST] timestamp drift detected for %s %s; resyncing time and retrying", method, path)
+                                self.sync_time()
+                                time.sleep(0.05)
+                                continue
+
+                            # Sometimes Binance returns JSON with code=-1003 without 418/429.
+                            if code == "-1003":
+                                retry_after = 60.0
+                                m = re.search(r"banned until\s+(\d+)", msg)
+                                if m:
+                                    banned_until_ms = int(m.group(1))
+                                    retry_after = max((banned_until_ms / 1000.0) - time.time(), 5.0)
+                                self._set_cooldown(retry_after, reason=f"code_-1003:{path}")
+                                raise RateLimitError(f"binance rate limit {method} {path}: {msg}", retry_after)
+                    except RateLimitError:
+                        raise
                     except Exception:
                         pass
                     raise RuntimeError(f"binance http {r.status_code} {method} {path}: {r.text}")
 
                 data = r.json()
-                # Even with HTTP 200, Binance can respond with code=-1003 in some edge cases.
-                if isinstance(data, dict) and str(data.get("code")) == "-1003":
-                    retry_after = 60.0
+                # Even with HTTP 200, Binance can respond with code=-1003 or -1021 in some edge cases.
+                if isinstance(data, dict):
+                    code = str(data.get("code"))
                     msg = str(data.get("msg") or "")
-                    m = re.search(r"banned until\s+(\d+)", msg)
-                    if m:
-                        banned_until_ms = int(m.group(1))
-                        retry_after = max((banned_until_ms / 1000.0) - time.time(), 5.0)
-                    self._set_cooldown(retry_after, reason=f"code_-1003_200:{path}")
-                    raise RateLimitError(f"binance rate limit {method} {path}: {msg}", retry_after)
+
+                    if signed and code == "-1021":
+                        log.warning("[BINANCE REST] timestamp drift detected for %s %s (HTTP 200 payload); resyncing time and retrying", method, path)
+                        self.sync_time()
+                        time.sleep(0.05)
+                        continue
+
+                    if code == "-1003":
+                        retry_after = 60.0
+                        m = re.search(r"banned until\s+(\d+)", msg)
+                        if m:
+                            banned_until_ms = int(m.group(1))
+                            retry_after = max((banned_until_ms / 1000.0) - time.time(), 5.0)
+                        self._set_cooldown(retry_after, reason=f"code_-1003_200:{path}")
+                        raise RateLimitError(f"binance rate limit {method} {path}: {msg}", retry_after)
 
                 return data
             except Exception as e:
@@ -793,6 +815,7 @@ class AccountBalanceWriter:
               (exchange_id, account_id, ts, wallet_balance, equity, available_balance, margin_used, unrealized_pnl, source)
             VALUES
               (%(ex)s, %(ac)s, %(ts)s, %(w)s, %(e)s, %(av)s, %(mu)s, %(up)s, %(src)s)
+            ON CONFLICT (exchange_id, account_id, ts) DO NOTHING
             """,
             {
                 "ex": self.exchange_id,

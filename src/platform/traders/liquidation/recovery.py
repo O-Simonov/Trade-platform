@@ -698,8 +698,9 @@ class TradeLiquidationRecoveryMixin:
 
         max_age_h = float(getattr(self.p, "recovery_max_age_hours", 48) or 48)
         place_sl = bool(getattr(self.p, "recovery_place_sl", True))
-        # Hedge strategy: do not auto-place SL brackets (hedge replaces SL)
-        if bool(getattr(self.p, "hedge_enabled", False)):
+        # In hedge mode we still must recover a main STOP_MARKET when enable_stop_loss=true.
+        # Only disable recovery SL if hedge mode is on AND stop-loss itself is explicitly disabled.
+        if bool(getattr(self.p, "hedge_enabled", False)) and (not bool(getattr(self.p, "enable_stop_loss", True))):
             place_sl = False
         place_tp = bool(getattr(self.p, "recovery_place_tp", True))
         place_trailing = bool(getattr(self.p, "recovery_place_trailing", True))
@@ -829,13 +830,10 @@ class TradeLiquidationRecoveryMixin:
                     _h = (_rm.get("hedge") or {}) if isinstance(_rm, dict) else {}
                     _bq = float(_h.get("base_qty") or 0.0) if isinstance(_h, dict) else 0.0
                     if _bq > 0.0:
-                        # raw_meta.hedge may be attached either to the hedge-managed leg itself
-                        # or to the main leg that owns the hedge state. To be robust across both
-                        # layouts, exclude both the current side and its opposite side from
-                        # generic RECOVERY TRAILING/ADD recovery.
-                        hedge_managed_sides.add((_sym, _side))
-                        _opp = "SHORT" if _side == "LONG" else "LONG"
-                        hedge_managed_sides.add((_sym, _opp))
+                        # raw_meta.hedge on the MAIN row describes the managed HEDGE leg.
+                        # Therefore the hedge-managed side is the opposite side, not the main one.
+                        _managed_side = "SHORT" if _side == "LONG" else "LONG"
+                        hedge_managed_sides.add((_sym, _managed_side))
                 except Exception:
                     continue
         except Exception:
@@ -954,8 +952,6 @@ class TradeLiquidationRecoveryMixin:
                         if (not sym_i) or side_i not in {"LONG", "SHORT"}:
                             continue
                         sym_u_i = str(sym_i).upper()
-                        if sym_u_i in two_sided_symbols:
-                            hedge_managed_sides.add((sym_u_i, side_i))
                         rm_i = lp.get("raw_meta") or {}
                         if isinstance(rm_i, str):
                             try:
@@ -971,12 +967,10 @@ class TradeLiquidationRecoveryMixin:
                         base_qty = float(hedge_meta.get("base_qty") or 0.0)
                         if base_qty <= 0.0:
                             continue
-                        # raw_meta.hedge can live either on the hedge leg itself or on the main
-                        # leg that controls hedge lifecycle. Exclude both sides here to avoid
-                        # generic RECOVERY TRAILING/ADD1 racing with dedicated HEDGE_TRL logic.
-                        hedge_managed_sides.add((sym_u_i, side_i))
-                        opp_i = "SHORT" if side_i == "LONG" else "LONG"
-                        hedge_managed_sides.add((sym_u_i, opp_i))
+                        # raw_meta.hedge lives on the MAIN row; generic recovery must skip
+                        # the opposite hedge leg, while keeping the main side eligible for _TRL.
+                        managed_side_i = "SHORT" if side_i == "LONG" else "LONG"
+                        hedge_managed_sides.add((sym_u_i, managed_side_i))
                     except Exception:
                         continue
             except Exception:
@@ -1128,9 +1122,11 @@ class TradeLiquidationRecoveryMixin:
                         if otype in {"TAKE_PROFIT_MARKET", "TAKE_PROFIT"} and close_pos:
                             has_any_tp = True
 
-                        # SL: stop-market/stop with closePosition OR any trailing stop
+                        # SL: stop-market/stop with closePosition
                         if otype in {"STOP_MARKET", "STOP"} and close_pos:
                             has_any_sl = True
+                        # Trailing must match the exact side/position side being recovered.
+                        # Do not treat opposite hedge trailing as the main trailing order.
                         if otype == "TRAILING_STOP_MARKET":
                             has_any_trl = True
                     except Exception:
@@ -1141,7 +1137,23 @@ class TradeLiquidationRecoveryMixin:
 
             has_sl = (cid_sl in existing) or bool(any_sl)
             has_tp = (cid_tp in existing) or bool(any_tp)
-            has_trl = (cid_trl in existing) or bool(any_trl)
+            has_trl = (cid_trl in existing)
+            if not has_trl:
+                try:
+                    has_trl = self._find_known_algo_order_by_client_id(sym, cid_trl) is not None
+                except Exception:
+                    has_trl = False
+            if not has_trl:
+                try:
+                    has_trl = self._find_semantic_open_algo(
+                        sym,
+                        client_suffix="_TRL",
+                        position_side=position_side if hedge_mode else None,
+                        order_type="TRAILING_STOP_MARKET",
+                        side=close_side,
+                    ) is not None
+                except Exception:
+                    has_trl = False
             main_partial_tp_enabled = bool(getattr(self.p, "main_partial_tp_enabled", False))
 
             # Strong dedupe for our own protective algo orders. Exchange snapshots can lag,
@@ -1408,24 +1420,8 @@ class TradeLiquidationRecoveryMixin:
                             resp = _tl_place_algo_with_retry(_place, max_tries=int(getattr(self.p, "trailing_place_retries", 3) or 3))
 
                         else:
-                            # In hedge mode, SL is implemented as a conditional market order that OPENS the opposite hedge leg.
-                            if hedge_mode and bool(getattr(self.p, "hedge_enabled", False)):
-                                hedge_qty, _hedge_koff_eff, _funding_pct = self._compute_live_hedge_qty_with_funding(
-                                    symbol=str(sym).upper(),
-                                    main_side=str(position_side).upper(),
-                                    main_qty=float(qty_use),
-                                )
-                                hedge_ps = "SHORT" if position_side == "LONG" else "LONG"
-                                params = dict(
-                                    symbol=sym,
-                                    side=close_side,
-                                    type="STOP_MARKET",
-                                    stopPrice=float(sl_price),
-                                    quantity=hedge_qty,
-                                    workingType=str(getattr(self.p, "working_type", "MARK_PRICE")),
-                                    newClientOrderId=cid_trl,
-                                    positionSide=hedge_ps,
-                                )
+                            if hedge_mode and (not bool(getattr(self.p, "enable_stop_loss", True))):
+                                resp = None
                             else:
                                 params = dict(
                                     symbol=sym,
@@ -1482,7 +1478,10 @@ class TradeLiquidationRecoveryMixin:
                                     pass
                                 return self._binance.new_order(**p2)
 
-                            resp = _tl_place_algo_with_retry(_place_sl2, max_tries=int(getattr(self.p, "trailing_place_retries", 3) or 3))
+                            if hedge_mode and (not bool(getattr(self.p, "enable_stop_loss", True))):
+                                resp = None
+                            else:
+                                resp = _tl_place_algo_with_retry(_place_sl2, max_tries=int(getattr(self.p, "trailing_place_retries", 3) or 3))
 
                         if isinstance(resp, dict):
                             self._upsert_order_shadow(

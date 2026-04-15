@@ -1246,6 +1246,111 @@ class TradeLiquidation(
         except Exception:
             return False
 
+    def _adopt_exchange_position_to_ledger(self, *, sym: str, side: str, ex_qty: float, ex_entry: float, ex_mark_val: float = 0.0, opened_at: Optional[datetime] = None, reason: str = "recovery_exchange_only") -> Optional[Dict[str, Any]]:
+        """Create a minimal OPEN ledger row for an exchange position that exists without a matching ledger row.
+
+        This lets recovery place SL / TRAILING for manually-opened or pre-existing positions after restart.
+        """
+        try:
+            sym_u = str(sym or "").upper().strip()
+            side_u = str(side or "").upper().strip()
+            qty_f = abs(float(ex_qty or 0.0))
+            entry_f = abs(float(ex_entry or 0.0))
+            if not sym_u or side_u not in {"LONG", "SHORT"} or qty_f <= 0.0:
+                return None
+
+            sym_map = self._symbols_map()
+            symbol_id = next((int(k) for k, v in sym_map.items() if str(v).upper().strip() == sym_u), 0)
+            if symbol_id <= 0:
+                log.warning("[trade_liquidation][RECOVERY][ADOPT] skip unknown symbol=%s side=%s", sym_u, side_u)
+                return None
+
+            existing = self.store.fetch_one(
+                """
+                SELECT symbol_id, pos_uid, side, status, qty_current, entry_price, avg_price, raw_meta, opened_at, source
+                  FROM position_ledger
+                 WHERE exchange_id=%s
+                   AND account_id=%s
+                   AND strategy_id=%s
+                   AND status='OPEN'
+                   AND symbol=%s
+                   AND side=%s
+                 ORDER BY opened_at DESC
+                 LIMIT 1
+                """,
+                (int(self.exchange_id), int(self.account_id), str(self.STRATEGY_ID), str(sym_u), str(side_u)),
+            )
+            if existing:
+                return dict(existing)
+
+            ts = opened_at or _utc_now()
+            pos_uid = f"EX-{sym_u}-{side_u}-{uuid.uuid4().hex[:12]}"
+            val_f = qty_f * entry_f if entry_f > 0 else 0.0
+            meta = {
+                "adopted_from_exchange": {
+                    "reason": str(reason or "recovery_exchange_only"),
+                    "symbol": str(sym_u),
+                    "side": str(side_u),
+                    "qty": float(qty_f),
+                    "entry_price": float(entry_f),
+                    "exchange_mark_usdt": float(ex_mark_val or 0.0),
+                    "working_without_signal": True,
+                    "ts": _utc_now().isoformat(),
+                },
+                "reconcile": {
+                    "value_mode": "entry_notional",
+                    "exchange_entry_price": float(entry_f),
+                    "exchange_mark_usdt": float(ex_mark_val or 0.0),
+                },
+            }
+            cols = [
+                "exchange_id", "account_id", "symbol_id", "pos_uid", "strategy_id", "strategy_name",
+                "side", "status", "opened_at", "qty_opened", "qty_current", "entry_price", "avg_price",
+                "position_value_usdt", "scale_in_count", "updated_at", "source"
+            ]
+            vals = [
+                "%(ex)s", "%(acc)s", "%(sym_id)s", "%(pos_uid)s", "%(sid)s", "%(sname)s",
+                "%(side)s", "'OPEN'", "%(opened_at)s", "%(qty)s", "%(qty)s", "%(entry)s", "%(avg)s",
+                "%(val)s", "0", "now()", "'live'"
+            ]
+            if self._pl_has_raw_meta:
+                cols.insert(-2, "raw_meta")
+                vals.insert(-2, "%(meta)s::jsonb")
+            sql = f"INSERT INTO position_ledger ({', '.join(cols)}) VALUES ({', '.join(vals)})"
+            params = {
+                "ex": int(self.exchange_id),
+                "acc": int(self.account_id),
+                "sym_id": int(symbol_id),
+                "pos_uid": str(pos_uid),
+                "sid": str(self.STRATEGY_ID),
+                "sname": str(self.STRATEGY_ID),
+                "side": str(side_u),
+                "opened_at": ts,
+                "qty": float(qty_f),
+                "entry": float(entry_f),
+                "avg": float(entry_f),
+                "val": float(val_f),
+                "meta": json.dumps(meta),
+            }
+            self.store.execute(sql, params)
+            row = {
+                "symbol_id": int(symbol_id),
+                "pos_uid": str(pos_uid),
+                "side": str(side_u),
+                "status": "OPEN",
+                "qty_current": float(qty_f),
+                "entry_price": float(entry_f),
+                "avg_price": float(entry_f),
+                "raw_meta": meta,
+                "opened_at": ts,
+                "source": "live",
+            }
+            log.info("[trade_liquidation][RECOVERY][ADOPT] created ledger row from exchange %s %s qty=%.8f entry=%.8f pos_uid=%s", sym_u, side_u, float(qty_f), float(entry_f), str(pos_uid))
+            return row
+        except Exception:
+            log.exception("[trade_liquidation][RECOVERY][ADOPT] failed for %s %s", str(sym or ""), str(side or ""))
+            return None
+
     def _sync_ledger_open_position_from_exchange(self, *, pos_uid: str, sym: str, side: str, ex_qty: float, ex_entry: float, ex_mark_val: float = 0.0, reason: str = "reconcile_entry_sync") -> bool:
         """Sync OPEN ledger row to live exchange qty/entry snapshot.
 
@@ -2018,8 +2123,9 @@ class TradeLiquidation(
 
         max_age_h = float(getattr(self.p, "recovery_max_age_hours", 48) or 48)
         place_sl = bool(getattr(self.p, "recovery_place_sl", True))
-        # Hedge strategy: do not auto-place SL brackets (hedge replaces SL)
-        if bool(getattr(self.p, "hedge_enabled", False)):
+        # In hedge mode we still must recover a main STOP_MARKET when enable_stop_loss=true.
+        # Only disable recovery SL if hedge mode is on AND stop-loss itself is explicitly disabled.
+        if bool(getattr(self.p, "hedge_enabled", False)) and (not bool(getattr(self.p, "enable_stop_loss", True))):
             place_sl = False
         place_tp = bool(getattr(self.p, "recovery_place_tp", True))
         place_trailing = bool(getattr(self.p, "recovery_place_trailing", True))
@@ -2122,6 +2228,41 @@ class TradeLiquidation(
             )
         )
 
+        # Adopt exchange-only positions into ledger so recovery can protect them.
+        # Without this, positions opened manually or surviving a DB cleanup were invisible to the
+        # recovery loop because it iterated only over OPEN ledger rows.
+        try:
+            ledger_open_pairs = set()
+            for _lp in led:
+                try:
+                    _sid = int(_lp.get("symbol_id") or 0)
+                    _sym = sym_map.get(_sid)
+                    _side = str(_lp.get("side") or "").upper().strip()
+                    if _sym and _side in {"LONG", "SHORT"}:
+                        ledger_open_pairs.add((str(_sym).upper(), _side))
+                except Exception:
+                    continue
+            adopted_rows: list[dict[str, Any]] = []
+            for (_sym, _side) in sorted(ex_has_pos):
+                if (_sym, _side) in ledger_open_pairs:
+                    continue
+                _row = self._adopt_exchange_position_to_ledger(
+                    sym=_sym,
+                    side=_side,
+                    ex_qty=float(ex_qty_map.get((_sym, _side), 0.0) or 0.0),
+                    ex_entry=float(ex_entry_map.get((_sym, _side), 0.0) or 0.0),
+                    ex_mark_val=float(ex_mark_map.get((_sym, _side), 0.0) or 0.0),
+                    reason="recovery_exchange_only",
+                )
+                if isinstance(_row, dict) and _row.get("pos_uid"):
+                    adopted_rows.append(dict(_row))
+                    ledger_open_pairs.add((_sym, _side))
+            if adopted_rows:
+                led.extend(adopted_rows)
+                led_live_for_hedge.extend(adopted_rows)
+        except Exception:
+            log.exception("[trade_liquidation][RECOVERY][ADOPT] exchange-only adoption pass failed")
+
         # Precompute symbol/side pairs that are hedge-managed by another OPEN live position.
         # For any OPEN live ledger row with raw_meta.hedge.base_qty > 0, the opposite side is
         # controlled by _live_hedge_manage() and must NOT receive generic RECOVERY TRAILING/ADD.
@@ -2148,13 +2289,10 @@ class TradeLiquidation(
                     _h = (_rm.get("hedge") or {}) if isinstance(_rm, dict) else {}
                     _bq = float(_h.get("base_qty") or 0.0) if isinstance(_h, dict) else 0.0
                     if _bq > 0.0:
-                        # raw_meta.hedge may be attached either to the hedge-managed leg itself
-                        # or to the main leg that owns the hedge state. To be robust across both
-                        # layouts, exclude both the current side and its opposite side from
-                        # generic RECOVERY TRAILING/ADD recovery.
-                        hedge_managed_sides.add((_sym, _side))
-                        _opp = "SHORT" if _side == "LONG" else "LONG"
-                        hedge_managed_sides.add((_sym, _opp))
+                        # raw_meta.hedge on the MAIN row describes the managed HEDGE leg.
+                        # Therefore the hedge-managed side is the opposite side, not the main one.
+                        _managed_side = "SHORT" if _side == "LONG" else "LONG"
+                        hedge_managed_sides.add((_sym, _managed_side))
                 except Exception:
                     continue
         except Exception:
@@ -2276,6 +2414,25 @@ class TradeLiquidation(
             except Exception:
                 pass
 
+        def _trl_skip(reason: str, *, sym: str = "", side: str = "", pos_uid: str = "", qty_use: float = 0.0, extra: Optional[Dict[str, Any]] = None) -> None:
+            try:
+                payload = {
+                    "sym": str(sym or ""),
+                    "side": str(side or ""),
+                    "pos_uid": str(pos_uid or ""),
+                    "qty_use": float(qty_use or 0.0),
+                }
+                if isinstance(extra, dict):
+                    payload.update(extra)
+                parts = []
+                for k, v in payload.items():
+                    if v in ("", None, False):
+                        continue
+                    parts.append(f"{k}={v}")
+                log.info("[trade_liquidation][RECOVERY][MAIN_TRL] skip reason=%s %s", str(reason), " ".join(parts))
+            except Exception:
+                pass
+
         if hedge_mode:
             try:
                 sides_by_symbol: Dict[str, set[str]] = {}
@@ -2292,8 +2449,6 @@ class TradeLiquidation(
                         if (not sym_i) or side_i not in {"LONG", "SHORT"}:
                             continue
                         sym_u_i = str(sym_i).upper()
-                        if sym_u_i in two_sided_symbols:
-                            hedge_managed_sides.add((sym_u_i, side_i))
                         rm_i = lp.get("raw_meta") or {}
                         if isinstance(rm_i, str):
                             try:
@@ -2309,12 +2464,10 @@ class TradeLiquidation(
                         base_qty = float(hedge_meta.get("base_qty") or 0.0)
                         if base_qty <= 0.0:
                             continue
-                        # raw_meta.hedge can live either on the hedge leg itself or on the main
-                        # leg that controls hedge lifecycle. Exclude both sides here to avoid
-                        # generic RECOVERY TRAILING/ADD1 racing with dedicated HEDGE_TRL logic.
-                        hedge_managed_sides.add((sym_u_i, side_i))
-                        opp_i = "SHORT" if side_i == "LONG" else "LONG"
-                        hedge_managed_sides.add((sym_u_i, opp_i))
+                        # raw_meta.hedge lives on the MAIN row; generic recovery must skip
+                        # the opposite hedge leg, while keeping the main side eligible for _TRL.
+                        managed_side_i = "SHORT" if side_i == "LONG" else "LONG"
+                        hedge_managed_sides.add((sym_u_i, managed_side_i))
                     except Exception:
                         continue
             except Exception:
@@ -2407,6 +2560,7 @@ class TradeLiquidation(
                     age_h = (now - opened_at.replace(tzinfo=timezone.utc) if opened_at.tzinfo is None else now - opened_at.astimezone(timezone.utc)).total_seconds() / 3600.0
                     if age_h > max_age_h:
                         _rec_skip("max_age", pos_uid=str(p.get("pos_uid") or ""), extra={"age_h": round(float(age_h), 4), "max_age_h": round(float(max_age_h), 4)})
+                        _trl_skip("max_age", pos_uid=str(p.get("pos_uid") or ""), extra={"age_h": round(float(age_h), 4), "max_age_h": round(float(max_age_h), 4)})
                         continue
             except Exception:
                 pass
@@ -2515,8 +2669,9 @@ class TradeLiquidation(
                                 side=hedge_close_side,
                                 close_position=True,
                             ) is not None
-                        need_htrl = bool(place_trailing) and bool(getattr(self.p, "hedge_trailing_enabled", False)) and (not has_htrl)
-                        need_hsl = bool(getattr(self.p, "recovery_place_sl", True)) and float(getattr(self.p, "hedge_stop_loss_pct", 0.0) or 0.0) > 0.0 and (not has_hsl)
+                        hedge_restore_allowed = bool(getattr(self.p, "hedge_enabled", False)) and (not bool(getattr(self.p, "enable_stop_loss", True)))
+                        need_htrl = hedge_restore_allowed and bool(place_trailing) and bool(getattr(self.p, "hedge_trailing_enabled", False)) and (not has_htrl)
+                        need_hsl = hedge_restore_allowed and bool(getattr(self.p, "recovery_place_sl", True)) and float(getattr(self.p, "hedge_stop_loss_pct", 0.0) or 0.0) > 0.0 and (not has_hsl)
                         if need_htrl or need_hsl:
                             log.info(
                                 "[trade_liquidation][RECOVERY][HEDGE] restoring %s %s base_pos_uid=%s hedge_pos_uid=%s need_hsl=%s need_htrl=%s",
@@ -2592,6 +2747,7 @@ class TradeLiquidation(
             qty_led = abs(_safe_float(p.get("qty_current"), 0.0))
             qty_use = float(qty_ex if qty_ex > 0 else qty_led)
             if qty_use <= 0:
+                _trl_skip("no_qty", sym=sym, side=side, pos_uid=pos_uid, qty_use=qty_use, extra={"qty_led": float(qty_led), "qty_ex": float(qty_ex), "source": src_kind})
                 continue
 
             pos_uid = str(p.get("pos_uid") or "").strip()
@@ -2645,9 +2801,11 @@ class TradeLiquidation(
                         if otype in {"TAKE_PROFIT_MARKET", "TAKE_PROFIT"} and close_pos:
                             has_any_tp = True
 
-                        # SL: stop-market/stop with closePosition OR any trailing stop
+                        # SL: stop-market/stop with closePosition
                         if otype in {"STOP_MARKET", "STOP"} and close_pos:
                             has_any_sl = True
+                        # Trailing must match the exact side/position side being recovered.
+                        # Do not treat opposite hedge trailing as the main trailing order.
                         if otype == "TRAILING_STOP_MARKET":
                             has_any_trl = True
                     except Exception:
@@ -2658,7 +2816,23 @@ class TradeLiquidation(
 
             has_sl = (cid_sl in existing) or bool(any_sl)
             has_tp = (cid_tp in existing) or bool(any_tp)
-            has_trl = (cid_trl in existing) or bool(any_trl)
+            has_trl = (cid_trl in existing)
+            if not has_trl:
+                try:
+                    has_trl = self._find_known_algo_order_by_client_id(sym, cid_trl) is not None
+                except Exception:
+                    has_trl = False
+            if not has_trl:
+                try:
+                    has_trl = self._find_semantic_open_algo(
+                        sym,
+                        client_suffix="_TRL",
+                        position_side=position_side if hedge_mode else None,
+                        order_type="TRAILING_STOP_MARKET",
+                        side=close_side,
+                    ) is not None
+                except Exception:
+                    has_trl = False
             main_partial_tp_enabled = bool(getattr(self.p, "main_partial_tp_enabled", False))
 
             # Strong dedupe for our own protective algo orders. Exchange snapshots can lag,
@@ -2699,6 +2873,7 @@ class TradeLiquidation(
             if not tick or tick <= 0:
                 tick = 1e-8
             if entry <= 0:
+                _trl_skip("bad_entry", sym=sym, side=side, pos_uid=pos_uid, qty_use=qty_use, extra={"entry": float(entry), "entry_ledger": float(entry_ledger)})
                 continue
 
             if side == "LONG":
@@ -2833,129 +3008,23 @@ class TradeLiquidation(
                                 else:
                                     sl_price = last_add_fill * (1.0 + _pct_to_mult(dist_pct))
                                 log.info("[trade_liquidation][RECOVER] using deferred main SL from last add %s %s last_add=%.8f dist_pct=%.4f sl=%.8f", sym, side, float(last_add_fill), float(dist_pct), float(sl_price))
-                        sl_mode = str(getattr(self.p, "sl_order_mode", "stop_market") or "stop_market").strip().lower()
-                        if sl_mode in {"trailing_stop_market", "trailing", "tsm"} and bool(getattr(self.p, "trailing_enabled", True)):
-                            callback_rate = float(getattr(self.p, "trailing_trail_pct", 0.6) or 0.6)
-                            activation_pct = float(getattr(self.p, "trailing_activation_pct", 1.2) or 1.2)
-                            buffer_pct = float(getattr(self.p, "trailing_activation_buffer_pct", 0.25) or 0.25)
-
-                            # Get markPrice from exchange snapshot if available (best-effort).
-                            mark = _safe_float(ex_mark_map.get((sym, side)), 0.0)
-
-                            # For SELL trailing stop, activation must be ABOVE current mark.
-                            # For BUY trailing stop, activation must be BELOW current mark.
-                            if close_side.upper() == "SELL":
-                                desired_act = entry * (1.0 + activation_pct / 100.0)
-                            else:
-                                desired_act = entry * (1.0 - activation_pct / 100.0)
-
-                            # Ensure activation is on correct side of the *actual* entry.
-                            desired_act = _ensure_tp_trail_side(desired_act, entry, tick, side, kind="trail_activate")
-
-                            tick_dec = self._price_tick_for_symbol(sym)
-                            tick = float(tick_dec) if tick_dec is not None else 0.0
-
-                            def _place(i_try: int):
-                                # increase buffer a bit on each retry
-                                buf = buffer_pct * (1.0 + 0.7 * float(i_try))
-                                activation_price = _tl_safe_trigger_price(
-                                    symbol=sym,
-                                    close_side=close_side,
-                                    desired=desired_act,
-                                    mark=mark,
-                                    tick=tick,
-                                    buffer_pct=buf,
-                                )
-
-                                # Round and enforce side vs actual entry.
-                                activation_price = _round_price_to_tick(
-                                    activation_price,
-                                    tick,
-                                    mode="up" if close_side.upper() == "SELL" else "down",
-                                )
-                                activation_price = _ensure_tp_trail_side(
-                                    activation_price,
-                                    entry,
-                                    tick,
-                                    side,
-                                    kind="trail_activate",
-                                )
-                                # Guard: never place trailing without an open MAIN position on the exchange
-                                try:
-                                    _qty_tmp = float(qty_use or 0.0)
-                                except Exception:
-                                    _qty_tmp = 0.0
-                                if _qty_tmp <= 0.0:
-                                    self._dlog("skip TRL: qty<=0 sym=%s side=%s", sym, position_side)
-                                    return None
-                                if hedge_mode and (not self._has_open_position_live(sym, str(position_side))):
-                                    # Main leg is already flat on exchange; ensure we don't leave a dangling TRL
-                                    self._dlog("skip TRL: no open MAIN position sym=%s side=%s", sym, position_side)
-                                    try:
-                                        self._cancel_algo_by_client_id_safe(sym, cid_trl)
-                                    except Exception:
-                                        pass
-                                    return None
-                                if (not hedge_mode):
-                                    # One-way mode: infer by requested side via position_side if given, else allow
-                                    if position_side:
-                                        if (not self._has_open_position_live(sym, str(position_side))):
-                                            self._dlog("skip TRL: no open position sym=%s side=%s", sym, position_side)
-                                            try:
-                                                self._cancel_algo_by_client_id_safe(sym, cid_trl)
-                                            except Exception:
-                                                pass
-                                            return None
-
-                                params = dict(
-                                    symbol=sym,
-                                    side=close_side,
-                                    type="TRAILING_STOP_MARKET",
-                                    quantity=float(qty_use),
-                                    activationPrice=float(activation_price),
-                                    callbackRate=float(callback_rate),
-                                    workingType=str(getattr(self.p, "working_type", "MARK_PRICE")),
-                                    newClientOrderId=cid_trl,
-                                    positionSide=position_side if hedge_mode else None,
-                                )
-                                if (not hedge_mode) and bool(self.p.reduce_only):
-                                    params["reduceOnly"] = True
-                                return self._binance.new_order(**params)
-
-                            resp = _tl_place_algo_with_retry(_place, max_tries=int(getattr(self.p, "trailing_place_retries", 3) or 3))
-
+                        # Recovery must always restore the main stop-loss as STOP_MARKET under cid_sl.
+                        # Main trailing protection is handled later in the dedicated TRAILING_STOP_MARKET block.
+                        if hedge_mode and (not bool(getattr(self.p, "enable_stop_loss", True))):
+                            resp = None
                         else:
-                            # In hedge mode, SL is implemented as a conditional market order that OPENS the opposite hedge leg.
-                            if hedge_mode and bool(getattr(self.p, "hedge_enabled", False)):
-                                hedge_qty, _hedge_koff_eff, _funding_pct = self._compute_live_hedge_qty_with_funding(
-                                    symbol=str(sym).upper(),
-                                    main_side=str(position_side).upper(),
-                                    main_qty=float(qty_use),
-                                )
-                                hedge_ps = "SHORT" if position_side == "LONG" else "LONG"
-                                params = dict(
-                                    symbol=sym,
-                                    side=close_side,
-                                    type="STOP_MARKET",
-                                    stopPrice=float(sl_price),
-                                    quantity=hedge_qty,
-                                    workingType=str(getattr(self.p, "working_type", "MARK_PRICE")),
-                                    newClientOrderId=cid_trl,
-                                    positionSide=hedge_ps,
-                                )
-                            else:
-                                params = dict(
-                                    symbol=sym,
-                                    side=close_side,
-                                    type="STOP_MARKET",
-                                    stopPrice=float(sl_price),
-                                    closePosition=True,
-                                    workingType=str(getattr(self.p, "working_type", "MARK_PRICE")),
-                                    newClientOrderId=cid_trl,
-                                    positionSide=position_side if hedge_mode else None,
-                                )
-                                if (not hedge_mode) and bool(self.p.reduce_only):
-                                    params["reduceOnly"] = True
+                            params = dict(
+                                symbol=sym,
+                                side=close_side,
+                                type="STOP_MARKET",
+                                stopPrice=float(sl_price),
+                                closePosition=True,
+                                workingType=str(getattr(self.p, "working_type", "MARK_PRICE")),
+                                newClientOrderId=cid_sl,
+                                positionSide=position_side if hedge_mode else None,
+                            )
+                            if (not hedge_mode) and bool(self.p.reduce_only):
+                                params["reduceOnly"] = True
                             def _place_sl2(i: int):
                                 p2 = dict(params)
                                 try:
@@ -2999,7 +3068,10 @@ class TradeLiquidation(
                                     pass
                                 return self._binance.new_order(**p2)
 
-                            resp = _tl_place_algo_with_retry(_place_sl2, max_tries=int(getattr(self.p, "trailing_place_retries", 3) or 3))
+                            if hedge_mode and (not bool(getattr(self.p, "enable_stop_loss", True))):
+                                resp = None
+                            else:
+                                resp = _tl_place_algo_with_retry(_place_sl2, max_tries=int(getattr(self.p, "trailing_place_retries", 3) or 3))
 
                         if isinstance(resp, dict):
                             self._upsert_order_shadow(
@@ -3201,6 +3273,7 @@ class TradeLiquidation(
                         "skip generic TRL recovery for hedge-managed side sym=%s side=%s pos_uid=%s",
                         sym, side, pos_uid,
                     )
+                    _trl_skip("hedge_managed", sym=sym, side=side, pos_uid=pos_uid, qty_use=qty_use, extra={"hedge_mode": bool(hedge_mode)})
                     continue
                 opp_side = "SHORT" if str(side).upper() == "LONG" else "LONG"
                 # IMPORTANT:
@@ -3213,8 +3286,17 @@ class TradeLiquidation(
                 #
                 # Otherwise after restart a symbol with both LONG(main) + SHORT(hedge) can lose
                 # the main trailing forever and only keep HEDGE_TRL.
-                if place_trailing and trailing_enabled and (not has_trl) and (not is_hedge_managed_side):
+                if (not place_trailing) and trailing_enabled:
+                    _trl_skip("recovery_disabled", sym=sym, side=side, pos_uid=pos_uid, qty_use=qty_use)
+                elif (not trailing_enabled):
+                    _trl_skip("trailing_disabled", sym=sym, side=side, pos_uid=pos_uid, qty_use=qty_use)
+                elif has_trl:
+                    _trl_skip("already_exists", sym=sym, side=side, pos_uid=pos_uid, qty_use=qty_use, extra={"cid_trl": cid_trl})
+                elif is_hedge_managed_side:
+                    _trl_skip("hedge_managed_side", sym=sym, side=side, pos_uid=pos_uid, qty_use=qty_use)
+                elif place_trailing and trailing_enabled and (not has_trl) and (not is_hedge_managed_side):
                     if not _reserve_recovery_action():
+                        _trl_skip("max_actions", sym=sym, side=side, pos_uid=pos_uid, qty_use=qty_use, extra={"max_actions": int(max_actions)})
                         break
                     recent_trl_ts = 0.0
                     trl_guard_sec = float(getattr(self.p, "trailing_place_guard_sec", 180) or 180)

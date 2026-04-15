@@ -294,6 +294,10 @@ class BinanceUMFuturesRest:
         if "closePosition" in p and isinstance(p.get("closePosition"), bool):
             p["closePosition"] = "true" if bool(p["closePosition"]) else "false"
 
+        # Keep conditional trigger source uniform and explicit.
+        if not str(p.get("workingType") or "").strip():
+            p["workingType"] = "MARK_PRICE"
+
         try:
             return self._request("POST", "/fapi/v1/algoOrder", **p)
         except Exception as e:
@@ -671,6 +675,17 @@ class TradeLiquidationOrderBuilderMixin:
         row = self._find_open_algo_order_by_client_id(sym, cid)
         if isinstance(row, dict):
             return row
+
+        # Important: do not trust DB shadow rows as a source of truth when the exchange
+        # snapshot is available and does not contain the algo order. Stale OPEN rows in
+        # algo_orders previously caused recovery to think TRL/SL already existed while
+        # Binance had no such protective orders open.
+        try:
+            snap = self._rest_snapshot_get("open_algo_orders_all")
+        except Exception:
+            snap = None
+        if isinstance(snap, list):
+            return None
 
         try:
             db_row = self.store.get_algo_order(exchange_id=self.exchange_id, account_id=self.account_id, client_algo_id=cid)
@@ -1570,17 +1585,21 @@ class TradeLiquidationOrderBuilderMixin:
         adds_done: int,
         max_adds: int,
     ) -> bool:
-        """Ensure main TRAILING_STOP_MARKET exists before the last averaging add is filled.
+        """Ensure main TRAILING_STOP_MARKET exists for a live main position.
 
-        This path is active whenever averaging is enabled and there are still
-        pending adds left for the main position. Unlike STOP_MARKET SL deferral,
-        main trailing should be allowed *before* the last add so profit can be
-        protected even if price never returns to averaging levels.
+        Works in two modes:
+          - averaging enabled and more adds are pending: pre-last-add trailing
+          - averaging disabled / no adds configured: immediate main trailing
+
+        Unlike STOP_MARKET SL deferral, main trailing should be allowed even
+        without averaging so profit protection is not silently skipped.
         """
         try:
             if not bool(getattr(self.p, "trailing_enabled", False)):
                 return False
-            if int(max_adds or 0) <= 0 or int(adds_done or 0) >= int(max_adds or 0):
+            # Generic immediate mode: when averaging is disabled (max_adds<=0),
+            # still allow a main trailing order to be created right after OPEN.
+            if int(max_adds or 0) > 0 and int(adds_done or 0) >= int(max_adds or 0):
                 return False
 
             side_u = str(pos_side or "").upper()
@@ -1684,7 +1703,7 @@ class TradeLiquidationOrderBuilderMixin:
                 "activation": round(float(activation), 12),
                 "trail_pct": round(float(trail_pct), 8),
                 "qty": round(float(qty), 12),
-                "mode": "pre_last_add",
+                "mode": ("pre_last_add" if int(max_adds or 0) > 0 else "immediate"),
             }
             if self._memo_recent_desired_order("_recent_trl_desired", cid_trl, _trl_payload, trl_guard_sec):
                 return False
@@ -1749,7 +1768,8 @@ class TradeLiquidationOrderBuilderMixin:
             if _dup_resp:
                 return False
             self.log.info(
-                "[trade_liquidation][LIVE][TP_TRL] placed pre-last-add TRAILING_STOP_MARKET %s %s activation=%.8f (entry=%.8f adds_done=%s/%s trail_pct=%.4f)",
+                "[trade_liquidation][LIVE][TP_TRL] placed %s TRAILING_STOP_MARKET %s %s activation=%.8f (entry=%.8f adds_done=%s/%s trail_pct=%.4f)",
+                ("pre-last-add" if int(max_adds or 0) > 0 else "immediate"),
                 sym_u,
                 side_u,
                 float(activation),
@@ -2887,88 +2907,154 @@ class TradeLiquidationOrderBuilderMixin:
     ) -> None:
         """Write/Update row in public.orders to link exchange orders with pos_uid/strategy_id.
 
-        Multi-account safe: first UPDATE by (exchange_id, account_id, client_order_id) for active status=NEW,
-        then INSERT; avoids unique violations on the partial unique index for active NEW orders.
+        Safe against both unique keys used by the table:
+        - primary key on (exchange_id, account_id, order_id)
+        - partial unique key on (exchange_id, account_id, client_order_id) for active orders
+
+        Strategy:
+        1) UPDATE by order_id when present
+        2) UPDATE by client_order_id
+        3) INSERT with ON CONFLICT on the primary key
+        4) final fallback UPDATE by client_order_id for races / partial unique hits
         """
         try:
             oid = str(order_id).strip() if order_id is not None else ''
             if not oid:
                 oid = f"CID:{client_order_id}"
-            sql = """
-            WITH upd AS (
-                UPDATE orders
-                SET
-                    order_id = %(oid)s,
-                    symbol_id = %(sym)s,
-                    side = %(side)s,
-                    type = %(type)s,
-                    status = %(status)s,
-                    qty = %(qty)s,
-                    price = %(price)s,
-                    reduce_only = %(reduce_only)s,
-                    strategy_id = %(strategy_id)s,
-                    pos_uid = %(pos_uid)s,
-                    updated_at = now()
-                WHERE exchange_id = %(ex)s
-                  AND account_id = %(acc)s
-                  AND client_order_id = %(coid)s
-                  AND client_order_id IS NOT NULL
-                  AND client_order_id <> ''
-                RETURNING 1
-            )
-            INSERT INTO orders (
-                exchange_id, account_id, symbol_id,
-                order_id, client_order_id,
-                side, type, status,
-                qty, price,
-                reduce_only,
-                strategy_id, pos_uid,
-                created_at, updated_at
-            )
-            SELECT
-                %(ex)s, %(acc)s, %(sym)s,
-                %(oid)s, %(coid)s,
-                %(side)s, %(type)s, %(status)s,
-                %(qty)s, %(price)s,
-                %(reduce_only)s,
-                %(strategy_id)s, %(pos_uid)s, 
-                now(), now()
-            WHERE NOT EXISTS (SELECT 1 FROM upd)
-            ON CONFLICT (exchange_id, account_id, client_order_id)
-            WHERE client_order_id IS NOT NULL AND client_order_id <> ''
-            DO UPDATE
-            SET
-                order_id = EXCLUDED.order_id,
-                client_order_id = EXCLUDED.client_order_id,
-                symbol_id = EXCLUDED.symbol_id,
-                side = EXCLUDED.side,
-                type = EXCLUDED.type,
-                status = EXCLUDED.status,
-                qty = EXCLUDED.qty,
-                price = EXCLUDED.price,
-                reduce_only = EXCLUDED.reduce_only,
-                strategy_id = EXCLUDED.strategy_id,
-                pos_uid = EXCLUDED.pos_uid,
-                updated_at = now();
-            """
+            payload = {
+                "ex": int(self.exchange_id),
+                "acc": int(self.account_id),
+                "sym": int(symbol_id),
+                "oid": oid,
+                "coid": str(client_order_id),
+                "side": str(side),
+                "type": str(order_type),
+                "status": str(status),
+                "qty": float(qty),
+                "price": None if price is None else float(price),
+                "reduce_only": bool(reduce_only),
+                "strategy_id": str(self.STRATEGY_ID),
+                "pos_uid": str(pos_uid),
+            }
+            # 1) Update existing row by exchange order_id when we already know it.
             self.store.execute(
-                sql,
-                {
-                    "ex": int(self.exchange_id),
-                    "acc": int(self.account_id),
-                    "sym": int(symbol_id),
-                    "oid": oid,
-                    "coid": str(client_order_id),
-                    "side": str(side),
-                    "type": str(order_type),
-                    "status": str(status),
-                    "qty": float(qty),
-                    "price": None if price is None else float(price),
-                    "reduce_only": bool(reduce_only),
-                    "strategy_id": str(self.STRATEGY_ID),
-                    "pos_uid": str(pos_uid),
-                },
+                """
+                UPDATE orders
+                   SET client_order_id = %(coid)s,
+                       symbol_id = %(sym)s,
+                       side = %(side)s,
+                       type = %(type)s,
+                       status = %(status)s,
+                       qty = %(qty)s,
+                       price = %(price)s,
+                       reduce_only = %(reduce_only)s,
+                       strategy_id = %(strategy_id)s,
+                       pos_uid = %(pos_uid)s,
+                       updated_at = now()
+                 WHERE exchange_id = %(ex)s
+                   AND account_id = %(acc)s
+                   AND order_id = %(oid)s
+                """,
+                payload,
             )
+            # 2) Update by client_order_id as the most stable logical id for our orders.
+            self.store.execute(
+                """
+                UPDATE orders
+                   SET order_id = %(oid)s,
+                       symbol_id = %(sym)s,
+                       side = %(side)s,
+                       type = %(type)s,
+                       status = %(status)s,
+                       qty = %(qty)s,
+                       price = %(price)s,
+                       reduce_only = %(reduce_only)s,
+                       strategy_id = %(strategy_id)s,
+                       pos_uid = %(pos_uid)s,
+                       updated_at = now()
+                 WHERE exchange_id = %(ex)s
+                   AND account_id = %(acc)s
+                   AND client_order_id = %(coid)s
+                   AND client_order_id IS NOT NULL
+                   AND client_order_id <> ''
+                """,
+                payload,
+            )
+            # 3) Insert missing row; if primary key already exists, update in place.
+            try:
+                self.store.execute(
+                    """
+                    INSERT INTO orders (
+                        exchange_id, account_id, symbol_id,
+                        order_id, client_order_id,
+                        side, type, status,
+                        qty, price,
+                        reduce_only,
+                        strategy_id, pos_uid,
+                        created_at, updated_at
+                    )
+                    SELECT
+                        %(ex)s, %(acc)s, %(sym)s,
+                        %(oid)s, %(coid)s,
+                        %(side)s, %(type)s, %(status)s,
+                        %(qty)s, %(price)s,
+                        %(reduce_only)s,
+                        %(strategy_id)s, %(pos_uid)s,
+                        now(), now()
+                    WHERE NOT EXISTS (
+                        SELECT 1
+                          FROM orders
+                         WHERE exchange_id = %(ex)s
+                           AND account_id = %(acc)s
+                           AND (
+                                order_id = %(oid)s
+                                OR (
+                                    client_order_id = %(coid)s
+                                    AND client_order_id IS NOT NULL
+                                    AND client_order_id <> ''
+                                )
+                           )
+                    )
+                    ON CONFLICT (exchange_id, account_id, order_id)
+                    DO UPDATE
+                       SET client_order_id = EXCLUDED.client_order_id,
+                           symbol_id = EXCLUDED.symbol_id,
+                           side = EXCLUDED.side,
+                           type = EXCLUDED.type,
+                           status = EXCLUDED.status,
+                           qty = EXCLUDED.qty,
+                           price = EXCLUDED.price,
+                           reduce_only = EXCLUDED.reduce_only,
+                           strategy_id = EXCLUDED.strategy_id,
+                           pos_uid = EXCLUDED.pos_uid,
+                           updated_at = now()
+                    """,
+                    payload,
+                )
+            except Exception:
+                # 4) Fallback for races on the partial unique index by client_order_id.
+                self.store.execute(
+                    """
+                    UPDATE orders
+                       SET order_id = %(oid)s,
+                           symbol_id = %(sym)s,
+                           side = %(side)s,
+                           type = %(type)s,
+                           status = %(status)s,
+                           qty = %(qty)s,
+                           price = %(price)s,
+                           reduce_only = %(reduce_only)s,
+                           strategy_id = %(strategy_id)s,
+                           pos_uid = %(pos_uid)s,
+                           updated_at = now()
+                     WHERE exchange_id = %(ex)s
+                       AND account_id = %(acc)s
+                       AND client_order_id = %(coid)s
+                       AND client_order_id IS NOT NULL
+                       AND client_order_id <> ''
+                    """,
+                    payload,
+                )
         except Exception:
             log.exception("[trade_liquidation][LIVE] failed to upsert orders shadow row (order_id=%s)", str(order_id))
 
